@@ -213,6 +213,20 @@ describe("production runtime", () => {
 
     expect(model.requests).toHaveLength(1);
     expect(model.maintenanceRequests).toHaveLength(1);
+    const systemPrompt = model.requests[0]?.messages.find(
+      (message) => message.role === "system",
+    )?.content;
+    expect(systemPrompt).toContain(
+      "You are Ben, the user's private personal assistant in iMessage.",
+    );
+    expect(systemPrompt).toContain(
+      "Write like a capable person texting the user: warm, direct, natural, and never corporate.",
+    );
+    expect(systemPrompt).toContain(
+      "Match the user's level of formality and energy without imitating typos or forced slang.",
+    );
+    expect(systemPrompt).toContain("Use light, dry humor when it fits.");
+    expect(systemPrompt).toContain("Have a point of view when judgment helps.");
     expect(model.requests[0]?.tools.map((tool) => tool.name)).toEqual([
       "gmail.search",
       "gmail.read_thread",
