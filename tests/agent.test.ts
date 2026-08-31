@@ -487,20 +487,25 @@ describe("durable bounded agent loop", () => {
       {
         role: "system",
         content: expect.stringContaining(
-          "A tool-backed report must start with a relevant emoji header",
+          "Every section header in a tool-backed report must begin with an emoji",
         ),
       },
       {
         role: "system",
         content: expect.stringContaining(
-          "A tool-backed report must start with a relevant emoji header",
+          "Every section header in a tool-backed report must begin with an emoji",
         ),
       },
     ]);
+    expect(assistantResponseFormatReminder).toContain(
+      "Wrong patterns: wrapping any header in Unicode U+002A; starting an item with a hyphen followed by ›; placing an introduction before the first emoji header.",
+    );
+    expect(assistantResponseFormatReminder).toContain(
+      "Correct example:\n📬 inbox:\n\n🚨 needs attention:\n› first item\n\n👀 worth a peek:\n› second item\n\n🗑️ ignore:\n› third item",
+    );
     expect(requests[1]?.messages).toEqual([
       { role: "system", content: "Be concise." },
       { role: "user", content: "Do both" },
-      { role: "system", content: assistantResponseFormatReminder },
       {
         role: "assistant",
         content: "",
@@ -514,6 +519,15 @@ describe("durable bounded agent loop", () => {
       { role: "tool", toolCallId: "call_2", content: "{\"ok\":true,\"value\":\"second\"}" },
       { role: "system", content: assistantResponseFormatReminder },
     ]);
+    expect(
+      harness.runs
+        .loadMessages(result.run.id)
+        .some(
+          (message) =>
+            message.role === "system" &&
+            message.content === assistantResponseFormatReminder,
+        ),
+    ).toBe(false);
     expect(harness.runs.getRequired(result.run.id)).toMatchObject({
       phase: "completed",
       modelRequests: 2,

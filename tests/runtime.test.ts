@@ -358,7 +358,9 @@ describe("production runtime", () => {
     expect(systemPrompt).toContain(
       "Never use Markdown syntax in a user-visible reply. Never emit the Unicode U+002A character.",
     );
-    expect(systemPrompt).toContain("📅 today:, 📬 inbox:, ✅ tasks:, 📁 recent work:");
+    expect(systemPrompt).toContain(
+      "📅 today:, 📬 inbox:, 🚨 needs attention:, 👀 worth a peek:, 🗑️ ignore:",
+    );
     expect(systemPrompt).toContain(
       "When the user asks to change future daily briefs",
     );

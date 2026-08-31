@@ -140,14 +140,13 @@ export class AgentLoop {
         if (toolRounds > this.#limits.maxToolRounds) {
           throw new AgentLimitError("round_limit", "The tool round limit was reached");
         }
-        let requestMessages = messages;
-        if (
-          last?.role !== "system" ||
-          last.content !== assistantResponseFormatReminder
-        ) {
-          this.#runs.appendSystemMessage(run.id, assistantResponseFormatReminder);
-          requestMessages = this.#runs.loadMessages(run.id);
-        }
+        const requestMessages: readonly ModelMessage[] =
+          last?.role === "system" && last.content === assistantResponseFormatReminder
+            ? messages
+            : [
+                ...messages,
+                { role: "system", content: assistantResponseFormatReminder },
+              ];
         this.#runs.beginModelRequest(run.id, this.#limits.maxToolRounds + 1);
         let response;
         try {
