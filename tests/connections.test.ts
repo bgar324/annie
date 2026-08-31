@@ -538,7 +538,7 @@ function testRuntimeConfig(
     SENDBLUE_BASE_URL: "https://api.sendblue.co",
     USER_PHONE_NUMBER: "+15559990000",
     PUBLIC_BASE_URL: "https://assistant.example",
-    GEMINI_API_KEY: "gemini_test_key",
+    DEEPSEEK_API_KEY: "deepseek_test_key",
     GOOGLE_CLIENT_ID: "google_test_client",
     GOOGLE_CLIENT_SECRET: "google_test_secret",
     GOOGLE_WORKSPACE_SCOPES: "openid email https://www.googleapis.com/auth/gmail.readonly",

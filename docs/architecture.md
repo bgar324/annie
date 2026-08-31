@@ -2,7 +2,7 @@
 
 ## Scope
 
-This service is a private iMessage assistant for one configured sender. One Node.js 24 process polls the Sendblue Free Sandbox for inbound iMessages, runs a bounded Gemini tool loop, accesses explicitly connected Gmail and Notion accounts, maintains one local memory document, and sends replies from the configured Sendblue line.
+This service is a private iMessage assistant for one configured sender. One Node.js 24 process polls the Sendblue Free Sandbox for inbound iMessages, runs a bounded DeepSeek tool loop, accesses explicitly connected Gmail and Notion accounts, maintains one local memory document, and sends replies from the configured Sendblue line.
 
 The service does not support group chats, multiple assistant users, autonomous scheduled work, destructive provider operations, or generic provider method execution.
 
@@ -40,7 +40,7 @@ The Fastify instance serves only `/health`, the signed connection routes, the OA
 
 SQLite, `MEMORY.md`, and projected traces share the Railway volume. Production runs one replica because the queue, worker, and WAL database are one local durability unit.
 
-Startup performs configuration validation, SQLite migration and integrity checks, interrupted-write recovery, interrupted-memory recovery, pending trace projection, and trace retention. Startup does not contact Sendblue, Gemini, Google Workspace, or Notion. The receiver and the worker start after the HTTP listener is bound.
+Startup performs configuration validation, SQLite migration and integrity checks, interrupted-write recovery, interrupted-memory recovery, pending trace projection, and trace retention. Startup does not contact Sendblue, DeepSeek, Google, or Notion. The receiver and the worker start after the HTTP listener is bound.
 
 ## Inbound message flow
 
@@ -87,10 +87,10 @@ Each run has a durable transcript and enforces these bounds:
 - eight tool calls total;
 - four tool calls in one model response;
 - two provider writes;
-- three transport attempts for one Gemini request;
+- three transport attempts for one DeepSeek request;
 - 18,996 characters for the final iMessage response, matching the Sendblue content cap.
 
-Internal tool names use dots. The Gemini adapter alone converts dots to underscores on the wire and maps returned calls back to the internal names. It stores each assistant wire message as opaque provider state and replays it unchanged so Gemini thought signatures survive tool rounds; core code never interprets that state.
+Internal tool names use dots. The DeepSeek adapter alone converts dots to underscores on the wire and maps returned calls back to the internal names.
 
 ## Production tools
 

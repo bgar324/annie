@@ -57,7 +57,7 @@ describe("canonical memory document", () => {
 
   it("rejects oversized or secret-bearing replacements without truncating memory", async () => {
     const database = trackedDatabase();
-    const secret = "gemini-secret-value";
+    const secret = "deepseek-secret-value";
     const store = new MemoryDocumentStore({
       path: database.config.memoryPath,
       maximumBytes: 16_384,

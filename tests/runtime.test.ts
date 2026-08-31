@@ -50,7 +50,7 @@ class FakeModel implements AssistantModel {
     return {
       id: "response_1",
       content: "Hello back.",
-      providerState: null,
+      reasoningContent: null,
       toolCalls: [],
       finishReason: "stop",
       usage: { promptTokens: 10, completionTokens: 2, totalTokens: 12 },
@@ -621,7 +621,7 @@ function runtimeConfig(directory: string): RuntimeConfig {
     SENDBLUE_BASE_URL: "https://api.sendblue.example",
     USER_PHONE_NUMBER: userNumber,
     PUBLIC_BASE_URL: "https://assistant.example",
-    GEMINI_API_KEY: "gemini_test_key",
+    DEEPSEEK_API_KEY: "deepseek_test_key",
     GOOGLE_CLIENT_ID: "google_test_client",
     GOOGLE_CLIENT_SECRET: "google_test_secret",
     GOOGLE_WORKSPACE_SCOPES: "openid email https://www.googleapis.com/auth/gmail.modify",

@@ -45,7 +45,7 @@ Use Node 24. Railway starts `node dist/main.js` directly so the process receives
 - `src/security`: AES-256-GCM credential encryption.
 - `src/core` and `src/providers`: shared identifiers, canonical JSON, error types, and the traced timeout-bounded fetch used by provider adapters.
 - `src/writes`: write-intent preparation, attempt records, and ambiguous-write recovery.
-- `src/agent`: provider-neutral messages, Gemini wire mapping, bounds, and the fixed tool registry.
+- `src/agent`: provider-neutral messages, DeepSeek wire mapping, bounds, and the fixed tool registry.
 - `src/gmail` and `src/notion`: the only provider tool adapters.
 - `src/memory`: bounded load, maintenance validation, diff, and atomic replacement.
 
@@ -67,9 +67,9 @@ Pin `sendblue@3.16.1` with `maxRetries: 0` and route every call through `Sendblu
 
 Inbound listing is filtered server-side to the trusted sender, the configured line, inbound direction, one-to-one iMessage, and `RECEIVED` status, and is ordered by `updatedAt` ascending. The receiver still re-checks every field locally before accepting. Sendblue does not transcribe inbound audio, so there is no voice path: a message without text reaches `missing_text` handling.
 
-### Gemini
+### DeepSeek
 
-Use `gemini-3.7-flash` through Google's OpenAI-compatible `/chat/completions`. Tool wire names use underscores; internal names use dots. Preserve each returned assistant wire message as opaque provider state and replay it unchanged before tool results so Gemini thought signatures survive. Use low reasoning by default and omit `tool_choice`.
+Use `deepseek-v4-flash` through `/chat/completions`. Tool wire names use underscores. Internal names use dots. With tools and thinking enabled, replay every prior assistant `reasoning_content`, use `""` for tool-only assistant content, and omit `tool_choice`.
 
 ### Google
 

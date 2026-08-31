@@ -8,7 +8,7 @@ export default defineRailway(() => {
     healthcheck: "/health",
     healthcheckTimeout: 30,
     volumeMounts: { "/app/data": benVolume },
-    env: { CREDENTIAL_ENCRYPTION_KEY: preserve(), GEMINI_API_KEY: preserve(), GEMINI_BASE_URL: preserve(), GEMINI_MODEL: preserve(), GEMINI_REASONING_EFFORT: preserve(), GOOGLE_CLIENT_ID: preserve(), GOOGLE_CLIENT_SECRET: preserve(), GOOGLE_WORKSPACE_SCOPES: preserve(), LOG_LEVEL: preserve(), NODE_ENV: preserve(), NOTION_MCP_URL: preserve(), PUBLIC_BASE_URL: preserve(), RAILWAY_DEPLOYMENT_DRAINING_SECONDS: preserve(), SENDBLUE_API_KEY_ID: preserve(), SENDBLUE_API_SECRET_KEY: preserve(), SENDBLUE_BASE_URL: preserve(), SENDBLUE_FROM_NUMBER: preserve(), USER_PHONE_NUMBER: preserve() },
+    env: { CREDENTIAL_ENCRYPTION_KEY: preserve(), DEEPSEEK_API_KEY: preserve(), DEEPSEEK_BASE_URL: preserve(), DEEPSEEK_MODEL: preserve(), DEEPSEEK_REASONING_EFFORT: preserve(), GOOGLE_CLIENT_ID: preserve(), GOOGLE_CLIENT_SECRET: preserve(), GOOGLE_WORKSPACE_SCOPES: preserve(), LOG_LEVEL: preserve(), NODE_ENV: preserve(), NOTION_MCP_URL: preserve(), PUBLIC_BASE_URL: preserve(), RAILWAY_DEPLOYMENT_DRAINING_SECONDS: preserve(), SENDBLUE_API_KEY_ID: preserve(), SENDBLUE_API_SECRET_KEY: preserve(), SENDBLUE_BASE_URL: preserve(), SENDBLUE_FROM_NUMBER: preserve(), USER_PHONE_NUMBER: preserve() },
   });
 
   return project("ben", {
