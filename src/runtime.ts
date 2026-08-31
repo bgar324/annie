@@ -18,7 +18,8 @@ import { GmailToolService } from "./gmail/tools.js";
 import { MemoryDocumentStore } from "./memory/document.js";
 import { MemoryMaintenanceService } from "./memory/maintenance.js";
 import { SendblueGateway } from "./messages/client.js";
-import { MessageEgressService } from "./messages/egress.js";
+import { DailyBriefService } from "./messages/daily-brief.js";
+import { MessageEgressService, type EgressSendPolicy } from "./messages/egress.js";
 import { FailureNotificationService } from "./messages/failure.js";
 import { MessageIngressService } from "./messages/inbound.js";
 import { SendblueReceiver } from "./messages/receiver.js";
@@ -62,6 +63,7 @@ export interface AssistantRuntime {
   database: DatabaseHandle;
   worker: DurableWorker;
   receiver: SendblueReceiver;
+  dailyBrief: DailyBriefService;
   handlers: JobHandlers;
   queue: QueueStore;
   traces: TraceStore;
@@ -142,21 +144,17 @@ export async function createRuntime(
       runs,
       writes,
     });
-    const tools = new ToolRegistry([...gmail.tools(), ...notion.tools()]);
+    const providerTools = [...gmail.tools(), ...notion.tools()];
+    const tools = new ToolRegistry(providerTools);
     assertProductionTools(tools);
     const model = overrides.model ?? new GeminiChatModel({ config, traces });
-    const agent = new AgentLoop({
-      model,
-      tools,
-      runs,
-      writes,
-      limits: {
-        maxToolRounds: config.limits.maxAgentToolRounds,
-        maxToolCalls: config.limits.maxAgentToolCalls,
-        maxProviderWrites: config.limits.maxAgentWrites,
-        maxRunMs: config.limits.maxAgentRunMs,
-      },
-    });
+    const agentLimits = {
+      maxToolRounds: config.limits.maxAgentToolRounds,
+      maxToolCalls: config.limits.maxAgentToolCalls,
+      maxProviderWrites: config.limits.maxAgentWrites,
+      maxRunMs: config.limits.maxAgentRunMs,
+    };
+    const agent = new AgentLoop({ model, tools, runs, writes, limits: agentLimits });
     const memory = new MemoryDocumentStore({
       path: config.memoryPath,
       maximumBytes: config.limits.memoryMaxBytes,
@@ -176,6 +174,20 @@ export async function createRuntime(
       queue,
       traces,
     });
+    const dailyBrief = new DailyBriefService({
+      db: database.db,
+      config,
+      agent,
+      runs,
+      memory,
+      maintenance,
+      connections,
+      egress,
+      failures,
+      queue,
+      traces,
+      projector,
+    });
     const turn = new InboundTurnService({
       db: database.db,
       config,
@@ -191,18 +203,28 @@ export async function createRuntime(
       recovery,
       egress,
       failures,
-      queue,
       traces,
     });
     const handlers: JobHandlers = {
       inbound: (job, context) => turn.handle(job, context),
+      daily_brief: (job, context) => dailyBrief.handle(job, context),
       egress_send: async (job, context) => {
+        const payload = egressPayload(job.payload);
         context.assertLease();
-        await egress.sendPrepared(egressIdFromPayload(job.payload), job);
+        await egress.sendPrepared(
+          payload.egressId,
+          job,
+          payload.sendPolicy === undefined
+            ? undefined
+            : {
+                policy: payload.sendPolicy,
+                enabled: config.dailyBrief.enabled,
+              },
+        );
       },
       egress_reconcile: async (job, context) => {
         context.assertLease();
-        const egressId = egressIdFromPayload(job.payload);
+        const egressId = egressPayload(job.payload).egressId;
         try {
           const result = await egress.reconcile(egressId);
           context.assertLease();
@@ -289,6 +311,7 @@ export async function createRuntime(
       database,
       worker,
       receiver,
+      dailyBrief,
       handlers,
       queue,
       traces,
@@ -310,8 +333,10 @@ export async function createRuntime(
   }
 }
 
-
-function egressIdFromPayload(value: unknown) {
+function egressPayload(value: unknown): {
+  egressId: ReturnType<typeof asEgressId>;
+  sendPolicy?: EgressSendPolicy;
+} {
   if (
     value === null ||
     typeof value !== "object" ||
@@ -321,7 +346,28 @@ function egressIdFromPayload(value: unknown) {
   ) {
     throw new Error("Egress job payload is invalid");
   }
-  return asEgressId(value.egressId);
+  const egressId = asEgressId(value.egressId);
+  if (!("sendPolicy" in value) || value.sendPolicy === undefined) {
+    return { egressId };
+  }
+  const sendPolicy = value.sendPolicy;
+  if (
+    sendPolicy === null ||
+    typeof sendPolicy !== "object" ||
+    Array.isArray(sendPolicy) ||
+    !("kind" in sendPolicy) ||
+    sendPolicy.kind !== "daily_brief" ||
+    !("expiresAtMs" in sendPolicy) ||
+    typeof sendPolicy.expiresAtMs !== "number" ||
+    !Number.isSafeInteger(sendPolicy.expiresAtMs) ||
+    sendPolicy.expiresAtMs < 0
+  ) {
+    throw new Error("Egress send policy is invalid");
+  }
+  return {
+    egressId,
+    sendPolicy: { kind: "daily_brief", expiresAtMs: sendPolicy.expiresAtMs },
+  };
 }
 
 function assertProductionTools(tools: ToolRegistry): void {
@@ -340,3 +386,4 @@ function assertProductionTools(tools: ToolRegistry): void {
     throw new Error(`Production tool registry drifted: ${actual.join(", ")}`);
   }
 }
+

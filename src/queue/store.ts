@@ -3,7 +3,7 @@ import type Database from "better-sqlite3";
 import { newJobId, type JobId, type TraceId } from "../core/ids.js";
 import type { TraceStore } from "../tracing/store.js";
 
-export type JobType = "inbound" | "egress_send" | "egress_reconcile";
+export type JobType = "inbound" | "egress_send" | "egress_reconcile" | "daily_brief";
 const maximumEgressReconcileAttempts = 16;
 export type JobStatus = "pending" | "running" | "succeeded" | "failed" | "blocked";
 

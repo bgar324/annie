@@ -3,7 +3,7 @@ import type { RuntimeConfig } from "../config.js";
 import type { EgressId, TraceId } from "../core/ids.js";
 import type { QueueStore } from "../queue/store.js";
 import type { TraceStore } from "../tracing/store.js";
-import { MessageEgressService } from "./egress.js";
+import { MessageEgressService, type EgressSendPolicy } from "./egress.js";
 
 export class FailureNotificationService {
   readonly #db: Database.Database;
@@ -31,6 +31,7 @@ export class FailureNotificationService {
     failureCode: string;
     runId?: string;
     replyToGuid?: string;
+    sendPolicy?: EgressSendPolicy;
   }): EgressId {
     const existing = this.#findExisting(input.traceId);
     if (existing !== undefined) {
@@ -53,7 +54,10 @@ export class FailureNotificationService {
         chatId: this.#recipient,
         type: "egress_send",
         subjectId: egressId,
-        payload: { egressId },
+        payload: {
+          egressId,
+          ...(input.sendPolicy === undefined ? {} : { sendPolicy: input.sendPolicy }),
+        },
         traceId: input.traceId,
         capacityExempt: true,
         ...(input.runId === undefined ? {} : { runId: input.runId }),
@@ -75,7 +79,9 @@ export class FailureNotificationService {
     return this.#db
       .prepare<{ trace_id: string }, { id: EgressId }>(`
         SELECT id FROM egress_messages
-        WHERE trace_id = @trace_id AND purpose = 'failure'
+        WHERE trace_id = @trace_id AND purpose IN ('reply', 'failure')
+        ORDER BY created_at_ms
+        LIMIT 1
       `)
       .get({ trace_id: traceId })?.id;
   }

@@ -838,8 +838,14 @@ describe("failure notifications", () => {
 
     const first = failures.plan({ traceId, failureCode: "model_request_limit" });
     const duplicate = failures.plan({ traceId, failureCode: "model_request_limit" });
+    const replyAfterFailure = harness.egress.planReply({
+      traceId,
+      recipient: harness.config.userPhoneNumber,
+      text: "A late successful-looking reply.",
+    });
 
     expect(duplicate).toBe(first);
+    expect(replyAfterFailure).toBe(first);
     expect(egressRow(harness, first)).toMatchObject({
       body: `I couldn't complete that request. Trace: ${traceId}`,
       purpose: "failure",
@@ -852,6 +858,42 @@ describe("failure notifications", () => {
     expect(
       harness.traces.list(traceId).some((event) => event.component === "failure_notification"),
     ).toBe(true);
+  });
+
+  it("keeps a committed reply when a later retry tries to plan failure", () => {
+    const harness = createMessagingHarness();
+    const traceId = newTraceId();
+    harness.traces.append({
+      traceId,
+      component: "agent",
+      event: "completed",
+      outcome: "ok",
+      data: {},
+    });
+    const failures = new FailureNotificationService({
+      db: harness.database.handle.db,
+      config: harness.config,
+      egress: harness.egress,
+      queue: harness.queue,
+      traces: harness.traces,
+    });
+
+    const reply = harness.egress.planReply({
+      traceId,
+      recipient: harness.config.userPhoneNumber,
+      text: "The committed reply.",
+    });
+    const failureAfterReply = failures.plan({
+      traceId,
+      failureCode: "late_failure",
+    });
+
+    expect(failureAfterReply).toBe(reply);
+    expect(egressRow(harness, reply)).toMatchObject({
+      body: "The committed reply.",
+      purpose: "reply",
+    });
+    expect(countRows(harness, "egress_messages")).toBe(1);
   });
 });
 
@@ -963,6 +1005,7 @@ describe("durable queue leases", () => {
         queue,
         handlers: {
           inbound: async () => undefined,
+          daily_brief: async () => undefined,
           egress_send: async () => undefined,
           egress_reconcile: async () => undefined,
         },

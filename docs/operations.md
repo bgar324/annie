@@ -21,13 +21,38 @@ Then deploy:
 7. Confirm that Notion can reach these endpoints:
    - `https://<domain>/.well-known/notion-mcp-client.json`
    - `https://<domain>/oauth/notion/callback`
-8. Deploy. Railway considers the service healthy only after `GET /health` returns HTTP 200.
+8. To send the daily brief, set `DAILY_BRIEF_ENABLED=true`. The schedule is fixed at 08:00 America/Los_Angeles.
+9. Deploy. Railway considers the service healthy only after `GET /health` returns HTTP 200.
 
-The HTTP process exists for health checks and the browser OAuth flows. Messaging needs no public URL, no webhook route, no scheduled cron, and no inbound network path: the receiver polls Sendblue from inside the same process as the durable worker.
+The HTTP process serves health checks and browser OAuth flows. Messaging needs no public URL, webhook route, external cron, or inbound network path. The receiver polls Sendblue, and the daily brief scheduler writes future work to the same durable queue.
 
-Startup does not contact Sendblue, Google Workspace, Notion, or Gemini. An unhealthy provider connection therefore cannot prevent the process from becoming ready. Startup does validate configuration, migrate SQLite, repair interrupted memory and write state, project pending traces, and apply trace retention.
+Startup does not contact Sendblue, Google Workspace, Notion, or Gemini. An unhealthy provider connection cannot prevent the process from becoming ready. Startup validates configuration, migrates SQLite, repairs interrupted memory and write state, projects pending traces, and applies trace retention. The scheduler can insert the next daily brief job without contacting a provider.
 
-The process handles `SIGTERM` by failing health checks, closing the HTTP listener, stopping the receiver and the worker after their in-flight sweep and handler return, projecting remaining trace events, and closing SQLite.
+The process handles `SIGTERM` by failing health checks, closing the HTTP listener, and stopping the receiver, the scheduler, and the worker after in-flight work returns. It then projects remaining trace events and closes SQLite.
+
+## Connect Gmail and Notion accounts
+
+One configured Google OAuth application and client ID can connect every Google account; the service stores and routes each account as a separate connection. If the OAuth app has an **External** user type and a **Testing** publishing status, open **Google Auth platform** > **Audience**. Add every account under **Test users** before starting OAuth. See [Configure the OAuth consent screen and choose scopes](https://developers.google.com/workspace/guides/configure-oauth-consent).
+
+Connect accounts from iMessage:
+
+1. Send `connect google` or `connect gmail` once for each Google account. Choose a different Google account in each browser flow.
+2. Send `connect notion` once for each Notion workspace. Notion does not need a static API key or integration token.
+3. Send `connections` to list the safe labels, health states, and granted capabilities.
+
+When multiple accounts grant the same capability, include the exact safe label in the request. If you request all accounts, the agent calls each healthy account separately. It never chooses one account silently.
+
+Google refresh tokens expire after seven days when the app has an **External** user type, a **Testing** publishing status, and Gmail scopes. Reconnect each Google account every seven days until the app moves to production. See [Refresh token expiration](https://developers.google.com/identity/protocols/oauth2#expiration).
+
+## Run the daily brief
+
+Set `DAILY_BRIEF_ENABLED=true` to schedule one brief at 08:00 America/Los_Angeles.
+
+The scheduler stores at most one `daily_brief` job for each local date and maintains the current or next eligible date. A restart or overlapping scheduler pass resolves to the same date-keyed job. If the service returns within two hours after 08:00 and no job exists for that date, it sends a late brief. After that window, it schedules the next day. A persisted older job is skipped before provider work.
+
+The scheduled run can use only `gmail.search`, `gmail.read_thread`, `notion.search`, and `notion.fetch`. It checks every healthy capable account by exact safe label. If no source is ready, the message gives the `connect google`, `connect notion`, and `connections` commands instead.
+
+A prepared daily message carries its own durable expiry. The send boundary cancels it without contacting Sendblue if the completion window has elapsed or `DAILY_BRIEF_ENABLED` was changed to `false`. An already attempted or ambiguous send is never canceled or replayed.
 
 ## Sandbox operating limits
 

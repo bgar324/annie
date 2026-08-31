@@ -401,11 +401,7 @@ function completedRun(
   sequence: number,
 ): { runId: RunId; traceId: TraceId } {
   const { inboundId, traceId } = insertInbound(harness.database, harness.traces, userMessage, sequence);
-  const run = harness.runs.startOrResume({
-    inboundId,
-    traceId,
-    deadlineAtMs: Date.now() + 60_000,
-  });
+  const run = harness.runs.startOrResume({ source: { kind: "inbound", inboundId }, traceId, deadlineAtMs: Date.now() + 60_000 });
   harness.runs.complete(run.id, "Reply remains available");
   return { runId: run.id, traceId };
 }

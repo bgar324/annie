@@ -356,14 +356,10 @@ describe("durable bounded agent loop", () => {
     ]);
     const loop = createAgentLoop(harness.runs, harness.writes, model, registry);
 
-    const result = await loop.execute({
-      inboundId,
-      traceId,
-      initialMessages: [
-        { role: "system", content: "Be concise." },
-        { role: "user", content: "Do both" },
-      ],
-    });
+    const result = await loop.execute({ source: { kind: "inbound", inboundId }, traceId, initialMessages: [
+      { role: "system", content: "Be concise." },
+      { role: "user", content: "Do both" },
+    ], });
 
     expect(result).toMatchObject({ outcome: "completed", response: "Both are complete." });
     expect(order).toEqual(["first", "second"]);
@@ -394,11 +390,7 @@ describe("durable bounded agent loop", () => {
   it("resumes a committed tool result without executing the provider operation again", async () => {
     const harness = agentHarness();
     const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Resume");
-    const run = harness.runs.startOrResume({
-      inboundId,
-      traceId,
-      deadlineAtMs: Date.now() + 60_000,
-    });
+    const run = harness.runs.startOrResume({ source: { kind: "inbound", inboundId }, traceId, deadlineAtMs: Date.now() + 60_000 });
     const call = { id: "durable_call", name: "test.echo", argumentsJson: "{\"value\":\"saved\"}" };
     harness.runs.appendInitialMessages(run.id, [
       { role: "system", content: "Resume safely." },
@@ -441,11 +433,7 @@ describe("durable bounded agent loop", () => {
       },
     ]);
 
-    const result = await createAgentLoop(harness.runs, harness.writes, model, registry).execute({
-      inboundId,
-      traceId,
-      initialMessages: [],
-    });
+    const result = await createAgentLoop(harness.runs, harness.writes, model, registry).execute({ source: { kind: "inbound", inboundId }, traceId, initialMessages: [], });
 
     expect(result.response).toBe("Recovered.");
     expect(providerExecutions).toBe(0);
@@ -475,11 +463,7 @@ describe("durable bounded agent loop", () => {
       harness.writes,
       model,
       ToolRegistry.empty(),
-    ).execute({
-      inboundId,
-      traceId,
-      initialMessages: [{ role: "user", content: "Be concise" }],
-    });
+    ).execute({ source: { kind: "inbound", inboundId }, traceId, initialMessages: [{ role: "user", content: "Be concise" }], });
 
     expect(result).toMatchObject({
       outcome: "bounded",
@@ -490,11 +474,7 @@ describe("durable bounded agent loop", () => {
   it("does not dispatch a persisted write after the durable run deadline", async () => {
     const harness = agentHarness();
     const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Too late");
-    const run = harness.runs.startOrResume({
-      inboundId,
-      traceId,
-      deadlineAtMs: Date.now() - 1,
-    });
+    const run = harness.runs.startOrResume({ source: { kind: "inbound", inboundId }, traceId, deadlineAtMs: Date.now() - 1 });
     const call = {
       id: "expired_write",
       name: "test.write",
@@ -535,11 +515,7 @@ describe("durable bounded agent loop", () => {
       harness.writes,
       scriptedModel([]),
       registry,
-    ).execute({
-      inboundId,
-      traceId,
-      initialMessages: [],
-    });
+    ).execute({ source: { kind: "inbound", inboundId }, traceId, initialMessages: [], });
 
     expect(result).toMatchObject({ outcome: "bounded", run: { failureCode: "run_deadline" } });
     expect(providerExecutions).toBe(0);
@@ -548,11 +524,7 @@ describe("durable bounded agent loop", () => {
   it("marks a dispatched running write ambiguous instead of re-executing it after a crash", async () => {
     const harness = agentHarness();
     const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Write once");
-    const run = harness.runs.startOrResume({
-      inboundId,
-      traceId,
-      deadlineAtMs: Date.now() + 60_000,
-    });
+    const run = harness.runs.startOrResume({ source: { kind: "inbound", inboundId }, traceId, deadlineAtMs: Date.now() + 60_000 });
     const call = {
       id: "write_call",
       name: "test.write",
@@ -619,12 +591,8 @@ describe("durable bounded agent loop", () => {
       harness.writes,
       scriptedModel([]),
       registry,
-    ).execute({
-      inboundId,
-      traceId,
-      initialMessages: [],
-      replay: true,
-    });
+    ).execute({ source: { kind: "inbound", inboundId }, traceId, initialMessages: [],
+    replay: true, });
 
     expect(providerExecutions).toBe(0);
     expect(result).toMatchObject({
@@ -666,11 +634,7 @@ describe("durable bounded agent loop", () => {
       },
     });
 
-    const result = await loop.execute({
-      inboundId,
-      traceId,
-      initialMessages: [{ role: "user", content: "Loop forever" }],
-    });
+    const result = await loop.execute({ source: { kind: "inbound", inboundId }, traceId, initialMessages: [{ role: "user", content: "Loop forever" }], });
 
     expect(result.outcome).toBe("bounded");
     expect(result.run).toMatchObject({ phase: "blocked", failureCode: "round_limit" });
@@ -715,11 +679,7 @@ describe("durable bounded agent loop", () => {
       harness.writes,
       model,
       registry,
-    ).execute({
-      inboundId,
-      traceId,
-      initialMessages: [{ role: "user", content: "Too many calls" }],
-    });
+    ).execute({ source: { kind: "inbound", inboundId }, traceId, initialMessages: [{ role: "user", content: "Too many calls" }], });
 
     expect(result).toMatchObject({
       outcome: "bounded",
@@ -731,18 +691,10 @@ describe("durable bounded agent loop", () => {
   it("loads only bounded completed history from the same chat", () => {
     const harness = agentHarness();
     const first = insertInbound(harness.database, harness.traces, "First", 1);
-    const firstRun = harness.runs.startOrResume({
-      inboundId: first.inboundId,
-      traceId: first.traceId,
-      deadlineAtMs: Date.now() + 60_000,
-    });
+    const firstRun = harness.runs.startOrResume({ source: { kind: "inbound", inboundId: first.inboundId }, traceId: first.traceId, deadlineAtMs: Date.now() + 60_000 });
     harness.runs.complete(firstRun.id, "First answer");
     const second = insertInbound(harness.database, harness.traces, "Second", 2);
-    const secondRun = harness.runs.startOrResume({
-      inboundId: second.inboundId,
-      traceId: second.traceId,
-      deadlineAtMs: Date.now() + 60_000,
-    });
+    const secondRun = harness.runs.startOrResume({ source: { kind: "inbound", inboundId: second.inboundId }, traceId: second.traceId, deadlineAtMs: Date.now() + 60_000 });
     harness.runs.complete(secondRun.id, "Second answer");
     const current = insertInbound(harness.database, harness.traces, "Current", 3);
 
@@ -802,11 +754,7 @@ describe("durable bounded agent loop", () => {
     ]);
     const loop = createAgentLoop(harness.runs, harness.writes, model, registry);
 
-    await loop.execute({
-      inboundId,
-      traceId,
-      initialMessages: [{ role: "user", content: "Read from the provider" }],
-    });
+    await loop.execute({ source: { kind: "inbound", inboundId }, traceId, initialMessages: [{ role: "user", content: "Read from the provider" }], });
 
     const toolMessage = requests[1]?.messages.find((message) => message.role === "tool");
     expect(toolMessage).toEqual({

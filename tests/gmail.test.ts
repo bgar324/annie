@@ -615,11 +615,7 @@ function toolContext(
   if (runId === undefined) {
     const inbound = insertInbound(harness, toolName);
     traceId = inbound.traceId;
-    const run = harness.runs.startOrResume({
-      inboundId: inbound.inboundId,
-      traceId,
-      deadlineAtMs: Date.now() + 60_000,
-    });
+    const run = harness.runs.startOrResume({ source: { kind: "inbound", inboundId: inbound.inboundId }, traceId, deadlineAtMs: Date.now() + 60_000 });
     runId = run.id;
   } else {
     traceId = harness.runs.getRequired(runId).traceId;

@@ -186,6 +186,59 @@ export class WriteStore {
     return toWriteIntent(row);
   }
 
+  cancelPreparedInTransaction(input: {
+    writeId: WriteIntentId;
+    traceId: TraceId;
+    normalizedResult: unknown;
+    jobLease: { jobId: string; leaseToken: string; nowMs: number };
+  }): WriteIntent {
+    const owned = this.#db
+      .prepare<
+        { id: string; lease_token: string; now_ms: number },
+        { owned: 1 }
+      >(`
+        SELECT 1 AS owned FROM jobs
+        WHERE id = @id AND status = 'running' AND lease_token = @lease_token
+          AND lease_expires_at_ms > @now_ms
+      `)
+      .get({
+        id: input.jobLease.jobId,
+        lease_token: input.jobLease.leaseToken,
+        now_ms: input.jobLease.nowMs,
+      });
+    if (owned === undefined) {
+      throw new Error("A prepared write cannot be canceled without the current job lease");
+    }
+    const row = this.#db
+      .prepare<
+        { id: string; now_ms: number },
+        WriteRow
+      >(`
+        UPDATE write_intents
+        SET state = 'confirmed_failed', completed_at_ms = @now_ms, updated_at_ms = @now_ms
+        WHERE id = @id AND state = 'prepared'
+        RETURNING id, run_id, tool_execution_id, egress_id, connection_id, kind, state,
+                  request_fingerprint, request_json, connection_generation,
+                  provider_reference_json
+      `)
+      .get({ id: input.writeId, now_ms: input.jobLease.nowMs });
+    if (row === undefined) {
+      throw new Error(`Write ${input.writeId} is not cancelable`);
+    }
+    this.#traces.appendInTransaction({
+      traceId: input.traceId,
+      component: "write",
+      event: "confirmed_failed",
+      outcome: row.kind,
+      runId: row.run_id ?? undefined,
+      toolExecutionId: row.tool_execution_id ?? undefined,
+      writeIntentId: row.id,
+      data: input.normalizedResult,
+      occurredAtMs: input.jobLease.nowMs,
+    });
+    return toWriteIntent(row);
+  }
+
   beginAttempt(input: {
     writeId: WriteIntentId;
     traceId: TraceId;

@@ -62,6 +62,10 @@ describe("runtime configuration", () => {
       baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
       reasoningEffort: "low",
     });
+    expect(config.dailyBrief).toEqual({
+      enabled: false,
+      timeZone: "America/Los_Angeles",
+    });
     expect(config.userPhoneNumber).toBe("+15550000002");
     expect(config.databasePath).toBe(join(testDatabase.directory, "assistant.sqlite"));
   });
@@ -83,6 +87,16 @@ describe("runtime configuration", () => {
     const missingSecret = validEnvironment(testDatabase.directory);
     delete missingSecret.SENDBLUE_API_SECRET_KEY;
     expect(() => loadRuntimeConfig(missingSecret)).toThrow();
+
+    const alternateTimeZone = validEnvironment(testDatabase.directory);
+    alternateTimeZone.DAILY_BRIEF_TIME_ZONE = "America/New_York";
+    expect(loadRuntimeConfig(alternateTimeZone).dailyBrief.timeZone).toBe(
+      "America/Los_Angeles",
+    );
+
+    const enabledBrief = validEnvironment(testDatabase.directory);
+    enabledBrief.DAILY_BRIEF_ENABLED = "true";
+    expect(loadRuntimeConfig(enabledBrief).dailyBrief.enabled).toBe(true);
 
     const noVolume = validEnvironment(testDatabase.directory);
     noVolume.NODE_ENV = "production";
@@ -144,6 +158,102 @@ describe("SQLite foundation", () => {
     expect(tables).toContain("trace_event_spool");
     expect(tables).toContain("oauth_attempts");
   });
+
+  it("preserves queued work and run children while adding scheduled run sources", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    runMigrations(db, 4);
+    db.exec(`
+      INSERT INTO webhook_deliveries(
+        id, provider_delivery_id, provider_message_id, event_kind, line_id,
+        line_handle, outbox_id, normalized_json, trace_id, received_at_ms
+      ) VALUES (
+        'delivery_existing', 'provider_delivery_existing', 'provider_message_existing',
+        'message.received', 'line_existing', '+15550000001', NULL, '{}',
+        'trace_existing', 1
+      );
+      INSERT INTO inbound_messages(
+        id, delivery_id, provider_message_id, chat_id, guid, sender, line_id,
+        line_handle, sequence, state, text, is_audio, attachment_json,
+        trace_id, created_at_ms, updated_at_ms
+      ) VALUES (
+        'in_existing', 'delivery_existing', 'provider_message_existing',
+        '+15550000002', 'guid_existing', '+15550000002', 'line_existing',
+        '+15550000001', 1, 'done', 'hello', 0, '{}', 'trace_existing', 1, 1
+      );
+      INSERT INTO jobs(
+        id, chat_id, type, subject_id, payload_json, status, attempts,
+        available_at_ms, lease_token, lease_expires_at_ms, trace_id, run_id,
+        inbound_sequence, last_error, created_at_ms, updated_at_ms
+      ) VALUES (
+        'job_existing', '+15550000002', 'inbound', 'in_existing',
+        '{"inboundId":"in_existing"}', 'succeeded', 1, 1, NULL, NULL,
+        'trace_existing', 'run_existing', 1, NULL, 1, 1
+      );
+      INSERT INTO agent_runs(
+        id, inbound_id, trace_id, phase, model_requests, maintenance_requests,
+        tool_calls, provider_writes, deadline_at_ms, transcript_bytes,
+        memory_maintenance_status, memory_before_digest, memory_after_digest,
+        ambiguous_write_id, final_response, failure_code, created_at_ms, updated_at_ms
+      ) VALUES (
+        'run_existing', 'in_existing', 'trace_existing', 'completed', 1, 0,
+        0, 0, 1000, 5, 'unchanged', NULL, NULL, NULL, 'hello', NULL, 1, 1
+      );
+      INSERT INTO agent_messages(
+        run_id, sequence, role, content, reasoning_content, tool_calls_json,
+        tool_call_id, provider_response_id, finish_reason, usage_json,
+        byte_count, created_at_ms
+      ) VALUES (
+        'run_existing', 1, 'assistant', 'hello', NULL, NULL, NULL, NULL,
+        'stop', NULL, 5, 1
+      );
+    `);
+
+    try {
+      runMigrations(db);
+
+      expect(
+        db
+          .prepare<[], { inbound_id: string | null; scheduled_job_id: string | null }>(
+            "SELECT inbound_id, scheduled_job_id FROM agent_runs WHERE id = 'run_existing'",
+          )
+          .get(),
+      ).toEqual({ inbound_id: "in_existing", scheduled_job_id: null });
+      expect(
+        db.prepare<[], { content: string }>(
+          "SELECT content FROM agent_messages WHERE run_id = 'run_existing'",
+        ).get(),
+      ).toEqual({ content: "hello" });
+      expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
+      expect(db.pragma("foreign_key_check")).toEqual([]);
+
+      db.exec(`
+        INSERT INTO jobs(
+          id, chat_id, type, subject_id, payload_json, status, attempts,
+          available_at_ms, lease_token, lease_expires_at_ms, trace_id, run_id,
+          inbound_sequence, last_error, created_at_ms, updated_at_ms
+        ) VALUES (
+          'job_daily', '+15550000002', 'daily_brief', '2026-09-01',
+          '{"localDate":"2026-09-01","scheduledForMs":1}', 'pending', 0,
+          1, NULL, NULL, 'trace_daily', NULL, NULL, NULL, 1, 1
+        );
+        INSERT INTO agent_runs(
+          id, inbound_id, scheduled_job_id, trace_id, phase, model_requests,
+          maintenance_requests, tool_calls, provider_writes, deadline_at_ms,
+          transcript_bytes, memory_maintenance_status, memory_before_digest,
+          memory_after_digest, ambiguous_write_id, final_response, failure_code,
+          created_at_ms, updated_at_ms
+        ) VALUES (
+          'run_daily', NULL, 'job_daily', 'trace_daily', 'running', 0, 0,
+          0, 0, 1000, 0, 'pending', NULL, NULL, NULL, NULL, NULL, 1, 1
+        );
+      `);
+      expect(db.pragma("foreign_key_check")).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
 
   it("terminalizes legacy messaging work while migrating its write-intent kind", () => {
     const db = new Database(":memory:");
@@ -249,7 +359,7 @@ describe("SQLite foundation", () => {
     `);
 
     try {
-      runMigrations(db);
+      runMigrations(db, 4);
 
       expect(
         db

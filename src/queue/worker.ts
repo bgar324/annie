@@ -3,6 +3,7 @@ import { LostLeaseError, QueueStore, type ClaimedJob, type JobType } from "./sto
 
 export interface JobContext {
   signal: AbortSignal;
+  nowMs(): number;
   assertLease(): void;
 }
 
@@ -85,6 +86,7 @@ export class DurableWorker {
 
     const context: JobContext = {
       signal,
+      nowMs: () => Date.now(),
       assertLease: () => {
         if (heartbeatFailure !== undefined) {
           throw heartbeatFailure;

@@ -14,7 +14,22 @@ export type EgressPurpose = "reply" | "recovery" | "oauth_result" | "failure";
 export type EgressSendResult =
   | { kind: "accepted"; egressId: EgressId; messageHandle: string }
   | { kind: "provider_failed"; egressId: EgressId; error: string }
-  | { kind: "acceptance_unknown"; egressId: EgressId; error: string };
+  | { kind: "acceptance_unknown"; egressId: EgressId; error: string }
+  | {
+      kind: "canceled";
+      egressId: EgressId;
+      reason: "daily_brief_disabled" | "daily_brief_expired";
+    };
+
+export interface EgressSendPolicy {
+  kind: "daily_brief";
+  expiresAtMs: number;
+}
+
+export interface EgressSendConstraint {
+  policy: EgressSendPolicy;
+  enabled: boolean;
+}
 
 interface EgressRow {
   id: EgressId;
@@ -62,6 +77,50 @@ export class MessageEgressService {
     this.#traces = input.traces;
     this.#writes = input.writes;
     this.#lineNumber = input.lineNumber;
+  }
+
+  planReply(input: {
+    traceId: TraceId;
+    recipient: string;
+    text: string;
+    runId?: string;
+    replyToGuid?: string;
+    sendPolicy?: EgressSendPolicy;
+  }): EgressId {
+    const transaction = this.#db.transaction(() => {
+      const existing = this.#db
+        .prepare<{ trace_id: string }, { id: EgressId }>(`
+          SELECT id FROM egress_messages
+          WHERE trace_id = @trace_id AND purpose IN ('reply', 'failure')
+          ORDER BY created_at_ms
+          LIMIT 1
+        `)
+        .get({ trace_id: input.traceId });
+      const egressId =
+        existing?.id ??
+        this.prepare({
+          traceId: input.traceId,
+          recipient: input.recipient,
+          text: input.text,
+          purpose: "reply",
+          ...(input.runId === undefined ? {} : { runId: input.runId }),
+          ...(input.replyToGuid === undefined ? {} : { replyToGuid: input.replyToGuid }),
+        });
+      this.#queue.enqueueInTransaction({
+        chatId: input.recipient,
+        subjectId: egressId,
+        type: "egress_send",
+        payload: {
+          egressId,
+          ...(input.sendPolicy === undefined ? {} : { sendPolicy: input.sendPolicy }),
+        },
+        traceId: input.traceId,
+        capacityExempt: true,
+        ...(input.runId === undefined ? {} : { runId: input.runId }),
+      });
+      return egressId;
+    });
+    return transaction.immediate();
   }
 
   prepare(input: {
@@ -145,25 +204,16 @@ export class MessageEgressService {
     return egressId;
   }
 
-  async sendPrepared(egressId: EgressId, job?: ClaimedJob): Promise<EgressSendResult> {
-    const egress = this.#get(egressId);
-    if (egress.state !== "prepared") {
-      throw new Error(`Egress ${egressId} is not prepared`);
+  async sendPrepared(
+    egressId: EgressId,
+    job?: ClaimedJob,
+    constraint?: EgressSendConstraint,
+  ): Promise<EgressSendResult> {
+    const preparation = this.#prepareSend(egressId, job, constraint);
+    if (preparation.kind === "canceled") {
+      return { kind: "canceled", egressId, reason: preparation.reason };
     }
-    this.#writes.beginAttempt({
-      writeId: egress.write_id,
-      traceId: egress.trace_id,
-      ...(job === undefined
-        ? {}
-        : {
-            jobLease: {
-              jobId: job.id,
-              leaseToken: job.leaseToken,
-              nowMs: Date.now(),
-            },
-          }),
-    });
-
+    const egress = preparation.egress;
     try {
       const accepted = await this.#gateway.send({
         to: egress.recipient_handle,
@@ -312,6 +362,98 @@ export class MessageEgressService {
         ? { kind: "provider_failed", egressId, error: failure.message }
         : { kind: "acceptance_unknown", egressId, error: failure.message };
     }
+  }
+
+  #prepareSend(
+    egressId: EgressId,
+    job: ClaimedJob | undefined,
+    constraint: EgressSendConstraint | undefined,
+  ):
+    | { kind: "attempting"; egress: EgressRow }
+    | {
+        kind: "canceled";
+        reason: "daily_brief_disabled" | "daily_brief_expired";
+      } {
+    const transaction = this.#db.transaction(() => {
+      const egress = this.#get(egressId);
+      if (egress.state !== "prepared") {
+        throw new Error(`Egress ${egressId} is not prepared`);
+      }
+      const nowMs = Date.now();
+      if (
+        constraint !== undefined &&
+        (!constraint.enabled || nowMs >= constraint.policy.expiresAtMs)
+      ) {
+        if (job === undefined) {
+          throw new Error("A constrained egress send requires a durable job lease");
+        }
+        const reason: "daily_brief_disabled" | "daily_brief_expired" =
+          constraint.enabled ? "daily_brief_expired" : "daily_brief_disabled";
+        this.#cancelPreparedInTransaction(egress, job, nowMs, reason);
+        return { kind: "canceled" as const, reason };
+      }
+      this.#writes.beginAttempt({
+        writeId: egress.write_id,
+        traceId: egress.trace_id,
+        ...(job === undefined
+          ? {}
+          : {
+              jobLease: {
+                jobId: job.id,
+                leaseToken: job.leaseToken,
+                nowMs,
+              },
+            }),
+      });
+      return { kind: "attempting" as const, egress };
+    });
+    return transaction.immediate();
+  }
+
+  #cancelPreparedInTransaction(
+    egress: EgressRow,
+    job: ClaimedJob,
+    nowMs: number,
+    reason: "daily_brief_disabled" | "daily_brief_expired",
+  ): void {
+    const result = {
+      ok: false,
+      error: {
+        code: reason,
+        message: "The daily brief was canceled before provider dispatch",
+      },
+    };
+    this.#writes.cancelPreparedInTransaction({
+      writeId: egress.write_id,
+      traceId: egress.trace_id,
+      normalizedResult: result,
+      jobLease: {
+        jobId: job.id,
+        leaseToken: job.leaseToken,
+        nowMs,
+      },
+    });
+    const updated = this.#db
+      .prepare<{ id: string; reason: string; now_ms: number }>(`
+        UPDATE egress_messages
+        SET state = 'provider_failed', last_error = @reason, updated_at_ms = @now_ms
+        WHERE id = @id AND state = 'prepared' AND attempt_count = 0
+      `)
+      .run({ id: egress.id, reason, now_ms: nowMs });
+    if (updated.changes !== 1) {
+      throw new Error(`Egress ${egress.id} is not cancelable`);
+    }
+    this.#traces.appendInTransaction({
+      traceId: egress.trace_id,
+      component: "egress",
+      event: "canceled",
+      outcome: reason,
+      jobId: job.id,
+      runId: egress.run_id ?? undefined,
+      data: { egressId: egress.id },
+      occurredAtMs: nowMs,
+    });
+    this.#traces.markTerminal(egress.trace_id);
   }
 
   async reconcile(egressId: EgressId): Promise<

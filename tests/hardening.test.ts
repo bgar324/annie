@@ -25,11 +25,7 @@ describe("safe replay", () => {
     const traces = new TraceStore(database.handle.db, createTraceRedactor([]));
     const runs = new AgentRunStore(database.handle.db, traces);
     const inbound = insertInbound(database, traces, "Send the existing draft");
-    const run = runs.startOrResume({
-      inboundId: inbound.inboundId,
-      traceId: inbound.traceId,
-      deadlineAtMs: Date.now() + 60_000,
-    });
+    const run = runs.startOrResume({ source: { kind: "inbound", inboundId: inbound.inboundId }, traceId: inbound.traceId, deadlineAtMs: Date.now() + 60_000 });
     runs.appendInitialMessages(run.id, [
       { role: "system", content: "fixture system" },
       { role: "user", content: "Send the existing draft" },
@@ -113,11 +109,7 @@ describe("safe replay", () => {
     const traces = new TraceStore(database.handle.db, createTraceRedactor([]));
     const runs = new AgentRunStore(database.handle.db, traces);
     const inbound = insertInbound(database, traces, "No tools");
-    const run = runs.startOrResume({
-      inboundId: inbound.inboundId,
-      traceId: inbound.traceId,
-      deadlineAtMs: Date.now() + 60_000,
-    });
+    const run = runs.startOrResume({ source: { kind: "inbound", inboundId: inbound.inboundId }, traceId: inbound.traceId, deadlineAtMs: Date.now() + 60_000 });
     runs.appendInitialMessages(run.id, [{ role: "user", content: "No tools" }]);
     runs.complete(run.id, "Done");
     const output = captureIo();

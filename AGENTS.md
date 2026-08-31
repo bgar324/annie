@@ -16,6 +16,8 @@ This service controls real Gmail, Notion, and iMessage accounts. Preserve these 
 - Change only the affected connection's health.
 - Keep `MEMORY.md` as the only canonical long-term memory file.
 - Keep the production registry at exactly eight tools. Do not expose destructive or catch-all provider methods.
+- Run daily briefs through the same eight-tool production registry, but expose and enforce only `gmail.search`, `gmail.read_thread`, `notion.search`, and `notion.fetch` for that run.
+- Skip daily brief work outside its same-morning window, and cancel only still-prepared daily egress when it expires or the feature is disabled.
 
 The architecture rationale and failure semantics live in `docs/architecture.md`.
 
@@ -36,7 +38,7 @@ Use Node 24. Railway starts `node dist/main.js` directly so the process receives
 ## Code ownership
 
 - `src/runtime.ts`: process composition, the Fastify instance, `/health`, and job-handler wiring.
-- `src/messages`: the Sendblue gateway, the polling receiver, ingress matching and normalization, inbound turns, egress, and delivery reconciliation.
+- `src/messages`: the Sendblue gateway, the polling receiver, ingress matching and normalization, inbound and daily brief turns, egress, and delivery reconciliation.
 - `src/db`: the one SQLite connection, schema migrations, and local integrity checks.
 - `src/queue`: lease claims, heartbeats, ordering, and recovery.
 - `src/tracing`: redaction, durable trace spool, JSONL projection, and rendering.
@@ -91,6 +93,8 @@ Required regression cases include:
 - media-only inbound reaching `missing_text` without an agent run;
 - lease expiry with stale-token fencing;
 - persisted jobs after restart;
+- daily brief 08:00 scheduling across DST, restart, stale-job recovery, and exhausted leases;
+- daily brief read-only enforcement, all-account coverage, and stale or disabled egress cancellation;
 - one-account selection and multi-account ambiguity;
 - reconnect identity mismatch;
 - expired and completed signed links;

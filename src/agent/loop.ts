@@ -1,9 +1,14 @@
 import { canonicalJson } from "../core/json.js";
 import { ModelSafeError } from "../core/errors.js";
-import type { InboundId, TraceId } from "../core/ids.js";
+import type { RunId, TraceId } from "../core/ids.js";
 import { maximumMessageTextCharacters } from "../messages/types.js";
 import type { ChatModel, ModelMessage, ModelToolCall } from "./model.js";
-import { AgentLimitError, AgentRunStore, type AgentRunRecord } from "./store.js";
+import {
+  AgentLimitError,
+  AgentRunStore,
+  type AgentRunRecord,
+  type AgentRunSource,
+} from "./store.js";
 import { ToolRegistry, ToolRegistryError } from "./tools.js";
 import type { WriteStore } from "../writes/store.js";
 
@@ -44,14 +49,34 @@ export class AgentLoop {
   }
 
   async execute(input: {
-    inboundId: InboundId;
+    source: AgentRunSource;
     traceId: TraceId;
     initialMessages: readonly ModelMessage[];
+    allowedToolNames?: readonly string[];
+    completionGuard?: (
+      candidate: { runId: RunId; response: string },
+    ) => string | undefined;
     jobLease?: { jobId: string; leaseToken: string };
     replay?: boolean;
   }): Promise<AgentLoopResult> {
+    const allToolDefinitions = this.#tools.definitions();
+    const allowedToolNames =
+      input.allowedToolNames === undefined ? undefined : new Set(input.allowedToolNames);
+    if (
+      allowedToolNames !== undefined &&
+      (allowedToolNames.size !== input.allowedToolNames?.length ||
+        [...allowedToolNames].some(
+          (name) => !allToolDefinitions.some((definition) => definition.name === name),
+        ))
+    ) {
+      throw new Error("Agent run tool allowlist contains an unknown or duplicate tool");
+    }
+    const toolDefinitions =
+      allowedToolNames === undefined
+        ? allToolDefinitions
+        : allToolDefinitions.filter((definition) => allowedToolNames.has(definition.name));
     const run = this.#runs.startOrResume({
-      inboundId: input.inboundId,
+      source: input.source,
       traceId: input.traceId,
       deadlineAtMs: Date.now() + this.#limits.maxRunMs,
     });
@@ -84,6 +109,7 @@ export class AgentLoop {
             pending,
             input.replay ?? false,
             input.jobLease,
+            allowedToolNames,
             runSignal,
           );
           continue;
@@ -96,6 +122,10 @@ export class AgentLoop {
           }
           if (response.length > maximumMessageTextCharacters) {
             return this.#bounded(run, "response_too_large");
+          }
+          const rejection = input.completionGuard?.({ runId: run.id, response });
+          if (rejection !== undefined) {
+            return this.#bounded(run, rejection);
           }
           this.#runs.complete(run.id, response);
           return { run: this.#runs.getRequired(run.id), response, outcome: "completed" };
@@ -114,7 +144,7 @@ export class AgentLoop {
             traceId: run.traceId,
             runId: run.id,
             messages,
-            tools: this.#tools.definitions(),
+            tools: toolDefinitions,
             signal: runSignal,
           });
         } catch (error) {
@@ -151,6 +181,7 @@ export class AgentLoop {
     calls: readonly ModelToolCall[],
     replay: boolean,
     jobLease: { jobId: string; leaseToken: string } | undefined,
+    allowedToolNames: ReadonlySet<string> | undefined,
     signal: AbortSignal,
   ): Promise<void> {
     const answered = answeredToolCalls(messages);
@@ -158,6 +189,12 @@ export class AgentLoop {
       this.#assertWithinDeadline(run, signal);
       if (answered.has(call.id)) {
         continue;
+      }
+      if (allowedToolNames !== undefined && !allowedToolNames.has(call.name)) {
+        throw new AgentLimitError(
+          "tool_not_allowed",
+          `Tool ${call.name} is not allowed for this agent run`,
+        );
       }
       const operationClass = this.#tools.operationClass(call.name);
       const execution = this.#runs.prepareTool({

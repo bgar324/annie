@@ -4,7 +4,7 @@
 
 This service is a private iMessage assistant for one configured sender. One Node.js 24 process polls the Sendblue Free Sandbox for inbound iMessages, runs a bounded Gemini tool loop, accesses explicitly connected Gmail and Notion accounts, maintains one local memory document, and sends replies from the configured Sendblue line.
 
-The service does not support group chats, multiple assistant users, autonomous scheduled work, destructive provider operations, or generic provider method execution.
+The service does not support group chats, multiple assistant users, arbitrary autonomous schedules, destructive provider operations, or generic provider method execution. It supports one fixed read-only daily brief.
 
 ## Transport account model
 
@@ -24,6 +24,7 @@ One process owns one long-lived `better-sqlite3` connection and these components
 flowchart LR
   S[Sendblue list sweep] --> R[Sendblue receiver]
   X[Sendblue event stream] -. wake .-> R
+  B[Daily brief scheduler] --> D
   R --> D[(SQLite)]
   D --> W[Durable worker]
   W --> A[Bounded agent loop]
@@ -40,7 +41,7 @@ The Fastify instance serves only `/health`, the signed connection routes, the OA
 
 SQLite, `MEMORY.md`, and projected traces share the Railway volume. Production runs one replica because the queue, worker, and WAL database are one local durability unit.
 
-Startup performs configuration validation, SQLite migration and integrity checks, interrupted-write recovery, interrupted-memory recovery, pending trace projection, and trace retention. Startup does not contact Sendblue, Gemini, Google Workspace, or Notion. The receiver and the worker start after the HTTP listener is bound.
+Startup performs configuration validation, SQLite migration and integrity checks, interrupted-write recovery, interrupted-memory recovery, pending trace projection, and trace retention. Startup does not contact Sendblue, Gemini, Google Workspace, or Notion. The receiver, the daily brief scheduler, and the worker start after the HTTP listener is bound.
 
 ## Inbound message flow
 
@@ -62,11 +63,21 @@ Sendblue does not transcribe inbound audio. A media-only message therefore arriv
 
 ## Durable queue
 
-The queue holds three job types: `inbound`, `egress_send`, and `egress_reconcile`. Jobs use lease tokens and lease expirations. A claim increments its attempt count and sets one random lease token. Heartbeats, completion, requeue, failure, and shutdown checks must present that token. An expired lease can be reclaimed; the stale owner cannot commit afterward.
+The queue holds four job types: `inbound`, `daily_brief`, `egress_send`, and `egress_reconcile`. Jobs use lease tokens and lease expirations. A claim increments its attempt count and sets one random lease token. Heartbeats, completion, requeue, failure, and shutdown checks must present that token. An expired lease can be reclaimed; the stale owner cannot commit afterward.
 
 Only one job for a chat can run at once. Inbound sequence numbers preserve per-chat order. Internal egress jobs are capacity-exempt so a full user queue cannot prevent a committed result or failure notice from being sent.
 
-A process stop does not release a lease while its handler may still be running. On `SIGTERM`, the HTTP listener closes, the receiver and the worker observe one shared abort signal and stop after their in-flight sweep and handler return, pending traces project, and SQLite closes. If the platform kills the process first, the lease expires and the durable ingress cursor and queue let the next process resume without losing a message.
+A process stop does not release a lease while its handler may still be running. On `SIGTERM`, the HTTP listener closes; the receiver, the daily brief scheduler, and the worker observe one shared abort signal and stop after their in-flight sweep or handler returns. Pending traces then project and SQLite closes. If the platform kills the process first, the lease expires and the durable ingress cursor and queue let the next process resume without losing work.
+
+## Daily brief flow
+
+The in-process scheduler reconciles SQLite once per minute. It creates one `daily_brief` job per Los Angeles calendar date with `available_at` set to 08:00 America/Los_Angeles. The unique `(type, subject)` key makes overlapping passes and restarts idempotent. A missing brief can catch up for two hours after 08:00; after that window, the scheduler creates the next day's job. Scheduling performs no provider request.
+
+A daily brief run points `agent_runs.scheduled_job_id` at the claimed job instead of fabricating an inbound message. It runs through the normal bounded agent loop, memory maintenance, egress write-intent, and delivery reconciliation paths.
+
+The production registry remains exactly eight tools. For a daily brief, `AgentLoop` filters the model definitions and enforces a per-run allowlist containing only `gmail.search`, `gmail.read_thread`, `notion.search`, and `notion.fetch`. A write tool is rejected before preparation or tool execution. The request names every healthy capable account by its exact safe label and requires each source to be checked. With no healthy source, the service sends connection instructions without calling the model.
+
+The handler rechecks the local date and catch-up deadline before any provider work. A daily-origin egress job carries a durable completion deadline and enabled-state requirement. Before opening a Sendblue attempt, the egress handler cancels a still-prepared stale or disabled message and records a confirmed non-write. It never cancels or repeats a write once provider dispatch may have started.
 
 ## Agent boundary and limits
 
@@ -76,6 +87,7 @@ The model receives:
 - the complete bounded `MEMORY.md` document;
 - bounded recent conversation history;
 - safe connection labels, provider names, health states, and capabilities;
+- tool definitions allowed for that run;
 - normalized tool results.
 
 The model does not receive credentials, provider SDK clients, provider wire payloads, internal connection IDs, provider account IDs, signed connection links, or raw attachment URLs.
@@ -107,7 +119,7 @@ The production registry contains exactly these tools:
 | `notion.create_page` | Write | Create one page |
 | `notion.update_page` | Write | Update one page |
 
-There are no delete, archive, move, batch, raw request, or catch-all tools.
+There are no delete, archive, move, batch, raw request, or catch-all tools. Daily brief runs use the same registry but can see and execute only the four read tools.
 
 Gmail reads are bounded and normalized before entering the transcript. Draft creation composes MIME locally with a unique message ID. Sending is available only through an existing draft.
 
@@ -128,7 +140,7 @@ Google and Notion token refreshes use credential generations and refresh leases.
 
 ## Signed browser connection flow
 
-The deterministic messages `connect google` and `connect notion` are handled before the model. The service creates a signed, expiring, single-use link and queues it through normal iMessage egress.
+The deterministic messages `connect google`, `connect gmail`, and `connect notion` are handled before the model. The `connections` command lists exact safe labels, health states, and capabilities. A connect command creates a signed, expiring, single-use link and queues it through normal iMessage egress.
 
 The signed token contains a random identifier, provider, issue time, and expiry. SQLite binds the token hash to its purpose, trace, and optional expected connection. The browser route validates the signature and durable binding before starting PKCE OAuth. Reconnection also verifies that the returned provider identity matches the expected connection before replacing credentials.
 

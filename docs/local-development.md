@@ -22,7 +22,19 @@ pnpm install
 pnpm dev
 ```
 
-The process opens SQLite and `MEMORY.md` under `DATA_DIR`, listens on port 3000 by default, and then starts the durable worker and the Sendblue receiver. Startup fails instead of using ephemeral storage when production volume configuration is missing or invalid. Startup contacts no provider, so a bad Sendblue key surfaces on the first sweep, not at boot.
+The process opens SQLite and `MEMORY.md` under `DATA_DIR`, listens on port 3000 by default, and then starts the durable worker, the Sendblue receiver, and the daily brief scheduler. Startup fails instead of using ephemeral storage when production volume configuration is missing or invalid. Startup contacts no provider, so a bad Sendblue key surfaces on the first sweep, not at boot.
+
+`DAILY_BRIEF_ENABLED` defaults to `false`. Set it to `true` to exercise the live schedule at 08:00 America/Los_Angeles. The scheduler creates the next durable job immediately, but the worker does not claim that job before its scheduled time. Enabling this option with real Sendblue credentials sends an iMessage.
+
+## Connect provider accounts
+
+Send these commands from `USER_PHONE_NUMBER`:
+
+- `connect google` or `connect gmail` starts one Google OAuth flow.
+- `connect notion` starts one Notion OAuth flow.
+- `connections` lists every safe account label and its capabilities.
+
+Repeat the connect command for each account or workspace. When more than one account can handle a request, use the exact label from `connections`.
 
 ## Send a message through the loop
 

@@ -7,6 +7,11 @@ const nonEmpty = z.string().trim().min(1);
 const positiveInteger = (fallback: number, maximum: number) =>
   z.coerce.number().int().positive().max(maximum).default(fallback);
 const e164Number = z.string().trim().regex(/^\+[1-9]\d{7,14}$/u);
+const dailyBriefTimeZone = "America/Los_Angeles" as const;
+const booleanFlag = z
+  .enum(["true", "false"])
+  .default("false")
+  .transform((value) => value === "true");
 
 const storageEnvSchema = z.object({
   NODE_ENV: nodeEnvSchema.default("development"),
@@ -44,7 +49,7 @@ const runtimeEnvSchema = storageEnvSchema.extend({
 
   CREDENTIAL_ENCRYPTION_KEY: nonEmpty,
   NOTION_MCP_URL: z.url().default("https://mcp.notion.com/mcp"),
-
+  DAILY_BRIEF_ENABLED: booleanFlag,
   MAX_AGENT_TOOL_ROUNDS: positiveInteger(6, 12),
   MAX_AGENT_RUN_MS: positiveInteger(120_000, 600_000),
   MAX_AGENT_TOOL_CALLS: positiveInteger(8, 32),
@@ -97,6 +102,10 @@ export interface RuntimeConfig extends StorageConfig {
     mcpUrl: string;
     callbackUrl: string;
     clientMetadataUrl: string;
+  };
+  dailyBrief: {
+    enabled: boolean;
+    timeZone: typeof dailyBriefTimeZone;
   };
   limits: {
     maxAgentToolRounds: number;
@@ -206,6 +215,10 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
       mcpUrl: parsed.NOTION_MCP_URL,
       callbackUrl: `${publicBaseUrl}/oauth/notion/callback`,
       clientMetadataUrl: `${publicBaseUrl}/.well-known/notion-mcp-client.json`,
+    },
+    dailyBrief: {
+      enabled: parsed.DAILY_BRIEF_ENABLED,
+      timeZone: dailyBriefTimeZone,
     },
     limits: {
       maxAgentToolRounds: parsed.MAX_AGENT_TOOL_ROUNDS,

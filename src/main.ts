@@ -33,10 +33,29 @@ try {
   const address = await runtime.app.listen({ host: config.host, port: config.port });
   runtime.setReady(true);
   runtime.app.log.info({ address }, "assistant_ready");
+  let actorFailed = false;
+  let firstActorFailure: unknown;
+  const settleActor = async (actor: Promise<void>): Promise<void> => {
+    try {
+      await actor;
+    } catch (error) {
+      if (!actorFailed) {
+        actorFailed = true;
+        firstActorFailure = error;
+        runtime.setReady(false);
+        abort.abort();
+      }
+    }
+  };
   actors = Promise.all([
-    runtime.worker.run(abort.signal),
-    runtime.receiver.run(abort.signal),
-  ]).then(() => undefined);
+    settleActor(runtime.worker.run(abort.signal)),
+    settleActor(runtime.receiver.run(abort.signal)),
+    settleActor(runtime.dailyBrief.run(abort.signal)),
+  ]).then(() => {
+    if (actorFailed) {
+      throw firstActorFailure;
+    }
+  });
   void actors.catch((error: unknown) => {
     runtime.app.log.error({ error }, "background_actor_stopped_unexpectedly");
     void stop("background_actor_failure", 1);
