@@ -29,7 +29,7 @@ function validEnvironment(directory: string): NodeJS.ProcessEnv {
     SENDBLUE_BASE_URL: "https://api.sendblue.co",
     USER_PHONE_NUMBER: "+15550000002",
     PUBLIC_BASE_URL: "http://localhost:3000",
-    DEEPSEEK_API_KEY: "deepseek_test_key",
+    GEMINI_API_KEY: "gemini_test_key",
     GOOGLE_CLIENT_ID: "google_test_client",
     GOOGLE_CLIENT_SECRET: "google_test_secret",
     GOOGLE_WORKSPACE_SCOPES: "openid,email,https://www.googleapis.com/auth/gmail.readonly",
@@ -55,6 +55,12 @@ describe("runtime configuration", () => {
       apiSecretKey: "sendblue_test_secret_key",
       fromNumber: "+15550000001",
       baseUrl: "https://api.sendblue.co",
+    });
+    expect(config.gemini).toEqual({
+      apiKey: "gemini_test_key",
+      model: "gemini-3.7-flash",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+      reasoningEffort: "low",
     });
     expect(config.userPhoneNumber).toBe("+15550000002");
     expect(config.databasePath).toBe(join(testDatabase.directory, "assistant.sqlite"));
@@ -96,6 +102,17 @@ describe("runtime configuration", () => {
 
     expect(() => loadRuntimeConfig(environment)).toThrow(
       /SENDBLUE_BASE_URL must use HTTPS in production/u,
+    );
+
+    const geminiEnvironment = validEnvironment(testDatabase.directory);
+    geminiEnvironment.NODE_ENV = "production";
+    geminiEnvironment.PUBLIC_BASE_URL = "https://assistant.example.com";
+    geminiEnvironment.RAILWAY_VOLUME_MOUNT_PATH = testDatabase.directory;
+    geminiEnvironment.DATA_DIR = testDatabase.directory;
+    geminiEnvironment.GEMINI_BASE_URL = "http://gemini.example.test";
+
+    expect(() => loadRuntimeConfig(geminiEnvironment)).toThrow(
+      /GEMINI_BASE_URL must use HTTPS in production/u,
     );
   });
 });
@@ -310,6 +327,7 @@ describe("trace projection", () => {
       outcome: "accepted",
       data: {
         apiKey: "top-secret-value",
+        providerState: "{\"extra_content\":{\"google\":{\"thought_signature\":\"opaque\"}}}",
         link: "https://assistant.example.com/connect/google?token=bearer-value",
       },
     });
@@ -318,6 +336,7 @@ describe("trace projection", () => {
     let content = readFileSync(tracePath, "utf8");
     expect(content).not.toContain("top-secret-value");
     expect(content).not.toContain("bearer-value");
+    expect(content).not.toContain("thought_signature");
     expect(projector.read(traceId)).toHaveLength(1);
 
     appendFileSync(tracePath, "{malformed");

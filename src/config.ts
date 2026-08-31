@@ -31,10 +31,12 @@ const runtimeEnvSchema = storageEnvSchema.extend({
   USER_PHONE_NUMBER: e164Number,
 
   PUBLIC_BASE_URL: z.url(),
-  DEEPSEEK_API_KEY: nonEmpty,
-  DEEPSEEK_MODEL: nonEmpty.default("deepseek-v4-flash"),
-  DEEPSEEK_BASE_URL: z.url().default("https://api.deepseek.com"),
-  DEEPSEEK_REASONING_EFFORT: z.enum(["low", "high", "max"]).default("high"),
+  GEMINI_API_KEY: nonEmpty,
+  GEMINI_MODEL: nonEmpty.default("gemini-3.7-flash"),
+  GEMINI_BASE_URL: z
+    .url()
+    .default("https://generativelanguage.googleapis.com/v1beta/openai"),
+  GEMINI_REASONING_EFFORT: z.enum(["low", "medium", "high"]).default("low"),
 
   GOOGLE_CLIENT_ID: nonEmpty,
   GOOGLE_CLIENT_SECRET: nonEmpty,
@@ -78,11 +80,11 @@ export interface RuntimeConfig extends StorageConfig {
   };
   userPhoneNumber: string;
   publicBaseUrl: string;
-  deepseek: {
+  gemini: {
     apiKey: string;
     model: string;
     baseUrl: string;
-    reasoningEffort: "low" | "high" | "max";
+    reasoningEffort: "low" | "medium" | "high";
   };
   google: {
     clientId: string;
@@ -165,7 +167,7 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
   const credentialEncryptionKey = decodeMasterKey(parsed.CREDENTIAL_ENCRYPTION_KEY);
   const scopes = parseScopes(parsed.GOOGLE_WORKSPACE_SCOPES);
   validateProviderUrl(parsed.SENDBLUE_BASE_URL, "SENDBLUE_BASE_URL", parsed.NODE_ENV);
-  validateProviderUrl(parsed.DEEPSEEK_BASE_URL, "DEEPSEEK_BASE_URL", parsed.NODE_ENV);
+  validateProviderUrl(parsed.GEMINI_BASE_URL, "GEMINI_BASE_URL", parsed.NODE_ENV);
   validateProviderUrl(parsed.NOTION_MCP_URL, "NOTION_MCP_URL", parsed.NODE_ENV);
 
   for (const requiredScope of ["openid", "email"] as const) {
@@ -187,11 +189,11 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
     },
     userPhoneNumber: parsed.USER_PHONE_NUMBER,
     publicBaseUrl,
-    deepseek: {
-      apiKey: parsed.DEEPSEEK_API_KEY,
-      model: parsed.DEEPSEEK_MODEL,
-      baseUrl: trimTrailingSlash(parsed.DEEPSEEK_BASE_URL),
-      reasoningEffort: parsed.DEEPSEEK_REASONING_EFFORT,
+    gemini: {
+      apiKey: parsed.GEMINI_API_KEY,
+      model: parsed.GEMINI_MODEL,
+      baseUrl: trimTrailingSlash(parsed.GEMINI_BASE_URL),
+      reasoningEffort: parsed.GEMINI_REASONING_EFFORT,
     },
     google: {
       clientId: parsed.GOOGLE_CLIENT_ID,
@@ -221,7 +223,7 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
     secretValues: [
       parsed.SENDBLUE_API_KEY_ID,
       parsed.SENDBLUE_API_SECRET_KEY,
-      parsed.DEEPSEEK_API_KEY,
+      parsed.GEMINI_API_KEY,
       parsed.GOOGLE_CLIENT_SECRET,
       parsed.CREDENTIAL_ENCRYPTION_KEY,
     ],

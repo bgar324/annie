@@ -25,7 +25,7 @@ Then deploy:
 
 The HTTP process exists for health checks and the browser OAuth flows. Messaging needs no public URL, no webhook route, no scheduled cron, and no inbound network path: the receiver polls Sendblue from inside the same process as the durable worker.
 
-Startup does not contact Sendblue, Google, Notion, or DeepSeek. An unhealthy provider connection therefore cannot prevent the process from becoming ready. Startup does validate configuration, migrate SQLite, repair interrupted memory and write state, project pending traces, and apply trace retention.
+Startup does not contact Sendblue, Google Workspace, Notion, or Gemini. An unhealthy provider connection therefore cannot prevent the process from becoming ready. Startup does validate configuration, migrate SQLite, repair interrupted memory and write state, project pending traces, and apply trace retention.
 
 The process handles `SIGTERM` by failing health checks, closing the HTTP listener, stopping the receiver and the worker after their in-flight sweep and handler return, projecting remaining trace events, and closing SQLite.
 
@@ -106,10 +106,10 @@ Changing `SENDBLUE_FROM_NUMBER` or `USER_PHONE_NUMBER` changes the trusted ident
 
 The predeployment message can be older than the cursor overlap. Do not use that message as the smoke test.
 
-### DeepSeek API key
+### Gemini API key
 
-1. Create a replacement DeepSeek key.
-2. Replace `DEEPSEEK_API_KEY` in Railway and redeploy.
+1. Create a replacement Gemini Developer API key in Google AI Studio.
+2. Replace `GEMINI_API_KEY` in Railway and redeploy.
 3. Send a read-only request and inspect its trace.
 4. Revoke the previous key.
 

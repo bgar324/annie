@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-const SENSITIVE_KEY = /(?:^|_)(?:api_key|authorization|access_token|refresh_token|id_token|client_secret|webhook_secret|encryption_key|credential|password|pkce_verifier|code_verifier|authorization_code|cookie|signature|raw_body|raw_mime|signed_token|reasoning_content)(?:$|_)/iu;
+const SENSITIVE_KEY = /(?:^|_)(?:api_key|authorization|access_token|refresh_token|id_token|client_secret|webhook_secret|encryption_key|credential|password|pkce_verifier|code_verifier|authorization_code|cookie|signature|raw_body|raw_mime|signed_token|reasoning_content|provider_state)(?:$|_)/iu;
 const TOKEN_QUERY_KEY = /^(?:token|code|state|access_token|refresh_token|id_token)$/iu;
 
 export interface TraceRedactor {

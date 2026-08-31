@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentLoop } from "../src/agent/loop.js";
-import { DeepSeekChatModel } from "../src/agent/deepseek.js";
+import { GeminiChatModel } from "../src/agent/gemini.js";
 import { ConversationHistoryStore } from "../src/agent/history.js";
 import type { ChatModel, ModelRequest, ModelResponse } from "../src/agent/model.js";
 import { AgentRunStore } from "../src/agent/store.js";
@@ -27,50 +27,67 @@ afterEach(() => {
   }
 });
 
-describe("DeepSeek model adapter", () => {
-  it("uses the native thinking contract and preserves reasoning across tool rounds", async () => {
+describe("Gemini model adapter", () => {
+  it("uses the OpenAI-compatible contract and replays provider extras exactly", async () => {
     const harness = modelHarness();
     let requestedUrl = "";
+    let authorization = "";
     let requestedBody: Record<string, unknown> = {};
-    const model = new DeepSeekChatModel({
+    const priorProviderMessage = {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          id: "prior_call",
+          type: "function",
+          function: { name: "test_echo", arguments: "{\"value\":1}" },
+          extra_content: { google: { thought_signature: "prior-signature" } },
+        },
+      ],
+    };
+    const returnedProviderMessage = {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          id: "call_a",
+          type: "function",
+          function: { name: "test_echo", arguments: "{\"value\":\"a\"}" },
+          extra_content: { google: { thought_signature: "signature-a" } },
+        },
+        {
+          id: "call_b",
+          type: "function",
+          function: { name: "test_echo", arguments: "{\"value\":\"b\"}" },
+          extra_content: { google: { thought_signature: "signature-b" } },
+        },
+      ],
+      extra_content: { google: { opaque_state: "keep-exactly" } },
+    };
+    const model = new GeminiChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async (input, init) => {
         const request = new Request(input, init);
         requestedUrl = request.url;
+        authorization = request.headers.get("authorization") ?? "";
         requestedBody = (await request.json()) as Record<string, unknown>;
         return completionResponse({
           id: "response_1",
           finish_reason: "tool_calls",
-          message: {
-            content: null,
-            reasoning_content: "second exact thought",
-            tool_calls: [
-              {
-                id: "call_a",
-                type: "function",
-                function: { name: "test_echo", arguments: "{\"value\":\"a\"}" },
-              },
-              {
-                id: "call_b",
-                type: "function",
-                function: { name: "test_echo", arguments: "{\"value\":\"b\"}" },
-              },
-            ],
-          },
+          message: returnedProviderMessage,
         });
       },
     });
-    const traceId = newTraceId();
     const response = await model.complete({
-      traceId,
+      traceId: newTraceId(),
       runId: newRunId(),
       messages: [
         { role: "user", content: "Do both" },
         {
           role: "assistant",
           content: "",
-          reasoningContent: "first exact thought",
+          providerState: JSON.stringify(priorProviderMessage),
           toolCalls: [
             { id: "prior_call", name: "test.echo", argumentsJson: "{\"value\":1}" },
           ],
@@ -80,51 +97,43 @@ describe("DeepSeek model adapter", () => {
       tools: [echoTool.definition],
     });
 
-    expect(requestedUrl).toBe("https://api.deepseek.com/chat/completions");
+    expect(requestedUrl).toBe(
+      "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    );
+    expect(authorization).toBe("Bearer gemini_test_key");
     expect(requestedBody).toMatchObject({
-      model: "deepseek-v4-flash",
-      thinking: { type: "enabled" },
-      reasoning_effort: "high",
+      model: "gemini-3.7-flash",
+      reasoning_effort: "low",
       messages: [
         { role: "user", content: "Do both" },
-        {
-          role: "assistant",
-          content: "",
-          reasoning_content: "first exact thought",
-          tool_calls: [
-            {
-              id: "prior_call",
-              type: "function",
-              function: { name: "test_echo", arguments: "{\"value\":1}" },
-            },
-          ],
-        },
+        priorProviderMessage,
         { role: "tool", tool_call_id: "prior_call", content: "{\"ok\":true}" },
       ],
     });
+    expect(requestedBody).not.toHaveProperty("thinking");
     expect(requestedBody).not.toHaveProperty("tool_choice");
     expect(response).toMatchObject({
       id: "response_1",
       content: "",
-      reasoningContent: "second exact thought",
       toolCalls: [
         { id: "call_a", name: "test.echo", argumentsJson: "{\"value\":\"a\"}" },
         { id: "call_b", name: "test.echo", argumentsJson: "{\"value\":\"b\"}" },
       ],
     });
+    expect(JSON.parse(response.providerState ?? "null")).toEqual(returnedProviderMessage);
   });
 
   it("omits the tools property for an explicit empty registry", async () => {
     const harness = modelHarness();
     let requestedBody: Record<string, unknown> = {};
-    const model = new DeepSeekChatModel({
+    const model = new GeminiChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async (input, init) => {
         requestedBody = (await new Request(input, init).json()) as Record<string, unknown>;
         return completionResponse({
           finish_reason: "stop",
-          message: { content: "hello", reasoning_content: "private" },
+          message: { role: "assistant", content: "hello" },
         });
       },
     });
@@ -140,10 +149,10 @@ describe("DeepSeek model adapter", () => {
     expect(requestedBody).not.toHaveProperty("tool_choice");
   });
 
-  it("disables thinking and tools for memory maintenance", async () => {
+  it("uses low reasoning without tools for memory maintenance", async () => {
     const harness = modelHarness();
     let requestedBody: Record<string, unknown> = {};
-    const model = new DeepSeekChatModel({
+    const model = new GeminiChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async (input, init) => {
@@ -151,8 +160,8 @@ describe("DeepSeek model adapter", () => {
         return completionResponse({
           finish_reason: "stop",
           message: {
+            role: "assistant",
             content: "{\"action\":\"unchanged\"}",
-            reasoning_content: null,
           },
         });
       },
@@ -169,17 +178,17 @@ describe("DeepSeek model adapter", () => {
         ],
       }),
     ).resolves.toMatchObject({ content: "{\"action\":\"unchanged\"}" });
-    expect(requestedBody).toMatchObject({ thinking: { type: "disabled" } });
-    expect(requestedBody).not.toHaveProperty("reasoning_effort");
+    expect(requestedBody).toMatchObject({ reasoning_effort: "low" });
+    expect(requestedBody).not.toHaveProperty("thinking");
     expect(requestedBody).not.toHaveProperty("tools");
     expect(requestedBody).not.toHaveProperty("tool_choice");
   });
 
-  it.each([429, 500, 503])("retries HTTP %s twice, then succeeds", async (status) => {
+  it.each([429, 500, 502, 503, 504])("retries HTTP %s twice, then succeeds", async (status) => {
     const harness = modelHarness();
     let requests = 0;
     const waits: number[] = [];
-    const model = new DeepSeekChatModel({
+    const model = new GeminiChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async () => {
@@ -189,7 +198,7 @@ describe("DeepSeek model adapter", () => {
         }
         return completionResponse({
           finish_reason: "stop",
-          message: { content: "done", reasoning_content: "complete" },
+          message: { role: "assistant", content: "done" },
         });
       },
       sleep: async (milliseconds) => {
@@ -209,12 +218,11 @@ describe("DeepSeek model adapter", () => {
     expect(waits).toEqual([250, 500]);
   });
 
-
-  it("honors and bounds DeepSeek Retry-After on HTTP 429", async () => {
+  it("honors and bounds Gemini Retry-After on HTTP 429", async () => {
     const harness = modelHarness();
     let requests = 0;
     const waits: number[] = [];
-    const model = new DeepSeekChatModel({
+    const model = new GeminiChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async () => {
@@ -227,7 +235,7 @@ describe("DeepSeek model adapter", () => {
         }
         return completionResponse({
           finish_reason: "stop",
-          message: { content: "done", reasoning_content: "complete" },
+          message: { role: "assistant", content: "done" },
         });
       },
       sleep: async (milliseconds) => {
@@ -246,13 +254,14 @@ describe("DeepSeek model adapter", () => {
     expect(requests).toBe(2);
     expect(waits).toEqual([5_000]);
   });
+
   it("aborts memory-maintenance retry backoff at the run deadline", async () => {
     const harness = modelHarness();
     const sleepStarted = Promise.withResolvers<void>();
     const neverFinishSleeping = Promise.withResolvers<void>();
     const controller = new AbortController();
     let requests = 0;
-    const model = new DeepSeekChatModel({
+    const model = new GeminiChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async () => {
@@ -281,15 +290,15 @@ describe("DeepSeek model adapter", () => {
     expect(requests).toBe(1);
   });
 
-  it("does not retry HTTP 502", async () => {
+  it("does not retry HTTP 400", async () => {
     const harness = modelHarness();
     let requests = 0;
-    const model = new DeepSeekChatModel({
+    const model = new GeminiChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async () => {
         requests += 1;
-        return new Response("bad gateway", { status: 502 });
+        return new Response("bad request", { status: 400 });
       },
       sleep: async () => undefined,
     });
@@ -301,7 +310,7 @@ describe("DeepSeek model adapter", () => {
         messages: [{ role: "user", content: "do not retry" }],
         tools: [],
       }),
-    ).rejects.toMatchObject({ kind: "terminal", status: 502 });
+    ).rejects.toMatchObject({ kind: "terminal", status: 400 });
     expect(requests).toBe(1);
   });
 });
@@ -317,7 +326,7 @@ describe("durable bounded agent loop", () => {
         {
           id: "response_tools",
           content: "",
-          reasoningContent: "Need two reads",
+          providerState: "Need two reads",
           toolCalls: [
             { id: "call_1", name: "test.echo", argumentsJson: "{\"value\":\"first\"}" },
             { id: "call_2", name: "test.echo", argumentsJson: "{\"value\":\"second\"}" },
@@ -328,7 +337,7 @@ describe("durable bounded agent loop", () => {
         {
           id: "response_final",
           content: "Both are complete.",
-          reasoningContent: "Combined both results",
+          providerState: "Combined both results",
           toolCalls: [],
           finishReason: "stop",
           usage: emptyUsage,
@@ -365,7 +374,7 @@ describe("durable bounded agent loop", () => {
       {
         role: "assistant",
         content: "",
-        reasoningContent: "Need two reads",
+        providerState: "Need two reads",
         toolCalls: [
           { id: "call_1", name: "test.echo", argumentsJson: "{\"value\":\"first\"}" },
           { id: "call_2", name: "test.echo", argumentsJson: "{\"value\":\"second\"}" },
@@ -398,7 +407,7 @@ describe("durable bounded agent loop", () => {
     harness.runs.appendAssistant(run.id, {
       id: "prior_response",
       content: "",
-      reasoningContent: "Persist this",
+      providerState: "Persist this",
       toolCalls: [call],
       finishReason: "tool_calls",
       usage: emptyUsage,
@@ -425,7 +434,7 @@ describe("durable bounded agent loop", () => {
       {
         id: "resumed_final",
         content: "Recovered.",
-        reasoningContent: "Used the durable result",
+        providerState: "Used the durable result",
         toolCalls: [],
         finishReason: "stop",
         usage: emptyUsage,
@@ -454,7 +463,7 @@ describe("durable bounded agent loop", () => {
       {
         id: "oversized_final",
         content: "x".repeat(18_997),
-        reasoningContent: null,
+        providerState: null,
         toolCalls: [],
         finishReason: "stop",
         usage: emptyUsage,
@@ -495,7 +504,7 @@ describe("durable bounded agent loop", () => {
     harness.runs.appendAssistant(run.id, {
       id: "expired_response",
       content: "",
-      reasoningContent: "A stale provider write",
+      providerState: "A stale provider write",
       toolCalls: [call],
       finishReason: "tool_calls",
       usage: emptyUsage,
@@ -553,7 +562,7 @@ describe("durable bounded agent loop", () => {
     harness.runs.appendAssistant(run.id, {
       id: "write_response",
       content: "",
-      reasoningContent: "One provider write",
+      providerState: "One provider write",
       toolCalls: [call],
       finishReason: "tool_calls",
       usage: emptyUsage,
@@ -694,7 +703,7 @@ describe("durable bounded agent loop", () => {
       {
         id: "too_many_calls",
         content: "",
-        reasoningContent: "Try five calls",
+        providerState: "Try five calls",
         toolCalls: calls,
         finishReason: "tool_calls",
         usage: emptyUsage,
@@ -765,7 +774,7 @@ describe("durable bounded agent loop", () => {
         {
           id: "response_tool_error",
           content: "",
-          reasoningContent: null,
+          providerState: null,
           toolCalls: [
             { id: "call_error", name: "test.echo", argumentsJson: '{"value":"read"}' },
           ],
@@ -775,7 +784,7 @@ describe("durable bounded agent loop", () => {
         {
           id: "response_after_error",
           content: "The provider read failed.",
-          reasoningContent: null,
+          providerState: null,
           toolCalls: [],
           finishReason: "stop",
           usage: emptyUsage,
@@ -978,7 +987,7 @@ function toolResponse(id: string, callId: string): ModelResponse {
   return {
     id,
     content: "",
-    reasoningContent: "Keep using the tool",
+    providerState: "Keep using the tool",
     toolCalls: [
       { id: callId, name: "test.echo", argumentsJson: "{\"value\":\"again\"}" },
     ],
@@ -1015,7 +1024,7 @@ function testRuntimeConfig(database: TestDatabase): RuntimeConfig {
     SENDBLUE_BASE_URL: "https://api.sendblue.co",
     USER_PHONE_NUMBER: "+15559990000",
     PUBLIC_BASE_URL: "https://assistant.example",
-    DEEPSEEK_API_KEY: "deepseek_test_key",
+    GEMINI_API_KEY: "gemini_test_key",
     GOOGLE_CLIENT_ID: "google_test_client",
     GOOGLE_CLIENT_SECRET: "google_test_secret",
     GOOGLE_WORKSPACE_SCOPES: "openid email https://www.googleapis.com/auth/gmail.readonly",

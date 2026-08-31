@@ -56,7 +56,7 @@ interface RunRow {
 interface MessageRow {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
-  reasoning_content: string | null;
+  provider_state: string | null;
   tool_calls_json: string | null;
   tool_call_id: string | null;
 }
@@ -209,9 +209,9 @@ export class AgentRunStore {
     const message: ModelMessage = {
       role: "assistant",
       content: response.content,
-      ...(response.reasoningContent === null
+      ...(response.providerState === null
         ? {}
-        : { reasoningContent: response.reasoningContent }),
+        : { providerState: response.providerState }),
       ...(response.toolCalls.length === 0 ? {} : { toolCalls: response.toolCalls }),
     };
     const transaction = this.#db.transaction(() => {
@@ -249,7 +249,7 @@ export class AgentRunStore {
   loadMessages(runId: RunId): readonly ModelMessage[] {
     return this.#db
       .prepare<{ run_id: string }, MessageRow>(`
-        SELECT role, content, reasoning_content, tool_calls_json, tool_call_id
+        SELECT role, content, reasoning_content AS provider_state, tool_calls_json, tool_call_id
         FROM agent_messages WHERE run_id = @run_id ORDER BY sequence
       `)
       .all({ run_id: runId })
@@ -467,13 +467,13 @@ export class AgentRunStore {
       throw new Error("Cannot allocate an agent transcript sequence");
     }
     const contentBytes = Buffer.byteLength(message.content);
-    const reasoning = message.role === "assistant" ? message.reasoningContent ?? null : null;
+    const providerState = message.role === "assistant" ? message.providerState ?? null : null;
     const toolCalls = message.role === "assistant" ? message.toolCalls ?? null : null;
     const toolCallId = message.role === "tool" ? message.toolCallId : null;
     const toolCallsJson = toolCalls === null ? null : canonicalJson(toolCalls);
     const byteCount =
       contentBytes +
-      (reasoning === null ? 0 : Buffer.byteLength(reasoning)) +
+      (providerState === null ? 0 : Buffer.byteLength(providerState)) +
       (toolCallsJson === null ? 0 : Buffer.byteLength(toolCallsJson));
     const now = Date.now();
     this.#db
@@ -482,7 +482,7 @@ export class AgentRunStore {
         sequence: number;
         role: string;
         content: string;
-        reasoning_content: string | null;
+        provider_state: string | null;
         tool_calls_json: string | null;
         tool_call_id: string | null;
         provider_response_id: string | null;
@@ -496,7 +496,7 @@ export class AgentRunStore {
           tool_call_id, provider_response_id, finish_reason, usage_json,
           byte_count, created_at_ms
         ) VALUES (
-          @run_id, @sequence, @role, @content, @reasoning_content, @tool_calls_json,
+          @run_id, @sequence, @role, @content, @provider_state, @tool_calls_json,
           @tool_call_id, @provider_response_id, @finish_reason, @usage_json,
           @byte_count, @now_ms
         )
@@ -506,7 +506,7 @@ export class AgentRunStore {
         sequence: sequence.sequence,
         role: message.role,
         content: message.content,
-        reasoning_content: reasoning,
+        provider_state: providerState,
         tool_calls_json: toolCallsJson,
         tool_call_id: toolCallId,
         provider_response_id: metadata.providerResponseId ?? null,
@@ -590,7 +590,7 @@ function toModelMessage(row: MessageRow): ModelMessage {
     return {
       role: "assistant",
       content: row.content,
-      ...(row.reasoning_content === null ? {} : { reasoningContent: row.reasoning_content }),
+      ...(row.provider_state === null ? {} : { providerState: row.provider_state }),
       ...(row.tool_calls_json === null
         ? {}
         : { toolCalls: JSON.parse(row.tool_calls_json) as ModelToolCall[] }),

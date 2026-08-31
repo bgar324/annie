@@ -5,7 +5,7 @@ export interface ReplayTranscriptEntry {
   sequence: number;
   role: "system" | "user" | "assistant" | "tool";
   content: string;
-  reasoningContent: string | null;
+  providerState: string | null;
   toolCalls: unknown;
   toolCallId: string | null;
 }
@@ -44,7 +44,7 @@ interface ReplayMessageRow {
   sequence: number;
   role: ReplayTranscriptEntry["role"];
   content: string;
-  reasoning_content: string | null;
+  provider_state: string | null;
   tool_calls_json: string | null;
   tool_call_id: string | null;
 }
@@ -72,7 +72,7 @@ export function buildSafeReplay(db: Database.Database, traceId: TraceId): SafeRe
   }
   const transcript = db
     .prepare<{ run_id: string }, ReplayMessageRow>(`
-      SELECT sequence, role, content, reasoning_content, tool_calls_json, tool_call_id
+      SELECT sequence, role, content, reasoning_content AS provider_state, tool_calls_json, tool_call_id
       FROM agent_messages
       WHERE run_id = @run_id
       ORDER BY sequence
@@ -83,7 +83,7 @@ export function buildSafeReplay(db: Database.Database, traceId: TraceId): SafeRe
         sequence: message.sequence,
         role: message.role,
         content: message.content,
-        reasoningContent: message.reasoning_content,
+        providerState: message.provider_state,
         toolCalls: parseNullableJson(message.tool_calls_json),
         toolCallId: message.tool_call_id,
       }),
