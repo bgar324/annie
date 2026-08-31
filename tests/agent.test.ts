@@ -1,0 +1,1024 @@
+import { randomUUID } from "node:crypto";
+import { afterEach, describe, expect, it } from "vitest";
+import { AgentLoop } from "../src/agent/loop.js";
+import { DeepSeekChatModel } from "../src/agent/deepseek.js";
+import { ConversationHistoryStore } from "../src/agent/history.js";
+import type { ChatModel, ModelRequest, ModelResponse } from "../src/agent/model.js";
+import { AgentRunStore } from "../src/agent/store.js";
+import { ToolRegistry, type RegisteredTool } from "../src/agent/tools.js";
+import { loadRuntimeConfig, type RuntimeConfig } from "../src/config.js";
+import {
+  newInboundId,
+  newRunId,
+  newTraceId,
+  type InboundId,
+  type TraceId,
+} from "../src/core/ids.js";
+import type { ProviderFetch } from "../src/providers/fetch.js";
+import { createTraceRedactor } from "../src/tracing/redaction.js";
+import { TraceStore } from "../src/tracing/store.js";
+import { WriteStore } from "../src/writes/store.js";
+import { createTestDatabase, type TestDatabase } from "./helpers.js";
+
+const databases: TestDatabase[] = [];
+afterEach(() => {
+  for (const database of databases.splice(0)) {
+    database.cleanup();
+  }
+});
+
+describe("DeepSeek model adapter", () => {
+  it("uses the native thinking contract and preserves reasoning across tool rounds", async () => {
+    const harness = modelHarness();
+    let requestedUrl = "";
+    let requestedBody: Record<string, unknown> = {};
+    const model = new DeepSeekChatModel({
+      config: harness.config,
+      traces: harness.traces,
+      fetchImpl: async (input, init) => {
+        const request = new Request(input, init);
+        requestedUrl = request.url;
+        requestedBody = (await request.json()) as Record<string, unknown>;
+        return completionResponse({
+          id: "response_1",
+          finish_reason: "tool_calls",
+          message: {
+            content: null,
+            reasoning_content: "second exact thought",
+            tool_calls: [
+              {
+                id: "call_a",
+                type: "function",
+                function: { name: "test_echo", arguments: "{\"value\":\"a\"}" },
+              },
+              {
+                id: "call_b",
+                type: "function",
+                function: { name: "test_echo", arguments: "{\"value\":\"b\"}" },
+              },
+            ],
+          },
+        });
+      },
+    });
+    const traceId = newTraceId();
+    const response = await model.complete({
+      traceId,
+      runId: newRunId(),
+      messages: [
+        { role: "user", content: "Do both" },
+        {
+          role: "assistant",
+          content: "",
+          reasoningContent: "first exact thought",
+          toolCalls: [
+            { id: "prior_call", name: "test.echo", argumentsJson: "{\"value\":1}" },
+          ],
+        },
+        { role: "tool", toolCallId: "prior_call", content: "{\"ok\":true}" },
+      ],
+      tools: [echoTool.definition],
+    });
+
+    expect(requestedUrl).toBe("https://api.deepseek.com/chat/completions");
+    expect(requestedBody).toMatchObject({
+      model: "deepseek-v4-flash",
+      thinking: { type: "enabled" },
+      reasoning_effort: "high",
+      messages: [
+        { role: "user", content: "Do both" },
+        {
+          role: "assistant",
+          content: "",
+          reasoning_content: "first exact thought",
+          tool_calls: [
+            {
+              id: "prior_call",
+              type: "function",
+              function: { name: "test_echo", arguments: "{\"value\":1}" },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "prior_call", content: "{\"ok\":true}" },
+      ],
+    });
+    expect(requestedBody).not.toHaveProperty("tool_choice");
+    expect(response).toMatchObject({
+      id: "response_1",
+      content: "",
+      reasoningContent: "second exact thought",
+      toolCalls: [
+        { id: "call_a", name: "test.echo", argumentsJson: "{\"value\":\"a\"}" },
+        { id: "call_b", name: "test.echo", argumentsJson: "{\"value\":\"b\"}" },
+      ],
+    });
+  });
+
+  it("omits the tools property for an explicit empty registry", async () => {
+    const harness = modelHarness();
+    let requestedBody: Record<string, unknown> = {};
+    const model = new DeepSeekChatModel({
+      config: harness.config,
+      traces: harness.traces,
+      fetchImpl: async (input, init) => {
+        requestedBody = (await new Request(input, init).json()) as Record<string, unknown>;
+        return completionResponse({
+          finish_reason: "stop",
+          message: { content: "hello", reasoning_content: "private" },
+        });
+      },
+    });
+
+    await model.complete({
+      traceId: newTraceId(),
+      runId: newRunId(),
+      messages: [{ role: "user", content: "Hello" }],
+      tools: ToolRegistry.empty().definitions(),
+    });
+
+    expect(requestedBody).not.toHaveProperty("tools");
+    expect(requestedBody).not.toHaveProperty("tool_choice");
+  });
+
+  it("disables thinking and tools for memory maintenance", async () => {
+    const harness = modelHarness();
+    let requestedBody: Record<string, unknown> = {};
+    const model = new DeepSeekChatModel({
+      config: harness.config,
+      traces: harness.traces,
+      fetchImpl: async (input, init) => {
+        requestedBody = (await new Request(input, init).json()) as Record<string, unknown>;
+        return completionResponse({
+          finish_reason: "stop",
+          message: {
+            content: "{\"action\":\"unchanged\"}",
+            reasoning_content: null,
+          },
+        });
+      },
+    });
+
+    await expect(
+      model.maintainMemory({
+        traceId: newTraceId(),
+        runId: newRunId(),
+        signal: new AbortController().signal,
+        messages: [
+          { role: "system", content: "Maintain memory." },
+          { role: "user", content: "{}" },
+        ],
+      }),
+    ).resolves.toMatchObject({ content: "{\"action\":\"unchanged\"}" });
+    expect(requestedBody).toMatchObject({ thinking: { type: "disabled" } });
+    expect(requestedBody).not.toHaveProperty("reasoning_effort");
+    expect(requestedBody).not.toHaveProperty("tools");
+    expect(requestedBody).not.toHaveProperty("tool_choice");
+  });
+
+  it.each([429, 500, 503])("retries HTTP %s twice, then succeeds", async (status) => {
+    const harness = modelHarness();
+    let requests = 0;
+    const waits: number[] = [];
+    const model = new DeepSeekChatModel({
+      config: harness.config,
+      traces: harness.traces,
+      fetchImpl: async () => {
+        requests += 1;
+        if (requests < 3) {
+          return new Response("temporary", { status });
+        }
+        return completionResponse({
+          finish_reason: "stop",
+          message: { content: "done", reasoning_content: "complete" },
+        });
+      },
+      sleep: async (milliseconds) => {
+        waits.push(milliseconds);
+      },
+    });
+
+    await expect(
+      model.complete({
+        traceId: newTraceId(),
+        runId: newRunId(),
+        messages: [{ role: "user", content: "retry" }],
+        tools: [],
+      }),
+    ).resolves.toMatchObject({ content: "done" });
+    expect(requests).toBe(3);
+    expect(waits).toEqual([250, 500]);
+  });
+
+
+  it("honors and bounds DeepSeek Retry-After on HTTP 429", async () => {
+    const harness = modelHarness();
+    let requests = 0;
+    const waits: number[] = [];
+    const model = new DeepSeekChatModel({
+      config: harness.config,
+      traces: harness.traces,
+      fetchImpl: async () => {
+        requests += 1;
+        if (requests === 1) {
+          return new Response("rate limited", {
+            status: 429,
+            headers: { "retry-after": "60" },
+          });
+        }
+        return completionResponse({
+          finish_reason: "stop",
+          message: { content: "done", reasoning_content: "complete" },
+        });
+      },
+      sleep: async (milliseconds) => {
+        waits.push(milliseconds);
+      },
+    });
+
+    await expect(
+      model.complete({
+        traceId: newTraceId(),
+        runId: newRunId(),
+        messages: [{ role: "user", content: "retry later" }],
+        tools: [],
+      }),
+    ).resolves.toMatchObject({ content: "done" });
+    expect(requests).toBe(2);
+    expect(waits).toEqual([5_000]);
+  });
+  it("aborts memory-maintenance retry backoff at the run deadline", async () => {
+    const harness = modelHarness();
+    const sleepStarted = Promise.withResolvers<void>();
+    const neverFinishSleeping = Promise.withResolvers<void>();
+    const controller = new AbortController();
+    let requests = 0;
+    const model = new DeepSeekChatModel({
+      config: harness.config,
+      traces: harness.traces,
+      fetchImpl: async () => {
+        requests += 1;
+        return new Response("temporary", { status: 503 });
+      },
+      sleep: async () => {
+        sleepStarted.resolve();
+        await neverFinishSleeping.promise;
+      },
+    });
+    const pending = model.maintainMemory({
+      traceId: newTraceId(),
+      runId: newRunId(),
+      signal: controller.signal,
+      messages: [
+        { role: "system", content: "Maintain memory." },
+        { role: "user", content: "{}" },
+      ],
+    });
+    await sleepStarted.promise;
+
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(requests).toBe(1);
+  });
+
+  it("does not retry HTTP 502", async () => {
+    const harness = modelHarness();
+    let requests = 0;
+    const model = new DeepSeekChatModel({
+      config: harness.config,
+      traces: harness.traces,
+      fetchImpl: async () => {
+        requests += 1;
+        return new Response("bad gateway", { status: 502 });
+      },
+      sleep: async () => undefined,
+    });
+
+    await expect(
+      model.complete({
+        traceId: newTraceId(),
+        runId: newRunId(),
+        messages: [{ role: "user", content: "do not retry" }],
+        tools: [],
+      }),
+    ).rejects.toMatchObject({ kind: "terminal", status: 502 });
+    expect(requests).toBe(1);
+  });
+});
+
+describe("durable bounded agent loop", () => {
+  it("executes multiple tool calls sequentially and preserves their correlation", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Do both");
+    const order: string[] = [];
+    const requests: ModelRequest[] = [];
+    const model = scriptedModel(
+      [
+        {
+          id: "response_tools",
+          content: "",
+          reasoningContent: "Need two reads",
+          toolCalls: [
+            { id: "call_1", name: "test.echo", argumentsJson: "{\"value\":\"first\"}" },
+            { id: "call_2", name: "test.echo", argumentsJson: "{\"value\":\"second\"}" },
+          ],
+          finishReason: "tool_calls",
+          usage: emptyUsage,
+        },
+        {
+          id: "response_final",
+          content: "Both are complete.",
+          reasoningContent: "Combined both results",
+          toolCalls: [],
+          finishReason: "stop",
+          usage: emptyUsage,
+        },
+      ],
+      requests,
+    );
+    const registry = new ToolRegistry([
+      {
+        ...echoTool,
+        async execute(argumentsValue) {
+          order.push(String(argumentsValue.value));
+          return { ok: true, value: argumentsValue.value };
+        },
+      },
+    ]);
+    const loop = createAgentLoop(harness.runs, harness.writes, model, registry);
+
+    const result = await loop.execute({
+      inboundId,
+      traceId,
+      initialMessages: [
+        { role: "system", content: "Be concise." },
+        { role: "user", content: "Do both" },
+      ],
+    });
+
+    expect(result).toMatchObject({ outcome: "completed", response: "Both are complete." });
+    expect(order).toEqual(["first", "second"]);
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.messages).toEqual([
+      { role: "system", content: "Be concise." },
+      { role: "user", content: "Do both" },
+      {
+        role: "assistant",
+        content: "",
+        reasoningContent: "Need two reads",
+        toolCalls: [
+          { id: "call_1", name: "test.echo", argumentsJson: "{\"value\":\"first\"}" },
+          { id: "call_2", name: "test.echo", argumentsJson: "{\"value\":\"second\"}" },
+        ],
+      },
+      { role: "tool", toolCallId: "call_1", content: "{\"ok\":true,\"value\":\"first\"}" },
+      { role: "tool", toolCallId: "call_2", content: "{\"ok\":true,\"value\":\"second\"}" },
+    ]);
+    expect(harness.runs.getRequired(result.run.id)).toMatchObject({
+      phase: "completed",
+      modelRequests: 2,
+      toolCalls: 2,
+      finalResponse: "Both are complete.",
+    });
+  });
+
+  it("resumes a committed tool result without executing the provider operation again", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Resume");
+    const run = harness.runs.startOrResume({
+      inboundId,
+      traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    const call = { id: "durable_call", name: "test.echo", argumentsJson: "{\"value\":\"saved\"}" };
+    harness.runs.appendInitialMessages(run.id, [
+      { role: "system", content: "Resume safely." },
+      { role: "user", content: "Resume" },
+    ]);
+    harness.runs.appendAssistant(run.id, {
+      id: "prior_response",
+      content: "",
+      reasoningContent: "Persist this",
+      toolCalls: [call],
+      finishReason: "tool_calls",
+      usage: emptyUsage,
+    });
+    const execution = harness.runs.prepareTool({
+      runId: run.id,
+      call,
+      operationClass: "read",
+      maximumToolCalls: 4,
+    });
+    harness.runs.markToolRunning(execution.id);
+    harness.runs.finishTool(execution.id, "succeeded", { ok: true, value: "saved" });
+    let providerExecutions = 0;
+    const registry = new ToolRegistry([
+      {
+        ...echoTool,
+        async execute() {
+          providerExecutions += 1;
+          return { ok: true, value: "repeated" };
+        },
+      },
+    ]);
+    const model = scriptedModel([
+      {
+        id: "resumed_final",
+        content: "Recovered.",
+        reasoningContent: "Used the durable result",
+        toolCalls: [],
+        finishReason: "stop",
+        usage: emptyUsage,
+      },
+    ]);
+
+    const result = await createAgentLoop(harness.runs, harness.writes, model, registry).execute({
+      inboundId,
+      traceId,
+      initialMessages: [],
+    });
+
+    expect(result.response).toBe("Recovered.");
+    expect(providerExecutions).toBe(0);
+    expect(harness.runs.loadMessages(run.id).at(-2)).toEqual({
+      role: "tool",
+      toolCallId: "durable_call",
+      content: "{\"ok\":true,\"value\":\"saved\"}",
+    });
+  });
+
+  it("bounds final responses to the outbound message character limit", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Be concise");
+    const model = scriptedModel([
+      {
+        id: "oversized_final",
+        content: "x".repeat(18_997),
+        reasoningContent: null,
+        toolCalls: [],
+        finishReason: "stop",
+        usage: emptyUsage,
+      },
+    ]);
+
+    const result = await createAgentLoop(
+      harness.runs,
+      harness.writes,
+      model,
+      ToolRegistry.empty(),
+    ).execute({
+      inboundId,
+      traceId,
+      initialMessages: [{ role: "user", content: "Be concise" }],
+    });
+
+    expect(result).toMatchObject({
+      outcome: "bounded",
+      run: { failureCode: "response_too_large" },
+    });
+  });
+
+  it("does not dispatch a persisted write after the durable run deadline", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Too late");
+    const run = harness.runs.startOrResume({
+      inboundId,
+      traceId,
+      deadlineAtMs: Date.now() - 1,
+    });
+    const call = {
+      id: "expired_write",
+      name: "test.write",
+      argumentsJson: "{\"value\":\"stale\"}",
+    };
+    harness.runs.appendInitialMessages(run.id, [{ role: "user", content: "Too late" }]);
+    harness.runs.appendAssistant(run.id, {
+      id: "expired_response",
+      content: "",
+      reasoningContent: "A stale provider write",
+      toolCalls: [call],
+      finishReason: "tool_calls",
+      usage: emptyUsage,
+    });
+    let providerExecutions = 0;
+    const registry = new ToolRegistry([
+      {
+        definition: {
+          name: "test.write",
+          description: "Writes a value.",
+          parameters: {
+            type: "object",
+            properties: { value: { type: "string" } },
+            required: ["value"],
+            additionalProperties: false,
+          },
+        },
+        operationClass: "write",
+        async execute() {
+          providerExecutions += 1;
+          return { ok: true };
+        },
+      },
+    ]);
+
+    const result = await createAgentLoop(
+      harness.runs,
+      harness.writes,
+      scriptedModel([]),
+      registry,
+    ).execute({
+      inboundId,
+      traceId,
+      initialMessages: [],
+    });
+
+    expect(result).toMatchObject({ outcome: "bounded", run: { failureCode: "run_deadline" } });
+    expect(providerExecutions).toBe(0);
+  });
+
+  it("marks a dispatched running write ambiguous instead of re-executing it after a crash", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Write once");
+    const run = harness.runs.startOrResume({
+      inboundId,
+      traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    const call = {
+      id: "write_call",
+      name: "test.write",
+      argumentsJson: "{\"value\":\"once\"}",
+    };
+    harness.runs.appendInitialMessages(run.id, [{ role: "user", content: "Write once" }]);
+    harness.runs.appendAssistant(run.id, {
+      id: "write_response",
+      content: "",
+      reasoningContent: "One provider write",
+      toolCalls: [call],
+      finishReason: "tool_calls",
+      usage: emptyUsage,
+    });
+    const execution = harness.runs.prepareTool({
+      runId: run.id,
+      call,
+      operationClass: "write",
+      maximumToolCalls: 4,
+    });
+    harness.runs.markToolRunning(execution.id);
+    const write = harness.writes.prepare({
+      traceId,
+      runId: run.id,
+      toolExecutionId: execution.id,
+      kind: "notion_update_page",
+      request: { value: "once" },
+      safeSummary: { operation: "update page" },
+    });
+    expect(
+      harness.writes.prepare({
+        traceId,
+        runId: run.id,
+        toolExecutionId: execution.id,
+        kind: "notion_update_page",
+        request: { value: "once" },
+        safeSummary: { operation: "update page" },
+      }).id,
+    ).toBe(write.id);
+    harness.writes.beginAttempt({ writeId: write.id, traceId });
+    let providerExecutions = 0;
+    const registry = new ToolRegistry([
+      {
+        definition: {
+          name: "test.write",
+          description: "Writes once.",
+          parameters: {
+            type: "object",
+            properties: { value: { type: "string" } },
+            required: ["value"],
+            additionalProperties: false,
+          },
+        },
+        operationClass: "write",
+        async execute() {
+          providerExecutions += 1;
+          return { ok: true };
+        },
+      },
+    ]);
+
+    const result = await createAgentLoop(
+      harness.runs,
+      harness.writes,
+      scriptedModel([]),
+      registry,
+    ).execute({
+      inboundId,
+      traceId,
+      initialMessages: [],
+      replay: true,
+    });
+
+    expect(providerExecutions).toBe(0);
+    expect(result).toMatchObject({
+      outcome: "bounded",
+      response: "I stopped because the provider may have accepted a write. I did not repeat it.",
+      run: { phase: "blocked", failureCode: "ambiguous_write" },
+    });
+    expect(harness.writes.get(write.id)?.state).toBe("ambiguous");
+    expect(harness.runs.getToolRequired(execution.id).status).toBe("ambiguous");
+  });
+
+  it("stops before executing a tool round beyond the configured bound", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Loop forever");
+    let executions = 0;
+    const registry = new ToolRegistry([
+      {
+        ...echoTool,
+        async execute() {
+          executions += 1;
+          return { ok: true };
+        },
+      },
+    ]);
+    const model = scriptedModel([
+      toolResponse("first_round", "call_first"),
+      toolResponse("second_round", "call_second"),
+    ]);
+    const loop = new AgentLoop({
+      model,
+      tools: registry,
+      runs: harness.runs,
+      writes: harness.writes,
+      limits: {
+        maxToolRounds: 1,
+        maxToolCalls: 4,
+        maxProviderWrites: 1,
+        maxRunMs: 60_000,
+      },
+    });
+
+    const result = await loop.execute({
+      inboundId,
+      traceId,
+      initialMessages: [{ role: "user", content: "Loop forever" }],
+    });
+
+    expect(result.outcome).toBe("bounded");
+    expect(result.run).toMatchObject({ phase: "blocked", failureCode: "round_limit" });
+    expect(executions).toBe(1);
+  });
+
+  it("executes none of five tool calls returned in one model response", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(
+      harness.database,
+      harness.traces,
+      "Too many calls",
+    );
+    let executions = 0;
+    const registry = new ToolRegistry([
+      {
+        ...echoTool,
+        async execute() {
+          executions += 1;
+          return { ok: true };
+        },
+      },
+    ]);
+    const calls = Array.from({ length: 5 }, (_, index) => ({
+      id: `call_${index}`,
+      name: "test.echo",
+      argumentsJson: `{\"value\":\"${index}\"}`,
+    }));
+    const model = scriptedModel([
+      {
+        id: "too_many_calls",
+        content: "",
+        reasoningContent: "Try five calls",
+        toolCalls: calls,
+        finishReason: "tool_calls",
+        usage: emptyUsage,
+      },
+    ]);
+
+    const result = await createAgentLoop(
+      harness.runs,
+      harness.writes,
+      model,
+      registry,
+    ).execute({
+      inboundId,
+      traceId,
+      initialMessages: [{ role: "user", content: "Too many calls" }],
+    });
+
+    expect(result).toMatchObject({
+      outcome: "bounded",
+      run: { phase: "blocked", failureCode: "tool_response_limit", toolCalls: 0 },
+    });
+    expect(executions).toBe(0);
+  });
+
+  it("loads only bounded completed history from the same chat", () => {
+    const harness = agentHarness();
+    const first = insertInbound(harness.database, harness.traces, "First", 1);
+    const firstRun = harness.runs.startOrResume({
+      inboundId: first.inboundId,
+      traceId: first.traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    harness.runs.complete(firstRun.id, "First answer");
+    const second = insertInbound(harness.database, harness.traces, "Second", 2);
+    const secondRun = harness.runs.startOrResume({
+      inboundId: second.inboundId,
+      traceId: second.traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    harness.runs.complete(secondRun.id, "Second answer");
+    const current = insertInbound(harness.database, harness.traces, "Current", 3);
+
+    expect(
+      new ConversationHistoryStore(harness.database.handle.db, 2, 1_024).loadBefore(
+        current.inboundId,
+      ),
+    ).toEqual([
+      { role: "user", content: "Second" },
+      { role: "assistant", content: "Second answer" },
+    ]);
+    expect(
+      new ConversationHistoryStore(harness.database.handle.db, 2, 1).loadBefore(
+        current.inboundId,
+      ),
+    ).toEqual([]);
+  });
+
+  it("keeps unexpected provider error details out of the model transcript", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(
+      harness.database,
+      harness.traces,
+      "Read from the provider",
+    );
+    const requests: ModelRequest[] = [];
+    const model = scriptedModel(
+      [
+        {
+          id: "response_tool_error",
+          content: "",
+          reasoningContent: null,
+          toolCalls: [
+            { id: "call_error", name: "test.echo", argumentsJson: '{"value":"read"}' },
+          ],
+          finishReason: "tool_calls",
+          usage: emptyUsage,
+        },
+        {
+          id: "response_after_error",
+          content: "The provider read failed.",
+          reasoningContent: null,
+          toolCalls: [],
+          finishReason: "stop",
+          usage: emptyUsage,
+        },
+      ],
+      requests,
+    );
+    const registry = new ToolRegistry([
+      {
+        ...echoTool,
+        async execute() {
+          throw new Error("credential bearer-secret and connection conn_internal");
+        },
+      },
+    ]);
+    const loop = createAgentLoop(harness.runs, harness.writes, model, registry);
+
+    await loop.execute({
+      inboundId,
+      traceId,
+      initialMessages: [{ role: "user", content: "Read from the provider" }],
+    });
+
+    const toolMessage = requests[1]?.messages.find((message) => message.role === "tool");
+    expect(toolMessage).toEqual({
+      role: "tool",
+      toolCallId: "call_error",
+      content:
+        '{"error":{"code":"tool_failed","message":"The tool failed at its provider boundary"},"ok":false}',
+    });
+    expect(JSON.stringify(requests[1]?.messages)).not.toContain("bearer-secret");
+    expect(JSON.stringify(requests[1]?.messages)).not.toContain("conn_internal");
+  });
+
+  it("rejects invalid tool arguments before invoking the handler", async () => {
+    let executions = 0;
+    const registry = new ToolRegistry([
+      {
+        ...echoTool,
+        async execute() {
+          executions += 1;
+          return null;
+        },
+      },
+    ]);
+
+    await expect(
+      registry.execute({
+        name: "test.echo",
+
+        argumentsJson: "{\"unexpected\":true}",
+        context: {
+          runId: newRunId(),
+          traceId: newTraceId(),
+          toolExecutionId: "tool_test" as never,
+          connectionId: null,
+          replay: false,
+        },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_arguments" });
+    expect(executions).toBe(0);
+  });
+});
+
+const emptyUsage = {
+  promptTokens: null,
+  completionTokens: null,
+  totalTokens: null,
+};
+const echoTool: RegisteredTool = {
+  definition: {
+    name: "test.echo",
+    description: "Returns a value.",
+    parameters: {
+      type: "object",
+      properties: { value: { type: "string" } },
+      required: ["value"],
+      additionalProperties: false,
+    },
+  },
+  operationClass: "read",
+  async execute(argumentsValue) {
+    return { ok: true, value: argumentsValue.value };
+  },
+};
+
+function modelHarness(): {
+  database: TestDatabase;
+  config: RuntimeConfig;
+  traces: TraceStore;
+} {
+  const database = createTestDatabase();
+  databases.push(database);
+  return {
+    database,
+    config: testRuntimeConfig(database),
+    traces: new TraceStore(database.handle.db, createTraceRedactor([])),
+  };
+}
+
+function agentHarness(): {
+  database: TestDatabase;
+  traces: TraceStore;
+  runs: AgentRunStore;
+  writes: WriteStore;
+} {
+  const database = createTestDatabase();
+  databases.push(database);
+  const traces = new TraceStore(database.handle.db, createTraceRedactor([]));
+  return {
+    database,
+    traces,
+    runs: new AgentRunStore(database.handle.db, traces),
+    writes: new WriteStore(database.handle.db, traces),
+  };
+}
+
+function insertInbound(
+  database: TestDatabase,
+  traces: TraceStore,
+  text: string,
+  sequence = 1,
+): { inboundId: InboundId; traceId: TraceId } {
+  const inboundId = newInboundId();
+  const traceId = newTraceId();
+  const deliveryId = `delivery_${randomUUID()}`;
+  const providerMessageId = `message_${randomUUID()}`;
+  const now = Date.now();
+  traces.append({
+    traceId,
+    component: "test",
+    event: "inbound_fixture",
+    outcome: "ready",
+    data: {},
+  });
+  const transaction = database.handle.db.transaction(() => {
+    database.handle.db
+      .prepare(`
+        INSERT INTO webhook_deliveries(
+          id, provider_delivery_id, provider_message_id, event_kind, line_id,
+          line_handle, outbox_id, normalized_json, trace_id, received_at_ms
+        ) VALUES (?, ?, ?, 'message.created', 'line_test', '+15551110000', NULL, '{}', ?, ?)
+      `)
+      .run(deliveryId, deliveryId, providerMessageId, traceId, now);
+    database.handle.db
+      .prepare(`
+        INSERT INTO inbound_messages(
+          id, delivery_id, provider_message_id, chat_id, guid, sender,
+          line_id, line_handle, sequence, state, text, is_audio,
+          attachment_json, trace_id, created_at_ms, updated_at_ms
+        ) VALUES (?, ?, ?, 'chat_test', ?, '+15559990000',
+                  'line_test', '+15551110000', ?, 'ready', ?, 0,
+                  NULL, ?, ?, ?)
+      `)
+      .run(inboundId, deliveryId, providerMessageId, providerMessageId, sequence, text, traceId, now, now);
+  });
+  transaction.immediate();
+  return { inboundId, traceId };
+}
+
+function scriptedModel(
+  responses: readonly ModelResponse[],
+  requests: ModelRequest[] = [],
+): ChatModel {
+  let index = 0;
+  return {
+    async complete(request) {
+      requests.push(request);
+      const response = responses[index];
+      index += 1;
+      if (response === undefined) {
+        throw new Error("No scripted model response remains");
+      }
+      return response;
+    },
+  };
+}
+
+function createAgentLoop(
+  runs: AgentRunStore,
+  writes: WriteStore,
+  model: ChatModel,
+  tools: ToolRegistry,
+): AgentLoop {
+  return new AgentLoop({
+    model,
+    tools,
+    runs,
+    writes,
+    limits: {
+      maxToolRounds: 4,
+      maxToolCalls: 8,
+      maxProviderWrites: 2,
+      maxRunMs: 60_000,
+    },
+  });
+}
+
+function toolResponse(id: string, callId: string): ModelResponse {
+  return {
+    id,
+    content: "",
+    reasoningContent: "Keep using the tool",
+    toolCalls: [
+      { id: callId, name: "test.echo", argumentsJson: "{\"value\":\"again\"}" },
+    ],
+    finishReason: "tool_calls",
+    usage: emptyUsage,
+  };
+}
+
+function completionResponse(choice: {
+  id?: string;
+  finish_reason: string;
+  message: Record<string, unknown>;
+}): Response {
+  return new Response(
+    JSON.stringify({
+      ...(choice.id === undefined ? {} : { id: choice.id }),
+      choices: [{ finish_reason: choice.finish_reason, message: choice.message }],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
+function testRuntimeConfig(database: TestDatabase): RuntimeConfig {
+  return loadRuntimeConfig({
+    NODE_ENV: "test",
+    DATA_DIR: database.directory,
+    DATABASE_PATH: database.config.databasePath,
+    MEMORY_PATH: database.config.memoryPath,
+    TRACE_DIR: database.config.traceDir,
+    SENDBLUE_API_KEY_ID: "sendblue_test_key_id",
+    SENDBLUE_API_SECRET_KEY: "sendblue_test_secret_key",
+    SENDBLUE_FROM_NUMBER: "+15551112222",
+    SENDBLUE_BASE_URL: "https://api.sendblue.co",
+    USER_PHONE_NUMBER: "+15559990000",
+    PUBLIC_BASE_URL: "https://assistant.example",
+    DEEPSEEK_API_KEY: "deepseek_test_key",
+    GOOGLE_CLIENT_ID: "google_test_client",
+    GOOGLE_CLIENT_SECRET: "google_test_secret",
+    GOOGLE_WORKSPACE_SCOPES: "openid email https://www.googleapis.com/auth/gmail.readonly",
+    CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
+  });
+}
