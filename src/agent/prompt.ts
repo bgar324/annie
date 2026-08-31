@@ -59,6 +59,7 @@ export const assistantResponseFormatReminder = [
   "The first character of every item line must be ›. Never place a hyphen, another bullet, or whitespace before ›.",
   "Do not write an introductory sentence before the first emoji header.",
   "Wrong patterns: wrapping any header in Unicode U+002A; starting an item with a hyphen followed by ›; placing an introduction before the first emoji header.",
+  "Incorrect example — never copy:\n**worth a peek:**\n- › item",
   "Correct example:\n📬 inbox:\n\n🚨 needs attention:\n› first item\n\n👀 worth a peek:\n› second item\n\n🗑️ ignore:\n› third item",
   "A calendar report must start with 📅 followed by the requested period and a colon, for example 📅 today:.",
   "Do not mention account traversal, accounts with no results, or duplicate appearances caused by shared calendars unless the user asks.",

@@ -501,6 +501,9 @@ describe("durable bounded agent loop", () => {
       "Wrong patterns: wrapping any header in Unicode U+002A; starting an item with a hyphen followed by ›; placing an introduction before the first emoji header.",
     );
     expect(assistantResponseFormatReminder).toContain(
+      "Incorrect example — never copy:\n**worth a peek:**\n- › item",
+    );
+    expect(assistantResponseFormatReminder).toContain(
       "Correct example:\n📬 inbox:\n\n🚨 needs attention:\n› first item\n\n👀 worth a peek:\n› second item\n\n🗑️ ignore:\n› third item",
     );
     expect(requests[1]?.messages).toEqual([
