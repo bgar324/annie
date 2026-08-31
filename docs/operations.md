@@ -15,7 +15,7 @@ Then deploy:
 1. Create a Railway service from this repository. Railway detects and builds the root `Dockerfile`.
 2. In the service deployment settings, keep one replica, set the health-check path to `/health` with a 30-second timeout, and use the `ON_FAILURE` restart policy with five retries. The image already starts `node dist/main.js`.
 3. Add a persistent volume mounted at `/app/data`.
-4. Set `RAILWAY_VOLUME_MOUNT_PATH=/app/data` and the required production variables from `.env.example`. Do not override `DATA_DIR` in production.
+4. Do not set `RAILWAY_VOLUME_MOUNT_PATH`, `DATA_DIR`, or `RAILWAY_RUN_UID`. Railway automatically provides the mount path, and the image starts as root only long enough to prepare the volume before dropping to `node`.
 5. Assign a public HTTPS domain and set `PUBLIC_BASE_URL` to its origin, without a trailing path.
 6. Register `https://<domain>/oauth/google/callback` as an authorized Google OAuth redirect URI.
 7. Confirm that Notion can reach these endpoints:
