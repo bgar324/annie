@@ -13,7 +13,7 @@ export type ModelMessage =
   | {
       role: "assistant";
       content: string;
-      reasoningContent?: string;
+      providerState?: string;
       toolCalls?: readonly ModelToolCall[];
     }
   | { role: "tool"; content: string; toolCallId: string };
@@ -33,7 +33,7 @@ export interface ModelUsage {
 export interface ModelResponse {
   id: string | null;
   content: string;
-  reasoningContent: string | null;
+  providerState: string | null;
   toolCalls: readonly ModelToolCall[];
   finishReason: string | null;
   usage: ModelUsage;

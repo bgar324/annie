@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { RuntimeConfig } from "../config.js";
+import { canonicalJson } from "../core/json.js";
 import { createTracedProviderFetch, type ProviderFetch } from "../providers/fetch.js";
 import type { TraceStore } from "../tracing/store.js";
 import {
@@ -13,28 +14,32 @@ import {
   type ModelResponse,
 } from "./model.js";
 
+const toolCallSchema = z
+  .object({
+    id: z.string().min(1),
+    type: z.literal("function"),
+    function: z.object({
+      name: z.string().min(1),
+      arguments: z.string(),
+    }),
+  })
+  .passthrough();
+
+const providerMessageSchema = z
+  .object({
+    role: z.literal("assistant").optional(),
+    content: z.string().nullish(),
+    tool_calls: z.array(toolCallSchema).nullish(),
+  })
+  .passthrough();
+
 const responseSchema = z.object({
   id: z.string().optional(),
   choices: z
     .array(
       z.object({
         finish_reason: z.string().nullish(),
-        message: z.object({
-          content: z.string().nullish(),
-          reasoning_content: z.string().nullish(),
-          tool_calls: z
-            .array(
-              z.object({
-                id: z.string().min(1),
-                type: z.literal("function"),
-                function: z.object({
-                  name: z.string().min(1),
-                  arguments: z.string(),
-                }),
-              }),
-            )
-            .nullish(),
-        }),
+        message: providerMessageSchema,
       }),
     )
     .min(1),
@@ -47,7 +52,7 @@ const responseSchema = z.object({
     .optional(),
 });
 
-export class DeepSeekChatModel implements ChatModel, MemoryMaintenanceModel {
+export class GeminiChatModel implements ChatModel, MemoryMaintenanceModel {
   readonly #config: RuntimeConfig;
   readonly #traces: TraceStore;
   readonly #fetchImpl: ProviderFetch | undefined;
@@ -67,30 +72,29 @@ export class DeepSeekChatModel implements ChatModel, MemoryMaintenanceModel {
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     const wireToolNames = new Map(
-      request.tools.map((tool) => [toDeepSeekToolName(tool.name), tool.name] as const),
+      request.tools.map((tool) => [toGeminiToolName(tool.name), tool.name] as const),
     );
     if (wireToolNames.size !== request.tools.length) {
-      throw new Error("Tool names collide after DeepSeek wire-name conversion");
+      throw new Error("Tool names collide after Gemini wire-name conversion");
     }
     return this.#request({
       traceId: request.traceId,
       runId: request.runId,
-      fetchComponent: "deepseek",
+      fetchComponent: "gemini",
       traceComponent: "model",
       ...(request.signal === undefined ? {} : { signal: request.signal }),
       wireToolNames,
       body: {
-        model: this.#config.deepseek.model,
-        messages: request.messages.map(toDeepSeekMessage),
-        thinking: { type: "enabled" },
-        reasoning_effort: this.#config.deepseek.reasoningEffort,
+        model: this.#config.gemini.model,
+        messages: request.messages.map(toGeminiMessage),
+        reasoning_effort: this.#config.gemini.reasoningEffort,
         ...(request.tools.length === 0
           ? {}
           : {
               tools: request.tools.map((tool) => ({
                 type: "function" as const,
                 function: {
-                  name: toDeepSeekToolName(tool.name),
+                  name: toGeminiToolName(tool.name),
                   description: tool.description,
                   parameters: tool.parameters,
                 },
@@ -104,20 +108,20 @@ export class DeepSeekChatModel implements ChatModel, MemoryMaintenanceModel {
     const response = await this.#request({
       traceId: request.traceId,
       runId: request.runId,
-      fetchComponent: "deepseek_memory",
+      fetchComponent: "gemini_memory",
       traceComponent: "memory_model",
       signal: request.signal,
       wireToolNames: new Map(),
       body: {
-        model: this.#config.deepseek.model,
+        model: this.#config.gemini.model,
         messages: request.messages,
-        thinking: { type: "disabled" },
+        reasoning_effort: this.#config.gemini.reasoningEffort,
       },
     });
     if (response.toolCalls.length > 0) {
       throw new ModelProviderError({
         kind: "terminal",
-        message: "DeepSeek returned tool calls during memory maintenance",
+        message: "Gemini returned tool calls during memory maintenance",
       });
     }
     return { id: response.id, content: response.content, usage: response.usage };
@@ -139,7 +143,7 @@ export class DeepSeekChatModel implements ChatModel, MemoryMaintenanceModel {
       timeoutMs: this.#config.limits.providerRequestTimeoutMs,
       ...(this.#fetchImpl === undefined ? {} : { fetchImpl: this.#fetchImpl }),
     });
-    const url = `${this.#config.deepseek.baseUrl}/chat/completions`;
+    const url = `${this.#config.gemini.baseUrl}/chat/completions`;
 
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       input.signal?.throwIfAborted();
@@ -150,7 +154,7 @@ export class DeepSeekChatModel implements ChatModel, MemoryMaintenanceModel {
           method: "POST",
           headers: {
             accept: "application/json",
-            authorization: `Bearer ${this.#config.deepseek.apiKey}`,
+            authorization: `Bearer ${this.#config.gemini.apiKey}`,
             "content-type": "application/json",
           },
           body: JSON.stringify(input.body),
@@ -166,7 +170,7 @@ export class DeepSeekChatModel implements ChatModel, MemoryMaintenanceModel {
         }
         throw new ModelProviderError({
           kind: "transient",
-          message: "DeepSeek could not be reached after three attempts",
+          message: "Gemini could not be reached after three attempts",
           cause: error,
         });
       }
@@ -175,20 +179,20 @@ export class DeepSeekChatModel implements ChatModel, MemoryMaintenanceModel {
       if (Buffer.byteLength(text) > 4_194_304) {
         throw new ModelProviderError({
           kind: "terminal",
-          message: "DeepSeek returned a response larger than 4 MiB",
+          message: "Gemini returned a response larger than 4 MiB",
           status: response.status,
           ...providerRequestMetadata(response),
         });
       }
       if (!response.ok) {
-        const retryable = response.status === 429 || response.status === 500 || response.status === 503;
+        const retryable = [429, 500, 502, 503, 504].includes(response.status);
         if (retryable && attempt < 3) {
           await waitForRetry(this.#sleep, retryDelay(response.headers, attempt), input.signal);
           continue;
         }
         throw new ModelProviderError({
           kind: response.status === 429 ? "rate_limited" : retryable ? "transient" : "terminal",
-          message: `DeepSeek returned HTTP ${response.status}`,
+          message: `Gemini returned HTTP ${response.status}`,
           status: response.status,
           ...providerRequestMetadata(response),
         });
@@ -200,7 +204,7 @@ export class DeepSeekChatModel implements ChatModel, MemoryMaintenanceModel {
       } catch (error) {
         throw new ModelProviderError({
           kind: "terminal",
-          message: "DeepSeek returned an invalid chat completion",
+          message: "Gemini returned an invalid chat completion",
           status: response.status,
           ...providerRequestMetadata(response),
           cause: error,
@@ -215,13 +219,14 @@ export class DeepSeekChatModel implements ChatModel, MemoryMaintenanceModel {
       if (new Set(toolCalls.map((call) => call.id)).size !== toolCalls.length) {
         throw new ModelProviderError({
           kind: "terminal",
-          message: "DeepSeek returned duplicate tool call IDs",
+          message: "Gemini returned duplicate tool call IDs",
         });
       }
+      const providerMessage = { role: "assistant" as const, ...choice.message };
       const result: ModelResponse = {
         id: parsed.id ?? null,
         content: choice.message.content ?? "",
-        reasoningContent: choice.message.reasoning_content ?? null,
+        providerState: canonicalJson(providerMessage),
         toolCalls,
         finishReason: choice.finish_reason ?? null,
         usage: {
@@ -241,32 +246,40 @@ export class DeepSeekChatModel implements ChatModel, MemoryMaintenanceModel {
           responseId: result.id,
           toolCallCount: result.toolCalls.length,
           contentBytes: Buffer.byteLength(result.content),
-          reasoningBytes:
-            result.reasoningContent === null ? 0 : Buffer.byteLength(result.reasoningContent),
+          providerStateBytes: Buffer.byteLength(result.providerState ?? ""),
           usage: result.usage,
         },
       });
       return result;
     }
-    throw new Error("Unreachable DeepSeek retry state");
+    throw new Error("Unreachable Gemini retry state");
   }
 }
 
-function toDeepSeekMessage(message: ModelMessage): Record<string, unknown> {
+function toGeminiMessage(message: ModelMessage): Record<string, unknown> {
   if (message.role === "assistant") {
+    if (message.providerState !== undefined) {
+      try {
+        const providerMessage = providerMessageSchema.parse(JSON.parse(message.providerState));
+        return { role: "assistant", ...providerMessage };
+      } catch (error) {
+        throw new ModelProviderError({
+          kind: "terminal",
+          message: "Stored Gemini assistant state is invalid",
+          cause: error,
+        });
+      }
+    }
     return {
       role: "assistant",
       content: message.content,
-      ...(message.reasoningContent === undefined
-        ? {}
-        : { reasoning_content: message.reasoningContent }),
       ...(message.toolCalls === undefined
         ? {}
         : {
             tool_calls: message.toolCalls.map((call) => ({
               id: call.id,
               type: "function",
-              function: { name: toDeepSeekToolName(call.name), arguments: call.argumentsJson },
+              function: { name: toGeminiToolName(call.name), arguments: call.argumentsJson },
             })),
           }),
     };
@@ -277,15 +290,16 @@ function toDeepSeekMessage(message: ModelMessage): Record<string, unknown> {
   return { role: message.role, content: message.content };
 }
 
-function toDeepSeekToolName(name: string): string {
+function toGeminiToolName(name: string): string {
   return name.replaceAll(".", "_");
 }
 
-
 function providerRequestMetadata(response: Response): { providerRequestId?: string } {
-  const providerRequestId = response.headers.get("x-request-id");
+  const providerRequestId =
+    response.headers.get("x-request-id") ?? response.headers.get("x-goog-request-id");
   return providerRequestId === null ? {} : { providerRequestId };
 }
+
 function retryDelay(headers: Headers, attempt: number): number {
   const retryAfter = headers.get("retry-after");
   if (retryAfter !== null) {

@@ -37,7 +37,7 @@ describe("safe replay", () => {
     runs.appendAssistant(run.id, {
       id: "response_tool",
       content: "",
-      reasoningContent: "The user asked for the send.",
+      providerState: "The user asked for the send.",
       toolCalls: [
         {
           id: "call_send",
@@ -68,7 +68,7 @@ describe("safe replay", () => {
     runs.appendAssistant(run.id, {
       id: "response_final",
       content: "Sent.",
-      reasoningContent: null,
+      providerState: null,
       toolCalls: [],
       finishReason: "stop",
       usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },

@@ -1,6 +1,6 @@
 import fastify, { type FastifyInstance } from "fastify";
 import { AgentLoop } from "./agent/loop.js";
-import { DeepSeekChatModel } from "./agent/deepseek.js";
+import { GeminiChatModel } from "./agent/gemini.js";
 import { ConversationHistoryStore } from "./agent/history.js";
 import type { ChatModel, MemoryMaintenanceModel } from "./agent/model.js";
 import { AgentRunStore } from "./agent/store.js";
@@ -144,7 +144,7 @@ export async function createRuntime(
     });
     const tools = new ToolRegistry([...gmail.tools(), ...notion.tools()]);
     assertProductionTools(tools);
-    const model = overrides.model ?? new DeepSeekChatModel({ config, traces });
+    const model = overrides.model ?? new GeminiChatModel({ config, traces });
     const agent = new AgentLoop({
       model,
       tools,
