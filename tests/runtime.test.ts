@@ -8,6 +8,7 @@ import type {
   ModelRequest,
   ModelResponse,
 } from "../src/agent/model.js";
+import { assistantResponseFormatReminder } from "../src/agent/prompt.js";
 import { AgentRunStore } from "../src/agent/store.js";
 import { ConnectionStore } from "../src/connections/store.js";
 import { loadRuntimeConfig, type RuntimeConfig } from "../src/config.js";
@@ -375,11 +376,7 @@ describe("production runtime", () => {
     expect(systemPrompt).toContain(
       "Merge their events into one chronological agenda",
     );
-    expect(
-      systemPrompt?.endsWith(
-        "Final check before every reply: use plain text only; never emit Unicode U+002A; every tool-backed report starts with a relevant emoji header ending in a colon and uses › for its items.",
-      ),
-    ).toBe(true);
+    expect(systemPrompt?.endsWith(assistantResponseFormatReminder)).toBe(true);
     const providerToolNames = [
       "gmail.search",
       "gmail.read_thread",
@@ -1325,10 +1322,14 @@ describe("production runtime", () => {
       .prepare<[], { body: string }>("SELECT body FROM egress_messages WHERE purpose = 'recovery'")
       .get();
     expect(model.requests).toHaveLength(2);
-    expect(model.requests[1]?.messages.at(-1)).toEqual({
+    expect(model.requests[1]?.messages.at(-2)).toEqual({
       role: "tool",
       content: '{"connectionLinkWillBeAppended":true,"provider":"google"}',
       toolCallId: "connect_google",
+    });
+    expect(model.requests[1]?.messages.at(-1)).toEqual({
+      role: "system",
+      content: assistantResponseFormatReminder,
     });
     expect(model.maintenanceRequests).toHaveLength(0);
     expect(reply?.body).toMatch(
@@ -1525,10 +1526,14 @@ describe("production runtime", () => {
     expect(model.requests).toHaveLength(2);
     expect(model.requests[0]?.tools.map((tool) => tool.name)).toContain("connections.list");
     expect(model.requests[0]?.messages[0]?.content).not.toContain("Connected account status");
-    expect(model.requests[1]?.messages.at(-1)).toEqual({
+    expect(model.requests[1]?.messages.at(-2)).toEqual({
       role: "tool",
       content: '{"connections":[]}',
       toolCallId: "connection_list",
+    });
+    expect(model.requests[1]?.messages.at(-1)).toEqual({
+      role: "system",
+      content: assistantResponseFormatReminder,
     });
     expect(
       item.runtime.database.db
@@ -1601,8 +1606,13 @@ describe("production runtime", () => {
     await runNextJob(item.runtime, Date.now() + 10);
 
     expect(model.requests).toHaveLength(2);
-    const toolMessage = model.requests[1]?.messages.at(-1);
-    expect(toolMessage?.role).toBe("tool");
+    const toolMessage = model.requests[1]?.messages.find(
+      (message) => message.role === "tool" && message.toolCallId === "connection_list",
+    );
+    expect(model.requests[1]?.messages.at(-1)).toEqual({
+      role: "system",
+      content: assistantResponseFormatReminder,
+    });
     expect(JSON.parse(toolMessage?.content ?? "null")).toEqual({
       connections: [
         {

@@ -50,6 +50,14 @@ function storedInfrastructureActionJson(text: string): string {
 export type AssistantPromptAudience =
   | { kind: "inbound" }
   | { kind: "daily_brief"; connections: readonly ConnectionRecord[] };
+export const assistantResponseFormatReminder = [
+  "Response format for the next assistant message is mandatory.",
+  "If tools are still needed, return only tool calls with no user-visible text.",
+  "If you return user-visible text, use plain text and never emit Unicode U+002A.",
+  "A tool-backed report must start with a relevant emoji header ending in a colon, with no introductory sentence before the header, and every item must start with ›.",
+  "A calendar report must start with 📅 followed by the requested period and a colon, for example 📅 today:.",
+  "Do not mention account traversal, accounts with no results, or duplicate appearances caused by shared calendars unless the user asks.",
+].join(" ");
 
 export function buildAssistantSystemPrompt(input: {
   memory: string;
@@ -88,6 +96,6 @@ export function buildAssistantSystemPrompt(input: {
     "<memory>",
     input.memory,
     "</memory>",
-    "Final check before every reply: use plain text only; never emit Unicode U+002A; every tool-backed report starts with a relevant emoji header ending in a colon and uses › for its items.",
+    assistantResponseFormatReminder,
   ].join("\n");
 }

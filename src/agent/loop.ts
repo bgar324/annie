@@ -3,6 +3,7 @@ import { ModelSafeError } from "../core/errors.js";
 import type { RunId, TraceId } from "../core/ids.js";
 import { maximumMessageTextCharacters } from "../messages/types.js";
 import type { ChatModel, ModelMessage, ModelToolCall } from "./model.js";
+import { assistantResponseFormatReminder } from "./prompt.js";
 import {
   AgentLimitError,
   AgentRunStore,
@@ -139,13 +140,21 @@ export class AgentLoop {
         if (toolRounds > this.#limits.maxToolRounds) {
           throw new AgentLimitError("round_limit", "The tool round limit was reached");
         }
+        let requestMessages = messages;
+        if (
+          last?.role !== "system" ||
+          last.content !== assistantResponseFormatReminder
+        ) {
+          this.#runs.appendSystemMessage(run.id, assistantResponseFormatReminder);
+          requestMessages = this.#runs.loadMessages(run.id);
+        }
         this.#runs.beginModelRequest(run.id, this.#limits.maxToolRounds + 1);
         let response;
         try {
           response = await this.#model.complete({
             traceId: run.traceId,
             runId: run.id,
-            messages,
+            messages: requestMessages,
             tools: toolDefinitions,
             signal: runSignal,
           });

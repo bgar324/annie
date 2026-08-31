@@ -238,6 +238,12 @@ export class AgentRunStore {
     });
     transaction.immediate();
   }
+  appendSystemMessage(runId: RunId, content: string): void {
+    const transaction = this.#db.transaction(() => {
+      this.#appendMessageInTransaction(runId, { role: "system", content }, {});
+    });
+    transaction.immediate();
+  }
 
   appendAssistant(runId: RunId, response: ModelResponse): void {
     const message: ModelMessage = {

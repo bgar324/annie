@@ -4,6 +4,7 @@ import { AgentLoop } from "../src/agent/loop.js";
 import { GeminiChatModel } from "../src/agent/gemini.js";
 import { ConversationHistoryStore } from "../src/agent/history.js";
 import type { ChatModel, ModelRequest, ModelResponse } from "../src/agent/model.js";
+import { assistantResponseFormatReminder } from "../src/agent/prompt.js";
 import { AgentRunStore } from "../src/agent/store.js";
 import { ToolRegistry, type RegisteredTool } from "../src/agent/tools.js";
 import { loadRuntimeConfig, type RuntimeConfig } from "../src/config.js";
@@ -482,9 +483,24 @@ describe("durable bounded agent loop", () => {
     expect(result).toMatchObject({ outcome: "completed", response: "Both are complete." });
     expect(order).toEqual(["first", "second"]);
     expect(requests).toHaveLength(2);
+    expect(requests.map((request) => request.messages.at(-1))).toEqual([
+      {
+        role: "system",
+        content: expect.stringContaining(
+          "A tool-backed report must start with a relevant emoji header",
+        ),
+      },
+      {
+        role: "system",
+        content: expect.stringContaining(
+          "A tool-backed report must start with a relevant emoji header",
+        ),
+      },
+    ]);
     expect(requests[1]?.messages).toEqual([
       { role: "system", content: "Be concise." },
       { role: "user", content: "Do both" },
+      { role: "system", content: assistantResponseFormatReminder },
       {
         role: "assistant",
         content: "",
@@ -496,6 +512,7 @@ describe("durable bounded agent loop", () => {
       },
       { role: "tool", toolCallId: "call_1", content: "{\"ok\":true,\"value\":\"first\"}" },
       { role: "tool", toolCallId: "call_2", content: "{\"ok\":true,\"value\":\"second\"}" },
+      { role: "system", content: assistantResponseFormatReminder },
     ]);
     expect(harness.runs.getRequired(result.run.id)).toMatchObject({
       phase: "completed",
@@ -555,7 +572,13 @@ describe("durable bounded agent loop", () => {
 
     expect(result.response).toBe("Recovered.");
     expect(providerExecutions).toBe(0);
-    expect(harness.runs.loadMessages(run.id).at(-2)).toEqual({
+    expect(
+      harness.runs
+        .loadMessages(run.id)
+        .find(
+          (message) => message.role === "tool" && message.toolCallId === "durable_call",
+        ),
+    ).toEqual({
       role: "tool",
       toolCallId: "durable_call",
       content: "{\"ok\":true,\"value\":\"saved\"}",
