@@ -220,13 +220,11 @@ describe("production runtime", () => {
       "You are Ben, the user's private personal assistant in iMessage.",
     );
     expect(systemPrompt).toContain(
-      "Write like a capable person texting the user: warm, direct, natural, and never corporate.",
+      "Write normal prose in lowercase. Preserve case in URLs, email addresses, identifiers, quoted text, and exact provider content.",
     );
     expect(systemPrompt).toContain(
-      "Match the user's level of formality and energy without imitating typos or forced slang.",
+      "Keep the tone casual. Be concise and direct, but include the details the user needs to understand or act.",
     );
-    expect(systemPrompt).toContain("Use light, dry humor when it fits.");
-    expect(systemPrompt).toContain("Have a point of view when judgment helps.");
     expect(model.requests[0]?.tools.map((tool) => tool.name)).toEqual([
       "gmail.search",
       "gmail.read_thread",
