@@ -5,18 +5,31 @@ import { ModelSafeError } from "../core/errors.js";
 export type ConnectionProvider = "google" | "notion";
 export type ConnectionStatus = "healthy" | "degraded" | "reconnect_required" | "disconnected";
 
-export const TOOL_CAPABILITIES = [
-  "gmail.search",
-  "gmail.read_thread",
-  "gmail.create_draft",
-  "gmail.send_draft",
+export const GOOGLE_CONNECTION_CAPABILITIES = [
+  "gmail.read",
+  "calendar.read",
+  "drive.read",
+  "contacts.read",
+  "tasks.read",
+] as const;
+
+export const NOTION_CONNECTION_CAPABILITIES = [
   "notion.search",
   "notion.fetch",
   "notion.create_page",
   "notion.update_page",
 ] as const;
 
-export type ToolCapability = (typeof TOOL_CAPABILITIES)[number];
+export const CONNECTION_CAPABILITIES = [
+  ...GOOGLE_CONNECTION_CAPABILITIES,
+  ...NOTION_CONNECTION_CAPABILITIES,
+] as const;
+
+export type ConnectionCapability = (typeof CONNECTION_CAPABILITIES)[number];
+
+export function providerForCapability(capability: ConnectionCapability): ConnectionProvider {
+  return capability.startsWith("notion.") ? "notion" : "google";
+}
 
 export interface ConnectionRecord {
   id: ConnectionId;
@@ -33,7 +46,7 @@ export interface ConnectionRecord {
   lastErrorSummary: string | null;
   safeMetadata: Record<string, unknown>;
   providerState: Record<string, unknown>;
-  capabilities: readonly ToolCapability[];
+  capabilities: readonly ConnectionCapability[];
   expiresAtMs: number | null;
 }
 
@@ -44,7 +57,7 @@ export interface ConnectionAuthorization {
   safeLabel: string;
   safeMetadata: Record<string, unknown>;
   providerState: Record<string, unknown>;
-  capabilities: readonly ToolCapability[];
+  capabilities: readonly ConnectionCapability[];
   credentials: Record<string, unknown>;
   expiresAtMs?: number;
   expectedConnectionId?: ConnectionId;

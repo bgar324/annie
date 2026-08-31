@@ -19,6 +19,10 @@ import {
   type TraceId,
 } from "../src/core/ids.js";
 import type { GmailApi, GmailClientProvider } from "../src/gmail/client.js";
+import type {
+  GoogleWorkspaceApi,
+  GoogleWorkspaceClientProvider,
+} from "../src/google/client.js";
 import type { NotionClientProvider, NotionSession } from "../src/notion/client.js";
 import type { ClaimedJob, JobType } from "../src/queue/store.js";
 import type { JobContext } from "../src/queue/worker.js";
@@ -101,15 +105,67 @@ class FakeGmailClients implements GmailClientProvider {
       getThread: async () => {
         throw new Error("Daily brief should not read an absent Gmail thread");
       },
-      createDraft: async () => {
-        throw new Error("Daily brief cannot create a Gmail draft");
-      },
-      sendDraft: async () => {
-        throw new Error("Daily brief cannot send a Gmail draft");
-      },
     };
   }
 }
+class FakeGoogleWorkspaceClients implements GoogleWorkspaceClientProvider {
+  readonly selected: ConnectionId[] = [];
+  readonly calendarSearches: { timeMin: string; timeMax: string }[] = [];
+  readonly driveSearches: string[] = [];
+  taskListSearches = 0;
+
+  async forConnection(connectionId: ConnectionId): Promise<GoogleWorkspaceApi> {
+    this.selected.push(connectionId);
+    return {
+      listCalendars: async () => ({
+        data: {
+          items: [{ id: "calendar_primary", summary: "Primary", primary: true }],
+        },
+        headers: {},
+      }),
+      listEvents: async (input) => {
+        this.calendarSearches.push({ timeMin: input.timeMin, timeMax: input.timeMax });
+        return { data: { items: [] }, headers: {} };
+      },
+      listDriveFiles: async (input) => {
+        this.driveSearches.push(input.query);
+        return { data: { files: [] }, headers: {} };
+      },
+      getDriveFile: async () => ({
+        data: { id: "file", name: "File", mimeType: "text/plain" },
+        headers: {},
+      }),
+      exportDriveText: async () => ({
+        data: { content: "", truncated: false },
+        headers: {},
+      }),
+      downloadDriveText: async () => ({
+        data: { content: "", truncated: false },
+        headers: {},
+      }),
+      warmContacts: async () => ({ data: { results: [] }, headers: {} }),
+      searchContacts: async () => ({ data: { results: [] }, headers: {} }),
+      getContact: async () => ({
+        data: { resourceName: "people/contact", names: [{ displayName: "Contact" }] },
+        headers: {},
+      }),
+      listTaskLists: async () => {
+        this.taskListSearches += 1;
+        return { data: { items: [] }, headers: {} };
+      },
+      getTaskList: async (input) => ({
+        data: { id: input.taskListId, title: "Tasks" },
+        headers: {},
+      }),
+      listTasks: async () => ({ data: { items: [] }, headers: {} }),
+      getTask: async (input) => ({
+        data: { id: input.taskId, title: "Task" },
+        headers: {},
+      }),
+    };
+  }
+}
+
 
 class FakeNotionClients implements NotionClientProvider {
   readonly selected: ConnectionId[] = [];
@@ -280,6 +336,12 @@ describe("production runtime", () => {
 
     expect(model.requests).toHaveLength(1);
     expect(model.maintenanceRequests).toHaveLength(1);
+    const maintenancePrompt = model.maintenanceRequests[0]?.messages.find(
+      (message) => message.role === "system",
+    )?.content;
+    expect(maintenancePrompt).toContain(
+      "Always retain explicit user preferences for future daily briefs",
+    );
     const systemPrompt = model.requests[0]?.messages.find(
       (message) => message.role === "system",
     )?.content;
@@ -293,20 +355,46 @@ describe("production runtime", () => {
       "Keep the tone casual. Be concise and direct, but include the details the user needs to understand or act.",
     );
     expect(systemPrompt).toContain(
-      "Connection commands are handled by infrastructure before the model: `connect google` or `connect gmail`, `connect notion`, and `connections`.",
+      "Never use Markdown syntax in a user-visible reply. Never emit the Unicode U+002A character.",
     );
+    expect(systemPrompt).toContain("📅 today:, 📬 inbox:, ✅ tasks:, 📁 recent work:");
+    expect(systemPrompt).toContain(
+      "When the user asks to change future daily briefs",
+    );
+    expect(systemPrompt).not.toContain("respond only as JSON");
+    expect(systemPrompt).not.toContain("`connect google`");
+    expect(systemPrompt).toContain("call connections.list and answer only from its result");
+    expect(systemPrompt).toContain("call connections.connect for Google or Notion");
+    expect(systemPrompt).not.toContain("Connected account status");
     expect(systemPrompt).toContain(
       "When multiple exist, never choose one arbitrarily",
     );
-    expect(model.requests[0]?.tools.map((tool) => tool.name)).toEqual([
+    expect(systemPrompt).toContain(
+      "A calendar request with no exact account label covers every healthy Google account with calendar access.",
+    );
+    expect(systemPrompt).toContain(
+      "Merge their events into one chronological agenda",
+    );
+    expect(
+      systemPrompt?.endsWith(
+        "Final check before every reply: use plain text only; never emit Unicode U+002A; every tool-backed report starts with a relevant emoji header ending in a colon and uses › for its items.",
+      ),
+    ).toBe(true);
+    const providerToolNames = [
       "gmail.search",
       "gmail.read_thread",
-      "gmail.create_draft",
-      "gmail.send_draft",
+      "google.search",
+      "google.read",
       "notion.search",
       "notion.fetch",
       "notion.create_page",
       "notion.update_page",
+    ];
+    expect(item.runtime.tools.definitions().map((tool) => tool.name)).toEqual(providerToolNames);
+    expect(model.requests[0]?.tools.map((tool) => tool.name)).toEqual([
+      ...providerToolNames,
+      "connections.list",
+      "connections.connect",
     ]);
     expect(readFileSync(join(item.directory, "MEMORY.md"), "utf8")).toContain(
       "User prefers concise replies",
@@ -402,7 +490,7 @@ describe("production runtime", () => {
         )
         .get(),
     ).toEqual({
-      body: `good morning — i can’t build your daily brief until an account is connected. send ‘connect google’ for gmail or ‘connect notion’, then send ‘connections’ to verify it. trace: ${scheduled.traceId}`,
+      body: `good morning — i can’t build your daily brief until an account is connected. ask me to connect Google Workspace or Notion, then ask which accounts are connected. trace: ${scheduled.traceId}`,
       purpose: "reply",
       reply_to_guid: null,
     });
@@ -636,6 +724,43 @@ describe("production runtime", () => {
         usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 },
       },
       {
+        id: "brief_workspace_tools",
+        content: "",
+        providerState: null,
+        toolCalls: [
+          ...["one@example.test", "two@example.test", "three@example.test"].map(
+            (account, index) => ({
+              id: `google_${index + 1}`,
+              name: "google.search",
+              argumentsJson: JSON.stringify({
+                account,
+                queries: [
+                  {
+                    product: "calendar",
+                    timeMin: "2026-06-02T15:00:00.000Z",
+                    timeMax: "2026-06-03T15:00:00.000Z",
+                    maxResults: 20,
+                  },
+                  {
+                    product: "drive",
+                    modifiedAfter: "2026-06-01T15:00:00.000Z",
+                    maxResults: 20,
+                  },
+                  {
+                    product: "tasks",
+                    dueBefore: "2026-06-03T15:00:00.000Z",
+                    includeCompleted: false,
+                    maxResults: 20,
+                  },
+                ],
+              }),
+            }),
+          ),
+        ],
+        finishReason: "tool_calls",
+        usage: { promptTokens: 30, completionTokens: 10, totalTokens: 40 },
+      },
+      {
         id: "brief_final",
         content: "good morning. nothing urgent across your connected accounts.",
         providerState: null,
@@ -645,10 +770,12 @@ describe("production runtime", () => {
       },
     );
     const gmailClients = new FakeGmailClients();
+    const googleWorkspaceClients = new FakeGoogleWorkspaceClients();
     const notionClients = new FakeNotionClients();
     const item = await newRuntime(model, new FakeGateway(), {
       dailyBriefEnabled: true,
       gmailClients,
+      googleWorkspaceClients,
       notionClients,
     });
     const connections = new ConnectionStore(
@@ -665,7 +792,7 @@ describe("production runtime", () => {
           safeLabel: label,
           safeMetadata: { email: label },
           providerState: { scopes: item.config.google.scopes },
-          capabilities: ["gmail.search", "gmail.read_thread"],
+          capabilities: ["gmail.read", "calendar.read", "drive.read", "contacts.read", "tasks.read"],
           credentials: { refreshToken: `refresh_${index + 1}` },
         }),
     );
@@ -688,20 +815,37 @@ describe("production runtime", () => {
 
     await runNextJob(item.runtime, scheduled.scheduledForMs + 1);
 
-    expect(model.requests).toHaveLength(2);
     expect(model.requests[0]?.tools.map((tool) => tool.name)).toEqual([
       "gmail.search",
       "gmail.read_thread",
+      "google.search",
+      "google.read",
       "notion.search",
       "notion.fetch",
     ]);
+    const briefSystemPrompt = model.requests[0]?.messages.find(
+      (message) => message.role === "system",
+    )?.content;
+    expect(briefSystemPrompt).toContain("Connected account status");
+    expect(briefSystemPrompt).not.toContain("call connections.list");
     const briefRequest = model.requests[0]?.messages.find(
       (message) => message.role === "user",
     )?.content;
     for (const label of ["one@example.test", "two@example.test", "three@example.test", "Work"]) {
       expect(briefRequest).toContain(label);
     }
+    expect(briefRequest).toContain("🎯 priorities:, 📅 today:, 📬 inbox:");
+    expect(briefRequest).toContain("Never use Markdown or asterisk characters.");
+    expect(briefRequest).toContain(
+      "Use explicit daily-brief preferences from canonical memory",
+    );
     expect(gmailClients.selected).toEqual(googleConnections.map((connection) => connection.id));
+    expect(googleWorkspaceClients.selected).toEqual(
+      googleConnections.map((connection) => connection.id),
+    );
+    expect(googleWorkspaceClients.calendarSearches).toHaveLength(3);
+    expect(googleWorkspaceClients.driveSearches).toHaveLength(3);
+    expect(googleWorkspaceClients.taskListSearches).toBe(3);
     expect(notionClients.selected).toEqual([notionConnection.id]);
     expect(gmailClients.searches).toHaveLength(3);
     expect(notionClients.searches).toEqual([
@@ -788,7 +932,7 @@ describe("production runtime", () => {
       safeLabel: "one@example.test",
       safeMetadata: { email: "one@example.test" },
       providerState: { scopes: item.config.google.scopes },
-      capabilities: ["gmail.search", "gmail.read_thread"],
+      capabilities: ["gmail.read", "calendar.read", "drive.read", "contacts.read", "tasks.read"],
       credentials: { refreshToken: "refresh_partial" },
     });
     connections.saveAuthorization({
@@ -835,6 +979,166 @@ describe("production runtime", () => {
     });
   });
 
+  it.each([
+    {
+      toolName: "google.search",
+      argumentsValue: {
+        account: "one@example.test",
+        queries: [{ product: "contacts", query: "Ada", maxResults: 20 }],
+      },
+    },
+    {
+      toolName: "google.read",
+      argumentsValue: {
+        account: "one@example.test",
+        product: "contacts",
+        contactId: "people/contact",
+      },
+    },
+  ])("rejects Contacts in $toolName before a scheduled provider call", async ({
+    toolName,
+    argumentsValue,
+  }) => {
+    const model = new FakeModel();
+    model.responses.push({
+      id: "brief_contacts_tool",
+      content: "",
+      providerState: null,
+      toolCalls: [
+        {
+          id: "contacts_call",
+          name: toolName,
+          argumentsJson: JSON.stringify(argumentsValue),
+        },
+      ],
+      finishReason: "tool_calls",
+      usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
+    });
+    const googleWorkspaceClients = new FakeGoogleWorkspaceClients();
+    const item = await newRuntime(model, new FakeGateway(), {
+      dailyBriefEnabled: true,
+      googleWorkspaceClients,
+    });
+    const connections = new ConnectionStore(
+      item.runtime.database.db,
+      new CredentialVault(item.config.credentialEncryptionKey),
+      item.runtime.traces,
+    );
+    connections.saveAuthorization({
+      traceId: newTraceId(),
+      provider: "google",
+      providerAccountId: "google_contacts_guard",
+      safeLabel: "one@example.test",
+      safeMetadata: { email: "one@example.test" },
+      providerState: { scopes: item.config.google.scopes },
+      capabilities: ["drive.read", "contacts.read"],
+      credentials: { refreshToken: "refresh_contacts_guard" },
+    });
+    const scheduled = item.runtime.dailyBrief.reconcile(
+      Date.parse("2026-06-04T14:00:00.000Z"),
+    );
+    if (scheduled.kind !== "scheduled") {
+      throw new Error(`Expected a scheduled daily brief, received ${scheduled.kind}`);
+    }
+
+    await runNextJob(item.runtime, scheduled.scheduledForMs + 1);
+
+    expect(googleWorkspaceClients.selected).toEqual([]);
+    expect(
+      item.runtime.database.db
+        .prepare<[], { failure_code: string }>("SELECT failure_code FROM agent_runs")
+        .get(),
+    ).toEqual({ failure_code: "tool_not_allowed" });
+    expect(
+      item.runtime.database.db
+        .prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM tool_executions")
+        .get()?.count,
+    ).toBe(0);
+  });
+
+  it("does not credit a completed Calendar search for the wrong scheduled window", async () => {
+    const model = new FakeModel();
+    model.responses.push(
+      {
+        id: "brief_wrong_window_tool",
+        content: "",
+        providerState: null,
+        toolCalls: [
+          {
+            id: "wrong_calendar_window",
+            name: "google.search",
+            argumentsJson: JSON.stringify({
+              account: "one@example.test",
+              queries: [
+                {
+                  product: "calendar",
+                  timeMin: "2020-01-01T00:00:00.000Z",
+                  timeMax: "2020-01-02T00:00:00.000Z",
+                  maxResults: 20,
+                },
+              ],
+            }),
+          },
+        ],
+        finishReason: "tool_calls",
+        usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
+      },
+      {
+        id: "brief_wrong_window_final",
+        content: "nothing scheduled.",
+        providerState: null,
+        toolCalls: [],
+        finishReason: "stop",
+        usage: { promptTokens: 20, completionTokens: 4, totalTokens: 24 },
+      },
+    );
+    const googleWorkspaceClients = new FakeGoogleWorkspaceClients();
+    const item = await newRuntime(model, new FakeGateway(), {
+      dailyBriefEnabled: true,
+      googleWorkspaceClients,
+    });
+    const connections = new ConnectionStore(
+      item.runtime.database.db,
+      new CredentialVault(item.config.credentialEncryptionKey),
+      item.runtime.traces,
+    );
+    connections.saveAuthorization({
+      traceId: newTraceId(),
+      provider: "google",
+      providerAccountId: "google_wrong_window",
+      safeLabel: "one@example.test",
+      safeMetadata: { email: "one@example.test" },
+      providerState: { scopes: item.config.google.scopes },
+      capabilities: ["calendar.read"],
+      credentials: { refreshToken: "refresh_wrong_window" },
+    });
+    const scheduled = item.runtime.dailyBrief.reconcile(
+      Date.parse("2026-06-05T14:00:00.000Z"),
+    );
+    if (scheduled.kind !== "scheduled") {
+      throw new Error(`Expected a scheduled daily brief, received ${scheduled.kind}`);
+    }
+
+    await runNextJob(item.runtime, scheduled.scheduledForMs + 1);
+
+    expect(googleWorkspaceClients.calendarSearches).toEqual([
+      {
+        timeMin: "2020-01-01T00:00:00.000Z",
+        timeMax: "2020-01-02T00:00:00.000Z",
+      },
+    ]);
+    expect(
+      item.runtime.database.db
+        .prepare<[], { phase: string; failure_code: string | null }>(
+          "SELECT phase, failure_code FROM agent_runs",
+        )
+        .get(),
+    ).toEqual({
+      phase: "blocked",
+      failure_code: "daily_brief_source_coverage",
+    });
+  });
+
   it("rejects a scheduled provider write before creating a tool execution", async () => {
     const model = new FakeModel();
     model.responses.push({
@@ -870,12 +1174,7 @@ describe("production runtime", () => {
       safeLabel: "one@example.test",
       safeMetadata: { email: "one@example.test" },
       providerState: { scopes: item.config.google.scopes },
-      capabilities: [
-        "gmail.search",
-        "gmail.read_thread",
-        "gmail.create_draft",
-        "gmail.send_draft",
-      ],
+      capabilities: ["gmail.read", "calendar.read", "drive.read", "contacts.read", "tasks.read"],
       credentials: { refreshToken: "refresh_disallowed" },
     });
     const scheduled = item.runtime.dailyBrief.reconcile(
@@ -886,10 +1185,11 @@ describe("production runtime", () => {
     }
 
     await runNextJob(item.runtime, scheduled.scheduledForMs + 1);
-
     expect(model.requests[0]?.tools.map((tool) => tool.name)).toEqual([
       "gmail.search",
       "gmail.read_thread",
+      "google.search",
+      "google.read",
       "notion.search",
       "notion.fetch",
     ]);
@@ -986,11 +1286,37 @@ describe("production runtime", () => {
     expect(gateway.statusReads).toHaveLength(0);
   });
 
-  it("handles connect commands without exposing them to the model", async () => {
+  it("lets the model resolve a natural Google connection request and fulfills it once", async () => {
     const model = new FakeModel();
+    model.responses.push(
+      {
+        id: "connect_tool",
+        content: "",
+        providerState: null,
+        toolCalls: [
+          {
+            id: "connect_google",
+            name: "connections.connect",
+            argumentsJson: '{"provider":"google"}',
+          },
+        ],
+        finishReason: "tool_calls",
+        usage: { promptTokens: 10, completionTokens: 4, totalTokens: 14 },
+      },
+      {
+        id: "connect_answer",
+        content: "here's the link to connect your google account:",
+        providerState: null,
+        toolCalls: [],
+        finishReason: "stop",
+        usage: { promptTokens: 15, completionTokens: 8, totalTokens: 23 },
+      },
+    );
     const gateway = new FakeGateway();
     const item = await newRuntime(model, gateway);
-    gateway.inbox.push(inboundMessage("msg_connect", { text: "connect my Gmail account" }));
+    gateway.inbox.push(
+      inboundMessage("msg_connect", { text: "i want to connect my google account" }),
+    );
 
     await sweep(item);
     await runNextJob(item.runtime, Date.now() + 10);
@@ -998,16 +1324,256 @@ describe("production runtime", () => {
     const reply = item.runtime.database.db
       .prepare<[], { body: string }>("SELECT body FROM egress_messages WHERE purpose = 'recovery'")
       .get();
-    expect(model.requests).toHaveLength(0);
+    expect(model.requests).toHaveLength(2);
+    expect(model.requests[1]?.messages.at(-1)).toEqual({
+      role: "tool",
+      content: '{"connectionLinkWillBeAppended":true,"provider":"google"}',
+      toolCallId: "connect_google",
+    });
     expect(model.maintenanceRequests).toHaveLength(0);
     expect(reply?.body).toMatch(
-      /^Connect another Google account: https:\/\/assistant\.example\/connect\/google\?token=/u,
+      /^here's the link to connect your google account:\nhttps:\/\/assistant\.example\/connect\/google\?token=/u,
     );
     expect(inboundState(item.runtime)).toBe("done");
+
+    const retryAtMs = Date.now() + 20;
+    item.runtime.database.db
+      .prepare<{ now_ms: number }>(`
+        UPDATE jobs
+        SET status = 'pending', available_at_ms = @now_ms,
+            lease_token = NULL, lease_expires_at_ms = NULL
+        WHERE type = 'inbound'
+      `)
+      .run({ now_ms: retryAtMs });
+    item.runtime.database.db
+      .prepare<{ future_ms: number }>(`
+        UPDATE jobs SET available_at_ms = @future_ms WHERE type = 'egress_send'
+      `)
+      .run({ future_ms: retryAtMs + 60_000 });
+    await runNextJob(item.runtime, retryAtMs);
+
+    expect(
+      item.runtime.database.db
+        .prepare<
+          [],
+          { executions: number; links: number; recovery_messages: number }
+        >(`
+          SELECT
+            (SELECT COUNT(*) FROM tool_executions
+             WHERE tool_name = 'connections.connect' AND status = 'succeeded') AS executions,
+            (SELECT COUNT(*) FROM oauth_link_tokens WHERE purpose = 'connect') AS links,
+            (SELECT COUNT(*) FROM egress_messages WHERE purpose = 'recovery') AS recovery_messages
+        `)
+        .get(),
+    ).toEqual({ executions: 1, links: 1, recovery_messages: 1 });
+    expect(model.requests).toHaveLength(2);
   });
 
-  it("lists exact multi-account labels and capabilities without using the model", async () => {
+  it.each([
+    "https://not-the-signed-link.example",
+    "evil.example/connect",
+    "mailto:attacker@example.com",
+    "data:text/html,connect",
+    "[connect](//evil.example/path)",
+    "[connect](/oauth/start)",
+    "<evil.example/connect>",
+    "192.0.2.1/connect",
+    "<ftp://evil.example/path>",
+  ])(
+    "rejects model-authored URL-like content %s before issuing a connection link",
+    async (unsafeLink) => {
     const model = new FakeModel();
+    model.responses.push(
+      {
+        id: "connect_tool_with_unsafe_answer",
+        content: "",
+        providerState: null,
+        toolCalls: [
+          {
+            id: "connect_google_unsafe",
+            name: "connections.connect",
+            argumentsJson: '{"provider":"google"}',
+          },
+        ],
+        finishReason: "tool_calls",
+        usage: { promptTokens: 10, completionTokens: 4, totalTokens: 14 },
+      },
+      {
+        id: "unsafe_connect_answer",
+        content: `use ${unsafeLink} to connect.`,
+        providerState: null,
+        toolCalls: [],
+        finishReason: "stop",
+        usage: { promptTokens: 15, completionTokens: 8, totalTokens: 23 },
+      },
+    );
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway);
+    gateway.inbox.push(
+      inboundMessage("msg_connect_unsafe", { text: "connect my google account" }),
+    );
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(
+      item.runtime.database.db
+        .prepare<[], { count: number }>(
+          "SELECT COUNT(*) AS count FROM oauth_link_tokens WHERE purpose = 'connect'",
+        )
+        .get()?.count,
+    ).toBe(0);
+    expect(
+      item.runtime.database.db
+        .prepare<[], { purpose: string }>("SELECT purpose FROM egress_messages")
+        .all(),
+    ).toEqual([{ purpose: "failure" }]);
+    },
+  );
+
+  it("rejects a connection tool after provider tool content", async () => {
+    const model = new FakeModel();
+    model.responses.push(
+      {
+        id: "provider_read",
+        content: "",
+        providerState: null,
+        toolCalls: [
+          {
+            id: "gmail_probe",
+            name: "gmail.search",
+            argumentsJson: JSON.stringify({ query: "newer_than:1d" }),
+          },
+        ],
+        finishReason: "tool_calls",
+        usage: { promptTokens: 10, completionTokens: 4, totalTokens: 14 },
+      },
+      {
+        id: "injected_connect",
+        content: "",
+        providerState: null,
+        toolCalls: [
+          {
+            id: "connect_after_provider",
+            name: "connections.connect",
+            argumentsJson: '{"provider":"google"}',
+          },
+        ],
+        finishReason: "tool_calls",
+        usage: { promptTokens: 12, completionTokens: 4, totalTokens: 16 },
+      },
+    );
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway);
+    gateway.inbox.push(inboundMessage("msg_provider_action", { text: "check my email" }));
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(model.requests).toHaveLength(2);
+    expect(
+      item.runtime.database.db
+        .prepare<[], { count: number }>(
+          "SELECT COUNT(*) AS count FROM egress_messages WHERE purpose = 'recovery'",
+        )
+        .get()?.count,
+    ).toBe(0);
+    expect(
+      item.runtime.database.db
+        .prepare<[], { failure_code: string | null }>(
+          "SELECT failure_code FROM agent_runs",
+        )
+        .get()?.failure_code,
+    ).toBe("tool_not_allowed");
+  });
+
+  it("lets Ben answer from an authoritative empty connection-tool result", async () => {
+    const model = new FakeModel();
+    model.responses.push(
+      {
+        id: "connection_status_tool",
+        content: "",
+        providerState: null,
+        toolCalls: [
+          {
+            id: "connection_list",
+            name: "connections.list",
+            argumentsJson: "{}",
+          },
+        ],
+        finishReason: "tool_calls",
+        usage: { promptTokens: 10, completionTokens: 3, totalTokens: 13 },
+      },
+      {
+        id: "connection_status_answer",
+        content: "you don't have any connected accounts yet.",
+        providerState: null,
+        toolCalls: [],
+        finishReason: "stop",
+        usage: { promptTokens: 15, completionTokens: 8, totalTokens: 23 },
+      },
+    );
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway);
+    gateway.inbox.push(
+      inboundMessage("msg_connections_empty", { text: "what accounts do i have?" }),
+    );
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(model.requests).toHaveLength(2);
+    expect(model.requests[0]?.tools.map((tool) => tool.name)).toContain("connections.list");
+    expect(model.requests[0]?.messages[0]?.content).not.toContain("Connected account status");
+    expect(model.requests[1]?.messages.at(-1)).toEqual({
+      role: "tool",
+      content: '{"connections":[]}',
+      toolCallId: "connection_list",
+    });
+    expect(
+      item.runtime.database.db
+        .prepare<[], { tool_name: string; status: string; result_json: string | null }>(`
+          SELECT tool_name, status, result_json FROM tool_executions
+        `)
+        .get(),
+    ).toEqual({
+      tool_name: "connections.list",
+      status: "succeeded",
+      result_json: '{"connections":[]}',
+    });
+    expect(
+      item.runtime.database.db
+        .prepare<[], { body: string }>("SELECT body FROM egress_messages WHERE purpose = 'reply'")
+        .get()?.body,
+    ).toBe("you don't have any connected accounts yet.");
+  });
+
+  it("returns only safe authoritative connection fields for Ben to describe", async () => {
+    const model = new FakeModel();
+    model.responses.push(
+      {
+        id: "connection_status_tool",
+        content: "",
+        providerState: null,
+        toolCalls: [
+          {
+            id: "connection_list",
+            name: "connections.list",
+            argumentsJson: "{}",
+          },
+        ],
+        finishReason: "tool_calls",
+        usage: { promptTokens: 10, completionTokens: 3, totalTokens: 13 },
+      },
+      {
+        id: "connection_status_answer",
+        content: "you have two connected google accounts: one@example.test and two@example.test.",
+        providerState: null,
+        toolCalls: [],
+        finishReason: "stop",
+        usage: { promptTokens: 20, completionTokens: 12, totalTokens: 32 },
+      },
+    );
     const gateway = new FakeGateway();
     const item = await newRuntime(model, gateway);
     const connections = new ConnectionStore(
@@ -1023,28 +1589,53 @@ describe("production runtime", () => {
         safeLabel: label,
         safeMetadata: { email: label },
         providerState: { scopes: item.config.google.scopes },
-        capabilities: ["gmail.search", "gmail.read_thread"],
+        capabilities: ["gmail.read", "calendar.read", "drive.read", "contacts.read", "tasks.read"],
         credentials: { refreshToken: `status_refresh_${index + 1}` },
       });
     }
-    gateway.inbox.push(inboundMessage("msg_connections", { text: "connections" }));
+    gateway.inbox.push(
+      inboundMessage("msg_connections", { text: "which accounts do i have connected?" }),
+    );
 
     await sweep(item);
     await runNextJob(item.runtime, Date.now() + 10);
 
-    const body = item.runtime.database.db
-      .prepare<[], { body: string }>("SELECT body FROM egress_messages WHERE purpose = 'reply'")
-      .get()?.body;
-    expect(model.requests).toHaveLength(0);
-    expect(body).toContain(
-      "one@example.test: google, healthy; gmail.read_thread, gmail.search",
-    );
-    expect(body).toContain(
-      "two@example.test: google, healthy; gmail.read_thread, gmail.search",
-    );
-    expect(body).toContain(
-      "Use the exact label shown when more than one account can handle a request.",
-    );
+    expect(model.requests).toHaveLength(2);
+    const toolMessage = model.requests[1]?.messages.at(-1);
+    expect(toolMessage?.role).toBe("tool");
+    expect(JSON.parse(toolMessage?.content ?? "null")).toEqual({
+      connections: [
+        {
+          capabilities: [
+            "calendar.read",
+            "contacts.read",
+            "drive.read",
+            "gmail.read",
+            "tasks.read",
+          ],
+          label: "one@example.test",
+          provider: "google",
+          status: "healthy",
+        },
+        {
+          capabilities: [
+            "calendar.read",
+            "contacts.read",
+            "drive.read",
+            "gmail.read",
+            "tasks.read",
+          ],
+          label: "two@example.test",
+          provider: "google",
+          status: "healthy",
+        },
+      ],
+    });
+    expect(
+      item.runtime.database.db
+        .prepare<[], { body: string }>("SELECT body FROM egress_messages WHERE purpose = 'reply'")
+        .get()?.body,
+    ).toBe("you have two connected google accounts: one@example.test and two@example.test.");
   });
 
   it("plans a failure notice for a media-only message instead of calling the model", async () => {
@@ -1271,6 +1862,7 @@ interface RuntimeTestOptions {
   dailyBriefEnabled?: boolean;
   gmailClients?: GmailClientProvider;
   notionClients?: NotionClientProvider;
+  googleWorkspaceClients?: GoogleWorkspaceClientProvider;
 }
 
 async function newRuntime(
@@ -1291,6 +1883,9 @@ async function newRuntime(
     model,
     messageGateway: gateway,
     ...(options.gmailClients === undefined ? {} : { gmailClients: options.gmailClients }),
+    ...(options.googleWorkspaceClients === undefined
+      ? {}
+      : { googleWorkspaceClients: options.googleWorkspaceClients }),
     ...(options.notionClients === undefined ? {} : { notionClients: options.notionClients }),
     logger: false,
   });
@@ -1313,7 +1908,6 @@ function runtimeConfig(directory: string): RuntimeConfig {
     GEMINI_API_KEY: "gemini_test_key",
     GOOGLE_CLIENT_ID: "google_test_client",
     GOOGLE_CLIENT_SECRET: "google_test_secret",
-    GOOGLE_WORKSPACE_SCOPES: "openid email https://www.googleapis.com/auth/gmail.modify",
     CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 9).toString("base64"),
     JOB_LEASE_MS: "10000",
   });

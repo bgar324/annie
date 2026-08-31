@@ -28,13 +28,13 @@ The process opens SQLite and `MEMORY.md` under `DATA_DIR`, listens on port 3000 
 
 ## Connect provider accounts
 
-Send these commands from `USER_PHONE_NUMBER`:
+Ask Ben in ordinary language to:
 
-- `connect google` or `connect gmail` starts one Google OAuth flow.
-- `connect notion` starts one Notion OAuth flow.
-- `connections` lists every safe account label and its capabilities.
+- connect or reconnect a Google account for Gmail, Calendar, Drive, Contacts, and Tasks;
+- connect or reconnect a Notion workspace;
+- list connected accounts, safe labels, and capabilities.
 
-Repeat the connect command for each account or workspace. When more than one account can handle a request, use the exact label from `connections`.
+Repeat the connection request for each account or workspace. When more than one account can handle a request, use the exact label from the account list.
 
 ## Send a message through the loop
 

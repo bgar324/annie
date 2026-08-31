@@ -56,6 +56,7 @@ export class CredentialVault {
   linkSigningKey(): Buffer {
     return Buffer.from(this.#linkSigningKey);
   }
+
 }
 
 function aad(purpose: string, identity: string, generation: number): Buffer {

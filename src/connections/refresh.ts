@@ -5,7 +5,7 @@ import type { RuntimeConfig } from "../config.js";
 import { ModelSafeError } from "../core/errors.js";
 import type { ConnectionId, TraceId } from "../core/ids.js";
 import type { GoogleCredential } from "../oauth/google.js";
-import { googleCapabilities } from "../oauth/google.js";
+import { googleCapabilities, googleScopeBundleStatus } from "../oauth/google.js";
 import type { NotionCredential } from "../oauth/notion.js";
 import { createTracedProviderFetch, type ProviderFetch } from "../providers/fetch.js";
 import type { TraceStore } from "../tracing/store.js";
@@ -117,6 +117,7 @@ export class RefreshCoordinator {
       }
       throw new RefreshBusyError();
     }
+    signal?.throwIfAborted();
 
     const claim = this.#claim(connection, traceId, nowMs);
     if (claim.kind === "busy") {
@@ -162,6 +163,10 @@ export class RefreshCoordinator {
         throw error;
       }
     } catch (error) {
+      if (error instanceof RefreshCancelledError) {
+        this.#clearLease(connection.id, claim.leaseToken);
+        throw error.cause ?? error;
+      }
       if (error instanceof RefreshProviderError) {
         if (error.kind === "terminal" || error.kind === "ambiguous") {
           if (error.kind === "ambiguous") {
@@ -319,11 +324,18 @@ export class RefreshCoordinator {
         client_id: this.#config.google.clientId,
         client_secret: this.#config.google.clientSecret,
       }),
-      networkFailureAmbiguous: false,
+      networkFailureAmbiguous: true,
       ...(signal === undefined ? {} : { signal }),
     });
     const expiresAtMs = Date.now() + (response.expires_in ?? 3_600) * 1_000;
     const scopes = response.scope === undefined ? credentials.scopes : splitScopes(response.scope);
+    if (googleScopeBundleStatus(scopes) !== "complete") {
+      throw new RefreshProviderError(
+        "terminal",
+        "google_scope_bundle_changed",
+        "The Google read-only permission bundle changed; reconnect this account",
+      );
+    }
     return {
       credentials: {
         accessToken: response.access_token,
@@ -400,7 +412,7 @@ export class RefreshCoordinator {
       ...(this.#fetchImpl === undefined ? {} : { fetchImpl: this.#fetchImpl }),
     });
     for (let attempt = 1; attempt <= refreshAttemptCount; attempt += 1) {
-      input.signal?.throwIfAborted();
+      throwIfRefreshCancelled(input.signal);
       let response: Response;
       try {
         response = await tracedFetch(input.url, {
@@ -427,7 +439,7 @@ export class RefreshCoordinator {
           );
         }
         if (attempt < refreshAttemptCount) {
-          await this.#sleep(refreshRetryBackoffMs[attempt - 1] ?? 0);
+          await this.#retryDelay(refreshRetryBackoffMs[attempt - 1] ?? 0, input.signal);
           continue;
         }
         throw new RefreshProviderError(
@@ -462,7 +474,7 @@ export class RefreshCoordinator {
         );
       }
       if ([429, 500, 502, 503, 504].includes(response.status) && attempt < refreshAttemptCount) {
-        await this.#sleep(refreshRetryBackoffMs[attempt - 1] ?? 0);
+        await this.#retryDelay(refreshRetryBackoffMs[attempt - 1] ?? 0, input.signal);
         continue;
       }
       const kind = [429, 500, 502, 503, 504].includes(response.status) ? "transient" : "terminal";
@@ -473,6 +485,27 @@ export class RefreshCoordinator {
       );
     }
     throw new Error("Unreachable refresh retry state");
+  }
+
+  async #retryDelay(milliseconds: number, signal: AbortSignal | undefined): Promise<void> {
+    if (signal === undefined) {
+      await this.#sleep(milliseconds);
+      return;
+    }
+    if (signal.aborted) {
+      throw new RefreshCancelledError(signal.reason);
+    }
+    const aborted = Promise.withResolvers<never>();
+    const onAbort = () => aborted.reject(new RefreshCancelledError(signal.reason));
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+    }
+    try {
+      await Promise.race([this.#sleep(milliseconds), aborted.promise]);
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
   }
 
   #clearLease(connectionId: ConnectionId, leaseToken: string): void {
@@ -500,6 +533,19 @@ interface RefreshResult {
   expiresAtMs: number;
   providerState: Record<string, unknown>;
   capabilities: readonly ConnectionRecord["capabilities"][number][];
+}
+
+function throwIfRefreshCancelled(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw new RefreshCancelledError(signal.reason);
+  }
+}
+
+class RefreshCancelledError extends Error {
+  constructor(cause: unknown) {
+    super("Token refresh was cancelled before another provider request", { cause });
+    this.name = "RefreshCancelledError";
+  }
 }
 
 class RefreshProviderError extends Error {

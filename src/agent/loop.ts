@@ -53,6 +53,7 @@ export class AgentLoop {
     traceId: TraceId;
     initialMessages: readonly ModelMessage[];
     allowedToolNames?: readonly string[];
+    toolCallGuard?: (call: ModelToolCall) => string | undefined;
     completionGuard?: (
       candidate: { runId: RunId; response: string },
     ) => string | undefined;
@@ -110,6 +111,7 @@ export class AgentLoop {
             input.replay ?? false,
             input.jobLease,
             allowedToolNames,
+            input.toolCallGuard,
             runSignal,
           );
           continue;
@@ -182,6 +184,7 @@ export class AgentLoop {
     replay: boolean,
     jobLease: { jobId: string; leaseToken: string } | undefined,
     allowedToolNames: ReadonlySet<string> | undefined,
+    toolCallGuard: ((call: ModelToolCall) => string | undefined) | undefined,
     signal: AbortSignal,
   ): Promise<void> {
     const answered = answeredToolCalls(messages);
@@ -195,6 +198,10 @@ export class AgentLoop {
           "tool_not_allowed",
           `Tool ${call.name} is not allowed for this agent run`,
         );
+      }
+      const toolCallRejection = toolCallGuard?.(call);
+      if (toolCallRejection !== undefined) {
+        throw new AgentLimitError("tool_not_allowed", toolCallRejection);
       }
       const operationClass = this.#tools.operationClass(call.name);
       const execution = this.#runs.prepareTool({

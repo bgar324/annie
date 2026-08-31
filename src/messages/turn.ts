@@ -5,7 +5,8 @@ import type { AgentRunRecord, AgentRunStore } from "../agent/store.js";
 import { buildAssistantSystemPrompt } from "../agent/prompt.js";
 import type { RuntimeConfig } from "../config.js";
 import type { ConnectionRecoveryService } from "../connections/recovery.js";
-import type { ConnectionStore } from "../connections/store.js";
+import { parseConnectToolArguments } from "../connections/tools.js";
+import type { ConnectionProvider } from "../connections/types.js";
 import { asInboundId, type InboundId, type RunId, type TraceId } from "../core/ids.js";
 import type { MemoryDocumentStore } from "../memory/document.js";
 import type { MemoryMaintenanceService } from "../memory/maintenance.js";
@@ -31,7 +32,6 @@ export class InboundTurnService {
   readonly #history: ConversationHistoryStore;
   readonly #memory: MemoryDocumentStore;
   readonly #maintenance: MemoryMaintenanceService;
-  readonly #connections: ConnectionStore;
   readonly #recovery: ConnectionRecoveryService;
   readonly #egress: MessageEgressService;
   readonly #failures: FailureNotificationService;
@@ -45,7 +45,6 @@ export class InboundTurnService {
     history: ConversationHistoryStore;
     memory: MemoryDocumentStore;
     maintenance: MemoryMaintenanceService;
-    connections: ConnectionStore;
     recovery: ConnectionRecoveryService;
     egress: MessageEgressService;
     failures: FailureNotificationService;
@@ -58,7 +57,6 @@ export class InboundTurnService {
     this.#history = input.history;
     this.#memory = input.memory;
     this.#maintenance = input.maintenance;
-    this.#connections = input.connections;
     this.#recovery = input.recovery;
     this.#egress = input.egress;
     this.#failures = input.failures;
@@ -95,6 +93,16 @@ export class InboundTurnService {
         if (completed.phase !== "completed" || completed.finalResponse === null) {
           throw new Error(`Done inbound ${inbound.id} has no completed response`);
         }
+        const connectProvider = this.#connectProviderForRun(completed.id);
+        if (connectProvider !== undefined) {
+          this.#fulfillConnectTool(
+            inbound,
+            completed.id,
+            connectProvider,
+            completed.finalResponse,
+          );
+          return;
+        }
         await this.#finishCompletedTurn(
           inbound,
           userMessage,
@@ -102,9 +110,6 @@ export class InboundTurnService {
           completed.finalResponse,
           context,
         );
-        return;
-      }
-      if (this.#handleCommand(inbound, userMessage)) {
         return;
       }
       if (userMessage.length === 0) {
@@ -126,6 +131,8 @@ export class InboundTurnService {
           ...history,
           { role: "user", content: userMessage },
         ],
+        toolCallGuard: (call) =>
+          this.#connectionToolCallRejection(inbound.id, call.name, call.id),
         jobLease: { jobId: job.id, leaseToken: job.leaseToken },
       });
       context.assertLease();
@@ -136,6 +143,11 @@ export class InboundTurnService {
           runId: result.run.id,
           replyToGuid: inbound.guid,
         });
+        return;
+      }
+      const connectProvider = this.#connectProviderForRun(result.run.id);
+      if (connectProvider !== undefined) {
+        this.#fulfillConnectTool(inbound, result.run.id, connectProvider, result.response);
         return;
       }
       await this.#finishCompletedTurn(
@@ -194,63 +206,107 @@ export class InboundTurnService {
     });
   }
 
-  #handleCommand(inbound: InboundTurnRow, text: string): boolean {
-    const googleConnect =
-      /^(?:\/)?connect\s+(?:(?:my|another)\s+)?(?:google|gmail)(?:\s+account)?$/iu.test(text);
-    const notionConnect =
-      /^(?:\/)?connect\s+(?:(?:my|another)\s+)?notion(?:\s+(?:account|workspace))?$/iu.test(text);
-    if (googleConnect || notionConnect) {
-      const provider = googleConnect ? "google" : "notion";
-      const transaction = this.#db.transaction(() => {
-        this.#recovery.sendConnectLink(provider, inbound.trace_id);
-        this.#finishCommand(inbound, `connect_${provider}`);
-      });
-      transaction.immediate();
-      return true;
-    }
-    if (/^(?:\/)?(?:connections|status)$/iu.test(text)) {
-      const connections = this.#connections.list();
-      const body =
-        connections.length === 0
-          ? "No Google or Notion accounts are connected. Send ‘connect google’ or ‘connect notion’."
-          : [
-              ...connections.map(
-                (connection) =>
-                  `${connection.safeLabel}: ${connection.provider}, ${connection.status}; ${connection.capabilities.join(", ") || "no capabilities"}`,
-              ),
-              "Use the exact label shown when more than one account can handle a request.",
-            ].join("\n");
-      const transaction = this.#db.transaction(() => {
-        this.#egress.planReply({
-          traceId: inbound.trace_id,
-          recipient: this.#config.userPhoneNumber,
-          replyToGuid: inbound.guid,
-          text: body,
-        });
-        this.#finishCommand(inbound, "connection_status");
-      });
-      transaction.immediate();
-      return true;
-    }
-    return false;
-  }
+  #fulfillConnectTool(
+    inbound: InboundTurnRow,
+    runId: RunId,
+    provider: ConnectionProvider,
+    message: string,
+  ): void {
+    const transaction = this.#db.transaction(() => {
+      const handled = this.#db
+        .prepare<
+          { run_id: string; trace_id: string },
+          { handled: number }
+        >(`
+          SELECT 1 AS handled
+          FROM trace_event_spool
+          WHERE run_id = @run_id
+            AND trace_id = @trace_id
+            AND component = 'connection_control'
+            AND event = 'connect_fulfilled'
+          LIMIT 1
+        `)
+        .get({ run_id: runId, trace_id: inbound.trace_id });
+      if (handled !== undefined) {
+        return;
+      }
 
-  #finishCommand(inbound: InboundTurnRow, command: string): void {
-    this.#db
-      .prepare<{ id: string; now_ms: number }>(`
-        UPDATE inbound_messages SET state = 'done', updated_at_ms = @now_ms
-        WHERE id = @id AND state = 'ready'
-      `)
-      .run({ id: inbound.id, now_ms: Date.now() });
-    this.#traces.appendInTransaction({
-      traceId: inbound.trace_id,
-      component: "command",
-      event: "handled",
-      outcome: command,
-      data: { inboundId: inbound.id },
+      this.#recovery.sendConnectLink(provider, inbound.trace_id, runId, message);
+      this.#traces.appendInTransaction({
+        traceId: inbound.trace_id,
+        component: "connection_control",
+        event: "connect_fulfilled",
+        outcome: provider,
+        runId,
+        data: { inboundId: inbound.id },
+      });
     });
+    transaction.immediate();
   }
 
+  #connectionToolCallRejection(
+    inboundId: InboundId,
+    toolName: string,
+    toolCallId: string,
+  ): string | undefined {
+    const run = this.#runForInbound(inboundId);
+    if (run === undefined) {
+      throw new Error(`Inbound ${inboundId} has no agent run`);
+    }
+    if (this.#toolCallWasPrepared(run.id, toolCallId)) {
+      return undefined;
+    }
+    if (this.#hasConnectToolCall(run.id)) {
+      return "No tool call may follow connections.connect";
+    }
+    if (toolName !== "connections.connect") {
+      return undefined;
+    }
+    return run.modelRequests === 1 && run.toolCalls === 0
+      ? undefined
+      : "connections.connect is allowed only in the first model response";
+  }
+
+  #connectProviderForRun(runId: RunId): ConnectionProvider | undefined {
+    const rows = this.#db
+      .prepare<{ run_id: string }, { arguments_json: string }>(`
+        SELECT arguments_json FROM tool_executions
+        WHERE run_id = @run_id
+          AND tool_name = 'connections.connect'
+          AND status = 'succeeded'
+        ORDER BY created_at_ms, id
+      `)
+      .all({ run_id: runId });
+    if (rows.length > 1) {
+      throw new Error(`Agent run ${runId} contains multiple successful connection requests`);
+    }
+    return rows[0] === undefined
+      ? undefined
+      : parseConnectToolArguments(rows[0].arguments_json).provider;
+  }
+
+  #hasConnectToolCall(runId: RunId): boolean {
+    return (
+      this.#db
+        .prepare<{ run_id: string }, { found: number }>(`
+          SELECT 1 AS found FROM tool_executions
+          WHERE run_id = @run_id AND tool_name = 'connections.connect'
+          LIMIT 1
+        `)
+        .get({ run_id: runId }) !== undefined
+    );
+  }
+
+  #toolCallWasPrepared(runId: RunId, toolCallId: string): boolean {
+    return (
+      this.#db
+        .prepare<{ run_id: string; tool_call_id: string }, { found: number }>(`
+          SELECT 1 AS found FROM tool_executions
+          WHERE run_id = @run_id AND tool_call_id = @tool_call_id
+        `)
+        .get({ run_id: runId, tool_call_id: toolCallId }) !== undefined
+    );
+  }
 
   #blockWithoutRun(inbound: InboundTurnRow, failureCode: string): void {
     const transaction = this.#db.transaction(() => {
@@ -306,7 +362,7 @@ export class InboundTurnService {
   #systemPrompt(memory: string): string {
     return buildAssistantSystemPrompt({
       memory,
-      connections: this.#connections.list(),
+      audience: { kind: "inbound" },
     });
   }
 }

@@ -2,9 +2,9 @@ import type { ConnectionId } from "../core/ids.js";
 import { normalizeSafeLabel, type ConnectionStore } from "./store.js";
 import {
   ConnectionRoutingError,
-  type ConnectionProvider,
+  providerForCapability,
+  type ConnectionCapability,
   type ConnectionRecord,
-  type ToolCapability,
 } from "./types.js";
 
 export class ConnectionRouter {
@@ -15,21 +15,28 @@ export class ConnectionRouter {
   }
 
   select(input: {
-    capability: ToolCapability;
+    capabilities: readonly [ConnectionCapability, ...ConnectionCapability[]];
     account?: string;
     connectionId?: ConnectionId;
   }): ConnectionRecord {
-    const provider = providerForCapability(input.capability);
+    const [firstCapability, ...otherCapabilities] = input.capabilities;
+    const provider = providerForCapability(firstCapability);
+    if (otherCapabilities.some((capability) => providerForCapability(capability) !== provider)) {
+      throw new TypeError("A connection route cannot span providers");
+    }
+    const capabilitySummary = input.capabilities.join(", ");
     const candidates = this.#connections
       .list(provider)
-      .filter((connection) => connection.capabilities.includes(input.capability));
+      .filter((connection) =>
+        input.capabilities.every((capability) => connection.capabilities.includes(capability)),
+      );
 
     if (input.connectionId !== undefined) {
       const selected = candidates.find((connection) => connection.id === input.connectionId);
       if (selected === undefined) {
         throw new ConnectionRoutingError({
           code: "connection_not_found",
-          message: `No ${provider} connection with that ID grants ${input.capability}`,
+          message: `No ${provider} connection with that ID grants ${capabilitySummary}`,
           labels: candidates.map((connection) => connection.safeLabel),
         });
       }
@@ -44,7 +51,7 @@ export class ConnectionRouter {
       if (selected === undefined) {
         throw new ConnectionRoutingError({
           code: "connection_not_found",
-          message: `No ${provider} connection labeled "${input.account}" grants ${input.capability}`,
+          message: `No ${provider} connection labeled "${input.account}" grants ${capabilitySummary}`,
           labels: candidates.map((connection) => connection.safeLabel),
         });
       }
@@ -57,15 +64,15 @@ export class ConnectionRouter {
         code: "capability_unavailable",
         message:
           candidates.length === 0
-            ? `No ${provider} connection grants ${input.capability}`
-            : `No healthy ${provider} connection grants ${input.capability}`,
+            ? `No ${provider} connection grants ${capabilitySummary}`
+            : `No healthy ${provider} connection grants ${capabilitySummary}`,
         labels: candidates.map((connection) => connection.safeLabel),
       });
     }
     if (healthy.length > 1) {
       throw new ConnectionRoutingError({
         code: "connection_ambiguous",
-        message: `Choose a ${provider} account for ${input.capability}: ${healthy
+        message: `Choose a ${provider} account for ${capabilitySummary}: ${healthy
           .map((connection) => connection.safeLabel)
           .join(", ")}`,
         labels: healthy.map((connection) => connection.safeLabel),
@@ -73,10 +80,6 @@ export class ConnectionRouter {
     }
     return healthy[0]!;
   }
-}
-
-function providerForCapability(capability: ToolCapability): ConnectionProvider {
-  return capability.startsWith("gmail.") ? "google" : "notion";
 }
 
 function requireHealthy(connection: ConnectionRecord): ConnectionRecord {

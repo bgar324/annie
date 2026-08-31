@@ -1,24 +1,28 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentRunStore } from "../src/agent/store.js";
-import { ToolRegistry, type ToolExecutionContext } from "../src/agent/tools.js";
+import type { ToolExecutionContext } from "../src/agent/tools.js";
 import { loadRuntimeConfig, type RuntimeConfig } from "../src/config.js";
 import { ConnectionRouter } from "../src/connections/router.js";
 import { ConnectionStore } from "../src/connections/store.js";
+import type { RefreshCoordinator } from "../src/connections/refresh.js";
 import {
   newInboundId,
   newTraceId,
   type ConnectionId,
   type InboundId,
-  type RunId,
   type TraceId,
 } from "../src/core/ids.js";
-import type { GmailApi, GmailClientProvider } from "../src/gmail/client.js";
+import {
+  GoogleGmailClientProvider,
+  type GmailApi,
+  type GmailClientProvider,
+} from "../src/gmail/client.js";
 import { GmailToolService } from "../src/gmail/tools.js";
+import { normalizeGmailMetadata, normalizeGmailThread } from "../src/gmail/normalize.js";
 import { CredentialVault } from "../src/security/vault.js";
 import { createTraceRedactor } from "../src/tracing/redaction.js";
 import { TraceStore } from "../src/tracing/store.js";
-import { WriteStore } from "../src/writes/store.js";
 import { createTestDatabase, type TestDatabase } from "./helpers.js";
 
 const databases: TestDatabase[] = [];
@@ -32,10 +36,14 @@ describe("Gmail read tools", () => {
   it("routes an explicit account and returns bounded normalized search results", async () => {
     const harness = gmailHarness();
     expect(harness.config.google.scopes).toEqual([
-      "email",
-      "https://www.googleapis.com/auth/gmail.compose",
-      "https://www.googleapis.com/auth/gmail.readonly",
       "openid",
+      "email",
+      "https://www.googleapis.com/auth/gmail.readonly",
+      "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+      "https://www.googleapis.com/auth/calendar.events.readonly",
+      "https://www.googleapis.com/auth/drive.readonly",
+      "https://www.googleapis.com/auth/contacts.readonly",
+      "https://www.googleapis.com/auth/tasks.readonly",
     ]);
     const work = addGoogleConnection(harness, "sub_work", "Work", "work@example.test");
     const personal = addGoogleConnection(
@@ -75,7 +83,7 @@ describe("Gmail read tools", () => {
         return api;
       },
     });
-    const context = toolContext(harness, "gmail.search", "read");
+    const context = toolContext(harness, "gmail.search");
 
     await expect(
       service.search({ query: "from:alice", account: "Personal", maxResults: 5 }, context),
@@ -146,7 +154,7 @@ describe("Gmail read tools", () => {
       },
     });
     const service = gmailService(harness, fixedClient(connection.id, api));
-    const context = toolContext(harness, "gmail.read_thread", "read");
+    const context = toolContext(harness, "gmail.read_thread");
     const result = await service.readThread({ threadId: "thread_7" }, context);
 
     expect(result).toMatchObject({
@@ -180,6 +188,109 @@ describe("Gmail read tools", () => {
     });
   });
 
+  it("bounds provider-controlled metadata and the aggregate normalized thread", () => {
+    const metadata = normalizeGmailMetadata({
+      id: "m".repeat(2_000),
+      threadId: "t".repeat(2_000),
+      labelIds: Array.from({ length: 200 }, (_, index) => `label-${index}-${"x".repeat(200)}`),
+      payload: {
+        headers: [
+          { name: "From", value: "f".repeat(10_000) },
+          { name: "To", value: "t".repeat(10_000) },
+          { name: "Subject", value: "s".repeat(10_000) },
+          { name: "Date", value: "d".repeat(10_000) },
+          { name: "Message-ID", value: "i".repeat(10_000) },
+        ],
+      },
+    });
+    expect(Buffer.byteLength(metadata.id)).toBeLessThanOrEqual(512);
+    expect(Buffer.byteLength(metadata.threadId ?? "")).toBeLessThanOrEqual(512);
+    expect(Buffer.byteLength(metadata.from ?? "")).toBeLessThanOrEqual(2_048);
+    expect(Buffer.byteLength(metadata.to ?? "")).toBeLessThanOrEqual(2_048);
+    expect(Buffer.byteLength(metadata.subject ?? "")).toBeLessThanOrEqual(1_024);
+    expect(metadata.labels).toHaveLength(50);
+    expect(metadata.labels.every((label) => Buffer.byteLength(label) <= 128)).toBe(true);
+
+    const attachmentParts = Array.from({ length: 100 }, (_, index) => ({
+      mimeType: "application/octet-stream",
+      filename: `attachment-${index}-${"x".repeat(1_000)}`,
+      body: { size: 10, attachmentId: `attachment-${index}-${"y".repeat(1_000)}` },
+    }));
+    const largeBody = Buffer.from("body ".repeat(50_000)).toString("base64url");
+    const thread = normalizeGmailThread({
+      id: "thread_bounded",
+      messages: Array.from({ length: 10 }, (_, index) => ({
+        id: `message_${index}`,
+        payload: {
+          mimeType: "multipart/mixed",
+          parts: [
+            { mimeType: "text/plain", body: { data: largeBody } },
+            ...attachmentParts,
+          ],
+        },
+      })),
+    });
+    expect(
+      thread.messages.reduce((count, message) => count + message.attachments.length, 0),
+    ).toBeLessThanOrEqual(100);
+    expect(Buffer.byteLength(JSON.stringify(thread))).toBeLessThanOrEqual(120 * 1_024);
+  });
+
+  it("bounds full-thread transport before parsing and requests only required fields", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(
+      harness,
+      "sub_transport_bound",
+      "Transport Bound",
+      "transport@example.test",
+    );
+    const refresh = {
+      async credentials() {
+        return {
+          accessToken: "synthetic-access-token",
+          refreshToken: "synthetic-refresh-token",
+          scopes: harness.config.google.scopes,
+        };
+      },
+    } as unknown as RefreshCoordinator;
+    let requestUrl = "";
+    let requestInit: RequestInit | undefined;
+    let chunksRead = 0;
+    const fetchImpl: typeof fetch = async (input, init) => {
+      requestUrl = String(input);
+      requestInit = init;
+      const chunk = new Uint8Array(1_024 * 1_024).fill(123);
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            chunksRead += 1;
+            controller.enqueue(chunk);
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    const provider = new GoogleGmailClientProvider(harness.config, refresh, fetchImpl);
+    const api = await provider.forConnection(connection.id, newTraceId());
+
+    await expect(api.getThread({ threadId: "thread/one" })).rejects.toMatchObject({
+      name: "GmailHttpError",
+      response: { status: 413 },
+    });
+    const url = new URL(requestUrl);
+    expect(url.origin).toBe("https://gmail.googleapis.com");
+    expect(url.pathname).toBe("/gmail/v1/users/me/threads/thread%2Fone");
+    expect(url.searchParams.get("format")).toBe("full");
+    expect(url.searchParams.get("fields")).toBe(
+      "id,historyId,messages(id,threadId,labelIds,snippet,internalDate,payload)",
+    );
+    expect(requestInit?.method).toBe("GET");
+    expect(new Headers(requestInit?.headers).get("authorization")).toBe(
+      "Bearer synthetic-access-token",
+    );
+    expect(chunksRead).toBeGreaterThan(8);
+  });
+
   it.each([429, 500, 503])("retries read-only Gmail HTTP %s responses", async (status) => {
     const harness = gmailHarness();
     const connection = addGoogleConnection(harness, `sub_retry_${status}`, "Retry", "retry@example.test");
@@ -195,7 +306,7 @@ describe("Gmail read tools", () => {
       },
     });
     const service = gmailService(harness, fixedClient(connection.id, api), waits);
-    const context = toolContext(harness, "gmail.search", "read");
+    const context = toolContext(harness, "gmail.search");
 
     await expect(service.search({ query: "is:unread", maxResults: 10 }, context)).resolves.toMatchObject({
       messages: [],
@@ -228,7 +339,7 @@ describe("Gmail read tools", () => {
     await expect(
       service.search(
         { query: "is:unread", maxResults: 10 },
-        toolContext(harness, "gmail.search", "read"),
+        toolContext(harness, "gmail.search"),
       ),
     ).resolves.toMatchObject({ messages: [] });
     expect(requests).toBe(2);
@@ -236,249 +347,6 @@ describe("Gmail read tools", () => {
   });
 });
 
-describe("Gmail draft writes", () => {
-  it("creates then sends a known draft with two one-attempt write intents", async () => {
-    const harness = gmailHarness();
-    const connection = addGoogleConnection(harness, "sub_writer", "Writer", "writer@example.test");
-    const rawMessages: string[] = [];
-    let createRequests = 0;
-    let sendRequests = 0;
-    const api = stubGmailApi({
-      async createDraft(input) {
-        createRequests += 1;
-        rawMessages.push(Buffer.from(input.raw, "base64url").toString("utf8"));
-        return response({
-          id: "draft_1",
-          message: { id: "provider_draft_message", threadId: "thread_draft" },
-        });
-      },
-      async sendDraft(input) {
-        sendRequests += 1;
-        expect(input.draftId).toBe("draft_1");
-        return response({ id: "sent_message", threadId: "thread_draft", labelIds: ["SENT"] });
-      },
-    });
-    const service = gmailService(harness, fixedClient(connection.id, api));
-    const createContext = toolContext(harness, "gmail.create_draft", "write");
-    const created = await service.createDraft(
-      {
-        to: ["recipient@example.test"],
-        subject: "Hello",
-        bodyText: "Draft body",
-      },
-      createContext,
-    );
-    const sendContext = toolContext(harness, "gmail.send_draft", "write", createContext.runId);
-    const sent = await service.sendDraft({ draftId: "draft_1" }, sendContext);
-
-    expect(created).toMatchObject({ ok: true, draftId: "draft_1", threadId: "thread_draft" });
-    expect(sent).toMatchObject({ ok: true, draftId: "draft_1", messageId: "sent_message" });
-    expect(createRequests).toBe(1);
-    expect(sendRequests).toBe(1);
-    expect(rawMessages[0]).toMatch(/^From: writer@example\.test/mu);
-    expect(rawMessages[0]).toMatch(/^To: recipient@example\.test/mu);
-    expect(rawMessages[0]).toMatch(/^Subject: Hello/mu);
-    expect(rawMessages[0]).toContain(
-      `Message-ID: <${createContext.toolExecutionId}@assistant.example>`,
-    );
-    expect(rawMessages[0]).toContain("Draft body");
-    expect(service.tools().map((tool) => tool.definition.name)).toEqual([
-      "gmail.search",
-      "gmail.read_thread",
-      "gmail.create_draft",
-      "gmail.send_draft",
-    ]);
-    expect(() => new ToolRegistry(service.tools())).not.toThrow();
-    expect(
-      harness.database.handle.db
-        .prepare<[], { state: string }>("SELECT state FROM write_intents ORDER BY created_at_ms")
-        .all(),
-    ).toEqual([{ state: "succeeded" }, { state: "succeeded" }]);
-    expect(
-      harness.database.handle.db
-        .prepare<[], { status: string; sent_message_id: string }>(`
-          SELECT status, sent_message_id FROM gmail_drafts WHERE provider_draft_id = 'draft_1'
-        `)
-        .get(),
-    ).toEqual({ status: "sent", sent_message_id: "sent_message" });
-    expect(harness.runs.getToolRequired(createContext.toolExecutionId).status).toBe("succeeded");
-    expect(harness.runs.getToolRequired(sendContext.toolExecutionId).status).toBe("succeeded");
-    expect(JSON.stringify(harness.traces.list(createContext.traceId))).not.toContain("Draft body");
-  });
-
-  it("reuses the exact persisted MIME when resuming before dispatch", async () => {
-    const harness = gmailHarness();
-    const connection = addGoogleConnection(
-      harness,
-      "sub_resume",
-      "Resume",
-      "resume@example.test",
-    );
-    const context = toolContext(harness, "gmail.create_draft", "write");
-    const persistedRequest = {
-      raw: Buffer.from("persisted MIME", "utf8").toString("base64url"),
-      threadId: "thread_persisted",
-      rfcMessageId: "<persisted@assistant.example>",
-    };
-    harness.writes.prepare({
-      traceId: context.traceId,
-      runId: context.runId,
-      toolExecutionId: context.toolExecutionId,
-      connectionId: connection.id,
-      connectionGeneration: connection.credentialGeneration,
-      kind: "gmail_create_draft",
-      request: persistedRequest,
-      safeSummary: { test: true },
-    });
-    let receivedRequest: unknown;
-    const api = stubGmailApi({
-      async createDraft(input) {
-        receivedRequest = input;
-        return response({
-          id: "draft_resumed",
-          message: { id: "message_resumed", threadId: "thread_persisted" },
-        });
-      },
-    });
-    const service = gmailService(harness, fixedClient(connection.id, api));
-
-    await expect(
-      service.createDraft(
-        {
-          to: ["different@example.test"],
-          subject: "Would recompose",
-          bodyText: "This content must not replace the persisted request",
-        },
-        context,
-      ),
-    ).resolves.toMatchObject({ ok: true, draftId: "draft_resumed" });
-    expect(receivedRequest).toEqual({
-      raw: persistedRequest.raw,
-      threadId: persistedRequest.threadId,
-    });
-    const completedWrite = harness.writes.getByToolExecution(context.toolExecutionId);
-    expect(completedWrite?.request).toEqual(persistedRequest);
-    expect(completedWrite?.state).toBe("succeeded");
-  });
-
-  it("refuses to send a draft that the assistant did not create", async () => {
-    const harness = gmailHarness();
-    const connection = addGoogleConnection(harness, "sub_safe", "Safe", "safe@example.test");
-    let sends = 0;
-    const api = stubGmailApi({
-      async sendDraft() {
-        sends += 1;
-        return response({ id: "should_not_send" });
-      },
-    });
-    const service = gmailService(harness, fixedClient(connection.id, api));
-    const context = toolContext(harness, "gmail.send_draft", "write");
-
-    await expect(service.sendDraft({ draftId: "foreign_draft" }, context)).rejects.toMatchObject({
-      code: "draft_not_sendable",
-    });
-    expect(sends).toBe(0);
-    expect(
-      harness.database.handle.db
-        .prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM write_intents")
-        .get()?.count,
-    ).toBe(0);
-  });
-
-  it("marks a response-loss draft creation ambiguous and never retries it", async () => {
-    const harness = gmailHarness();
-    const connection = addGoogleConnection(
-      harness,
-      "sub_ambiguous",
-      "Ambiguous",
-      "ambiguous@example.test",
-    );
-    let creates = 0;
-    const api = stubGmailApi({
-      async createDraft() {
-        creates += 1;
-        throw new TypeError("socket closed after dispatch");
-      },
-    });
-    const service = gmailService(harness, fixedClient(connection.id, api));
-    const context = toolContext(harness, "gmail.create_draft", "write");
-
-    await expect(
-      service.createDraft(
-        { to: ["recipient@example.test"], subject: "One attempt", bodyText: "Only once" },
-        context,
-      ),
-    ).rejects.toThrow("socket closed after dispatch");
-    expect(creates).toBe(1);
-    expect(
-      harness.database.handle.db
-        .prepare<[], { state: string }>("SELECT state FROM write_intents")
-        .get()?.state,
-    ).toBe("ambiguous");
-    expect(harness.runs.getToolRequired(context.toolExecutionId).status).toBe("ambiguous");
-  });
-
-  it("treats a Gmail server error as acceptance-unknown", async () => {
-    const harness = gmailHarness();
-    const connection = addGoogleConnection(
-      harness,
-      "sub_rejected",
-      "Rejected",
-      "rejected@example.test",
-    );
-    let creates = 0;
-    const api = stubGmailApi({
-      async createDraft() {
-        creates += 1;
-        throw providerError(503);
-      },
-    });
-    const service = gmailService(harness, fixedClient(connection.id, api));
-    const context = toolContext(harness, "gmail.create_draft", "write");
-
-    await expect(
-      service.createDraft(
-        { to: ["recipient@example.test"], subject: "Rejected", bodyText: "One try" },
-        context,
-      ),
-    ).rejects.toMatchObject({ response: { status: 503 } });
-    expect(creates).toBe(1);
-    expect(
-      harness.database.handle.db
-        .prepare<[], { state: string }>("SELECT state FROM write_intents")
-        .get()?.state,
-    ).toBe("ambiguous");
-  });
-
-  it("records a semantic Gmail rejection as confirmed failed", async () => {
-    const harness = gmailHarness();
-    const connection = addGoogleConnection(
-      harness,
-      "sub_bad_request",
-      "Bad request",
-      "bad-request@example.test",
-    );
-    const api = stubGmailApi({
-      async createDraft() {
-        throw providerError(400);
-      },
-    });
-    const service = gmailService(harness, fixedClient(connection.id, api));
-    const context = toolContext(harness, "gmail.create_draft", "write");
-
-    await expect(
-      service.createDraft(
-        { to: ["recipient@example.test"], subject: "Rejected", bodyText: "One try" },
-        context,
-      ),
-    ).rejects.toMatchObject({ response: { status: 400 } });
-    expect(
-      harness.database.handle.db
-        .prepare<[], { state: string }>("SELECT state FROM write_intents")
-        .get()?.state,
-    ).toBe("confirmed_failed");
-  });
-});
 
 interface GmailHarness {
   database: TestDatabase;
@@ -487,7 +355,6 @@ interface GmailHarness {
   connections: ConnectionStore;
   router: ConnectionRouter;
   runs: AgentRunStore;
-  writes: WriteStore;
   nextSequence: number;
 }
 
@@ -508,7 +375,6 @@ function gmailHarness(): GmailHarness {
     connections,
     router: new ConnectionRouter(connections),
     runs: new AgentRunStore(database.handle.db, traces),
-    writes: new WriteStore(database.handle.db, traces),
     nextSequence: 1,
   };
 }
@@ -526,12 +392,7 @@ function addGoogleConnection(
     safeLabel,
     safeMetadata: { email },
     providerState: { scopes: harness.config.google.scopes },
-    capabilities: [
-      "gmail.search",
-      "gmail.read_thread",
-      "gmail.create_draft",
-      "gmail.send_draft",
-    ],
+    capabilities: ["gmail.read"],
     credentials: {
       accessToken: `access-${providerAccountId}`,
       refreshToken: `refresh-${providerAccountId}`,
@@ -547,13 +408,10 @@ function gmailService(
   waits: number[] = [],
 ): GmailToolService {
   return new GmailToolService({
-    db: harness.database.handle.db,
-    config: harness.config,
     router: harness.router,
     connections: harness.connections,
     clients,
     runs: harness.runs,
-    writes: harness.writes,
     traces: harness.traces,
     sleep: async (milliseconds) => {
       waits.push(milliseconds);
@@ -581,12 +439,6 @@ function stubGmailApi(overrides: Partial<GmailApi>): GmailApi {
     async getThread() {
       throw new Error("Unexpected threads.get");
     },
-    async createDraft() {
-      throw new Error("Unexpected drafts.create");
-    },
-    async sendDraft() {
-      throw new Error("Unexpected drafts.send");
-    },
     ...overrides,
   };
 }
@@ -604,37 +456,28 @@ function providerError(
   });
 }
 
-function toolContext(
-  harness: GmailHarness,
-  toolName: string,
-  operationClass: "read" | "write",
-  existingRunId?: RunId,
-): ToolExecutionContext {
-  let runId = existingRunId;
-  let traceId: TraceId;
-  if (runId === undefined) {
-    const inbound = insertInbound(harness, toolName);
-    traceId = inbound.traceId;
-    const run = harness.runs.startOrResume({ source: { kind: "inbound", inboundId: inbound.inboundId }, traceId, deadlineAtMs: Date.now() + 60_000 });
-    runId = run.id;
-  } else {
-    traceId = harness.runs.getRequired(runId).traceId;
-  }
+function toolContext(harness: GmailHarness, toolName: string): ToolExecutionContext {
+  const inbound = insertInbound(harness, toolName);
+  const run = harness.runs.startOrResume({
+    source: { kind: "inbound", inboundId: inbound.inboundId },
+    traceId: inbound.traceId,
+    deadlineAtMs: Date.now() + 60_000,
+  });
   const call = {
     id: `call_${randomUUID()}`,
     name: toolName,
     argumentsJson: "{}",
   };
   const execution = harness.runs.prepareTool({
-    runId,
+    runId: run.id,
     call,
-    operationClass,
-    maximumToolCalls: 8,
+    operationClass: "read",
+    maximumToolCalls: 16,
   });
   harness.runs.markToolRunning(execution.id);
   return {
-    runId,
-    traceId,
+    runId: run.id,
+    traceId: inbound.traceId,
     toolExecutionId: execution.id,
     connectionId: null,
     replay: false,
@@ -710,8 +553,6 @@ function testRuntimeConfig(database: TestDatabase): RuntimeConfig {
     GEMINI_API_KEY: "gemini_test_key",
     GOOGLE_CLIENT_ID: "google_test_client",
     GOOGLE_CLIENT_SECRET: "google_test_secret",
-    GOOGLE_WORKSPACE_SCOPES:
-      "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose",
     CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
   });
 }

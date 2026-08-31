@@ -1,12 +1,12 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { Auth } from "googleapis";
 import { z } from "zod";
-import type { RuntimeConfig } from "../config.js";
+import { GOOGLE_WORKSPACE_READ_SCOPES, type RuntimeConfig } from "../config.js";
 import type { ConnectionStore } from "../connections/store.js";
 import {
   OAuthIdentityMismatchError,
+  type ConnectionCapability,
   type ConnectionRecord,
-  type ToolCapability,
 } from "../connections/types.js";
 import type { ConnectionId, OAuthAttemptId } from "../core/ids.js";
 import type { TraceStore } from "../tracing/store.js";
@@ -39,12 +39,6 @@ const savedContextSchema = z.object({
   safeLabel: z.string().min(1),
   safeMetadata: z.record(z.string(), z.unknown()),
   providerState: z.record(z.string(), z.unknown()),
-  capabilities: z.array(z.enum([
-    "gmail.search",
-    "gmail.read_thread",
-    "gmail.create_draft",
-    "gmail.send_draft",
-  ])),
   credentials: credentialSchema,
 });
 
@@ -72,7 +66,7 @@ export function registerGoogleOAuth(input: {
             authorizationUrl: oauth.generateAuthUrl({
               access_type: "offline",
               prompt: "consent select_account",
-              include_granted_scopes: true,
+              include_granted_scopes: false,
               scope: [...input.config.google.scopes],
               state,
               nonce,
@@ -151,6 +145,13 @@ export function registerGoogleOAuth(input: {
         if (tokens.id_token === undefined || tokens.id_token === null) {
           throw new Error("Google did not return the required OpenID identity token");
         }
+        input.traces.append({
+          traceId: begun.attempt.traceId,
+          component: "google_oauth",
+          event: "id_token_verification_attempted",
+          outcome: "google",
+          data: { attemptId: begun.attempt.id },
+        });
         const ticket = await oauth.verifyIdToken({
           idToken: tokens.id_token,
           audience: input.config.google.clientId,
@@ -160,12 +161,27 @@ export function registerGoogleOAuth(input: {
           throw new Error("Google returned an invalid OpenID identity");
         }
 
-        const scopes = await actualGoogleScopes(oauth, tokens.scope, tokens.access_token);
+        const scopes = await actualGoogleScopes(
+          oauth,
+          tokens.scope,
+          tokens.access_token,
+          () => {
+            input.traces.append({
+              traceId: begun.attempt.traceId,
+              component: "google_oauth",
+              event: "token_info_attempted",
+              outcome: "google",
+              data: { attemptId: begun.attempt.id },
+            });
+          },
+        );
+        assertGoogleReadOnlyScopes(scopes);
         const refreshToken = existingOrNewRefreshToken(
           input.connections,
           identity.sub,
           begun.attempt.expectedConnectionId,
           tokens.refresh_token,
+          scopes,
         );
         const safeLabel = identity.email ?? `Google ${identity.sub.slice(-6)}`;
         const saved = input.attempts.saveExchangeResult({
@@ -179,7 +195,6 @@ export function registerGoogleOAuth(input: {
               emailVerified: identity.email_verified === true,
             },
             providerState: { scopes },
-            capabilities: googleCapabilities(scopes),
             credentials: {
               ...(tokens.access_token === undefined || tokens.access_token === null
                 ? {}
@@ -207,7 +222,10 @@ export function registerGoogleOAuth(input: {
         const connection = finalizeGoogleConnection(input, saved);
         return successPage(reply, connection);
       } catch (error) {
-        if (attemptId !== undefined && !tokensSaved) {
+        if (
+          attemptId !== undefined &&
+          (!tokensSaved || error instanceof GoogleScopeError)
+        ) {
           input.attempts.fail(attemptId, oauthFailureCode(error));
         }
         return callbackErrorPage(reply, error, tokensSaved);
@@ -224,6 +242,7 @@ function finalizeGoogleConnection(
   attempt: OAuthAttempt,
 ): ConnectionRecord {
   const saved = savedContextSchema.parse(attempt.context);
+  assertGoogleReadOnlyScopes(saved.credentials.scopes);
   const connection = input.connections.saveAuthorization({
     traceId: attempt.traceId,
     provider: "google",
@@ -231,7 +250,7 @@ function finalizeGoogleConnection(
     safeLabel: saved.safeLabel,
     safeMetadata: saved.safeMetadata,
     providerState: saved.providerState,
-    capabilities: saved.capabilities,
+    capabilities: googleCapabilities(saved.credentials.scopes),
     credentials: saved.credentials,
     ...(attempt.expectedConnectionId === null
       ? {}
@@ -272,6 +291,7 @@ async function actualGoogleScopes(
   oauth: Auth.OAuth2Client,
   tokenScopes: string | null | undefined,
   accessToken: string | null | undefined,
+  beforeTokenInfo: () => void,
 ): Promise<readonly string[]> {
   if (tokenScopes !== undefined && tokenScopes !== null) {
     return uniqueScopes(tokenScopes.split(/\s+/u));
@@ -279,24 +299,32 @@ async function actualGoogleScopes(
   if (accessToken === undefined || accessToken === null) {
     return [];
   }
+  beforeTokenInfo();
   const info = await oauth.getTokenInfo(accessToken);
   return uniqueScopes(info.scopes);
 }
 
-export function googleCapabilities(scopes: readonly string[]): readonly ToolCapability[] {
+export function googleCapabilities(
+  scopes: readonly string[],
+): readonly ConnectionCapability[] {
   const grants = new Set(scopes);
-  const full = grants.has("https://mail.google.com/");
-  const readable =
-    full ||
-    grants.has("https://www.googleapis.com/auth/gmail.readonly") ||
-    grants.has("https://www.googleapis.com/auth/gmail.modify");
-  const composable =
-    full ||
-    grants.has("https://www.googleapis.com/auth/gmail.compose") ||
-    grants.has("https://www.googleapis.com/auth/gmail.modify");
+  const calendarRead =
+    grants.has("https://www.googleapis.com/auth/calendar.calendarlist.readonly") &&
+    grants.has("https://www.googleapis.com/auth/calendar.events.readonly");
   return [
-    ...(readable ? (["gmail.search", "gmail.read_thread"] as const) : []),
-    ...(composable ? (["gmail.create_draft", "gmail.send_draft"] as const) : []),
+    ...(grants.has("https://www.googleapis.com/auth/gmail.readonly")
+      ? (["gmail.read"] as const)
+      : []),
+    ...(calendarRead ? (["calendar.read"] as const) : []),
+    ...(grants.has("https://www.googleapis.com/auth/drive.readonly")
+      ? (["drive.read"] as const)
+      : []),
+    ...(grants.has("https://www.googleapis.com/auth/contacts.readonly")
+      ? (["contacts.read"] as const)
+      : []),
+    ...(grants.has("https://www.googleapis.com/auth/tasks.readonly")
+      ? (["tasks.read"] as const)
+      : []),
   ];
 }
 
@@ -305,6 +333,7 @@ function existingOrNewRefreshToken(
   providerAccountId: string,
   expectedConnectionId: ConnectionId | null,
   newRefreshToken: string | null | undefined,
+  grantedScopes: readonly string[],
 ): string {
   if (newRefreshToken !== undefined && newRefreshToken !== null) {
     return newRefreshToken;
@@ -318,13 +347,68 @@ function existingOrNewRefreshToken(
     );
   if (existing !== undefined) {
     const credentials = credentialSchema.safeParse(connections.loadCredentials(existing.id));
-    if (credentials.success) {
+    if (
+      credentials.success &&
+      sameScopes(credentials.data.scopes, grantedScopes)
+    ) {
       return credentials.data.refreshToken;
     }
   }
-  throw new Error("Google did not return a refresh token; authorize again with consent");
+  throw new Error(
+    "Google did not return a refresh token for the new read-only grant; remove Ben's old Google access and connect again",
+  );
 }
 
+const requiredGoogleScopes = new Set<string>(GOOGLE_WORKSPACE_READ_SCOPES);
+const canonicalGoogleScopeAliases = new Map([
+  ["https://www.googleapis.com/auth/userinfo.email", "email"],
+]);
+
+class GoogleScopeError extends Error {
+  readonly reason: "outside_read_only_bundle" | "incomplete_bundle";
+
+  constructor(reason: GoogleScopeError["reason"]) {
+    super(
+      reason === "outside_read_only_bundle"
+        ? "Google returned permissions outside Ben's fixed read-only Workspace bundle"
+        : "Google did not grant every permission in Ben's read-only Workspace bundle",
+    );
+    this.name = "GoogleScopeError";
+    this.reason = reason;
+  }
+}
+
+export type GoogleScopeBundleStatus = "complete" | "incomplete" | "unsafe";
+
+export function googleScopeBundleStatus(scopes: readonly string[]): GoogleScopeBundleStatus {
+  const normalized = new Set(
+    scopes.map((scope) => canonicalGoogleScopeAliases.get(scope) ?? scope),
+  );
+  if ([...normalized].some((scope) => !requiredGoogleScopes.has(scope))) {
+    return "unsafe";
+  }
+  return GOOGLE_WORKSPACE_READ_SCOPES.some((scope) => !normalized.has(scope))
+    ? "incomplete"
+    : "complete";
+}
+
+function assertGoogleReadOnlyScopes(scopes: readonly string[]): void {
+  const status = googleScopeBundleStatus(scopes);
+  if (status !== "complete") {
+    throw new GoogleScopeError(
+      status === "unsafe" ? "outside_read_only_bundle" : "incomplete_bundle",
+    );
+  }
+}
+
+function sameScopes(left: readonly string[], right: readonly string[]): boolean {
+  const normalizedLeft = uniqueScopes(left);
+  const normalizedRight = uniqueScopes(right);
+  return (
+    normalizedLeft.length === normalizedRight.length &&
+    normalizedLeft.every((scope, index) => scope === normalizedRight[index])
+  );
+}
 function uniqueScopes(scopes: readonly string[]): readonly string[] {
   return [...new Set(scopes.map((scope) => scope.trim()).filter(Boolean))].sort();
 }
@@ -351,6 +435,16 @@ function callbackErrorPage(
   error: unknown,
   tokensSaved: boolean,
 ): FastifyReply {
+  if (error instanceof GoogleScopeError) {
+    return sendOAuthPage(
+      reply,
+      400,
+      error.reason === "outside_read_only_bundle"
+        ? "Google permissions are not read-only"
+        : "Google permissions are incomplete",
+      "Remove Ben from your Google Account connections, then request a new Google connection link and grant every requested permission.",
+    );
+  }
   if (error instanceof OAuthIdentityMismatchError) {
     return sendOAuthPage(
       reply,
@@ -376,6 +470,11 @@ function callbackErrorPage(
 }
 
 function oauthFailureCode(error: unknown): string {
+  if (error instanceof GoogleScopeError) {
+    return error.reason === "outside_read_only_bundle"
+      ? "scope_not_read_only"
+      : "scope_bundle_incomplete";
+  }
   if (error instanceof OAuthIdentityMismatchError) {
     return "identity_mismatch";
   }

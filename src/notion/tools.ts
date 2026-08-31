@@ -4,7 +4,7 @@ import type { AgentRunStore } from "../agent/store.js";
 import type { RegisteredTool, ToolExecutionContext } from "../agent/tools.js";
 import type { ConnectionRouter } from "../connections/router.js";
 import type { ConnectionStore } from "../connections/store.js";
-import type { ConnectionRecord, ToolCapability } from "../connections/types.js";
+import type { ConnectionCapability, ConnectionRecord } from "../connections/types.js";
 import { ModelSafeError } from "../core/errors.js";
 import type { TraceId, WriteIntentId } from "../core/ids.js";
 import type { WriteStore } from "../writes/store.js";
@@ -427,7 +427,7 @@ export class NotionToolService {
     connection: ConnectionRecord;
     context: ToolExecutionContext;
     upstreamName: Extract<NotionUpstreamTool, "notion-create-pages" | "notion-update-page">;
-    capability: Extract<ToolCapability, "notion.create_page" | "notion.update_page">;
+    capability: Extract<ConnectionCapability, "notion.create_page" | "notion.update_page">;
     writeKind: "notion_create_page" | "notion_update_page";
     argumentsValue: Record<string, unknown>;
     safeSummary: unknown;
@@ -490,12 +490,12 @@ export class NotionToolService {
   }
 
   #select(
-    capability: ToolCapability,
+    capability: ConnectionCapability,
     workspace: string | undefined,
     context: ToolExecutionContext,
   ): ConnectionRecord {
     const connection = this.#router.select({
-      capability,
+      capabilities: [capability],
       ...(context.connectionId === null
         ? workspace === undefined
           ? {}

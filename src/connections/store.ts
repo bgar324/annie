@@ -12,11 +12,12 @@ import type { TraceStore } from "../tracing/store.js";
 import {
   OAuthIdentityMismatchError,
   StaleCredentialGenerationError,
+  providerForCapability,
   type ConnectionAuthorization,
+  type ConnectionCapability,
   type ConnectionProvider,
   type ConnectionRecord,
   type ConnectionStatus,
-  type ToolCapability,
 } from "./types.js";
 
 interface ConnectionRow {
@@ -161,7 +162,7 @@ export class ConnectionStore {
         .run({ connection_id: connectionId });
       const insertCapability = this.#db.prepare<{
         connection_id: string;
-        capability: ToolCapability;
+        capability: ConnectionCapability;
       }>(`
         INSERT INTO connection_capabilities(connection_id, capability)
         VALUES (@connection_id, @capability)
@@ -451,7 +452,7 @@ export class ConnectionStore {
 
   #toRecord(row: ConnectionRow): ConnectionRecord {
     const capabilities = this.#db
-      .prepare<{ connection_id: string }, { capability: ToolCapability }>(`
+      .prepare<{ connection_id: string }, { capability: ConnectionCapability }>(`
         SELECT capability FROM connection_capabilities
         WHERE connection_id = @connection_id ORDER BY capability
       `)
@@ -491,11 +492,10 @@ const connectionSelect = `
 `;
 
 function validateAuthorization(input: ConnectionAuthorization): void {
-  const providerPrefix = input.provider === "google" ? "gmail." : "notion.";
   if (input.providerAccountId.length === 0 || input.providerAccountId.length > 512) {
     throw new Error("Provider account IDs must contain between 1 and 512 characters");
   }
-  if (input.capabilities.some((capability) => !capability.startsWith(providerPrefix))) {
+  if (input.capabilities.some((capability) => providerForCapability(capability) !== input.provider)) {
     throw new Error(`A ${input.provider} connection contains a capability for another provider`);
   }
 }

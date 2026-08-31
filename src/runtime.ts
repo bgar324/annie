@@ -10,11 +10,15 @@ import { RefreshCoordinator } from "./connections/refresh.js";
 import { ConnectionRecoveryService } from "./connections/recovery.js";
 import { ConnectionRouter } from "./connections/router.js";
 import { ConnectionStore } from "./connections/store.js";
+import { connectionTools } from "./connections/tools.js";
 import { asEgressId } from "./core/ids.js";
 import { openDatabase, type DatabaseHandle } from "./db/database.js";
 import type { GmailClientProvider } from "./gmail/client.js";
 import { GoogleGmailClientProvider } from "./gmail/client.js";
 import { GmailToolService } from "./gmail/tools.js";
+import type { GoogleWorkspaceClientProvider } from "./google/client.js";
+import { GoogleApisWorkspaceClientProvider } from "./google/client.js";
+import { GoogleWorkspaceToolService } from "./google/tools.js";
 import { MemoryDocumentStore } from "./memory/document.js";
 import { MemoryMaintenanceService } from "./memory/maintenance.js";
 import { SendblueGateway } from "./messages/client.js";
@@ -54,6 +58,7 @@ export interface RuntimeOverrides {
   model?: AssistantModel;
   messageGateway?: MessageGateway;
   gmailClients?: GmailClientProvider;
+  googleWorkspaceClients?: GoogleWorkspaceClientProvider;
   notionClients?: NotionClientProvider;
   logger?: false;
 }
@@ -125,13 +130,19 @@ export async function createRuntime(
     const router = new ConnectionRouter(connections);
     const runs = new AgentRunStore(database.db, traces);
     const gmail = new GmailToolService({
-      db: database.db,
-      config,
       router,
       connections,
       clients: overrides.gmailClients ?? new GoogleGmailClientProvider(config, refresh),
       runs,
-      writes,
+      traces,
+    });
+    const workspace = new GoogleWorkspaceToolService({
+      router,
+      connections,
+      clients:
+        overrides.googleWorkspaceClients ??
+        new GoogleApisWorkspaceClientProvider(config, refresh),
+      runs,
       traces,
     });
     const notion = new NotionToolService({
@@ -144,9 +155,11 @@ export async function createRuntime(
       runs,
       writes,
     });
-    const providerTools = [...gmail.tools(), ...notion.tools()];
+    const providerTools = [...gmail.tools(), ...workspace.tools(), ...notion.tools()];
     const tools = new ToolRegistry(providerTools);
     assertProductionTools(tools);
+    const agentTools = new ToolRegistry([...providerTools, ...connectionTools(connections)]);
+    assertAgentTools(agentTools, tools);
     const model = overrides.model ?? new GeminiChatModel({ config, traces });
     const agentLimits = {
       maxToolRounds: config.limits.maxAgentToolRounds,
@@ -154,7 +167,7 @@ export async function createRuntime(
       maxProviderWrites: config.limits.maxAgentWrites,
       maxRunMs: config.limits.maxAgentRunMs,
     };
-    const agent = new AgentLoop({ model, tools, runs, writes, limits: agentLimits });
+    const agent = new AgentLoop({ model, tools: agentTools, runs, writes, limits: agentLimits });
     const memory = new MemoryDocumentStore({
       path: config.memoryPath,
       maximumBytes: config.limits.memoryMaxBytes,
@@ -199,7 +212,6 @@ export async function createRuntime(
       ),
       memory,
       maintenance,
-      connections,
       recovery,
       egress,
       failures,
@@ -297,6 +309,7 @@ export async function createRuntime(
     registerNotionOAuth({ app, config, links, attempts, connections, traces });
 
     writes.recoverOpenAttempts();
+    recovery.planPendingReconnects("google");
     await maintenance.recoverInterrupted();
     projector.projectPending();
     new TraceRetentionService({
@@ -374,8 +387,8 @@ function assertProductionTools(tools: ToolRegistry): void {
   const expected = [
     "gmail.search",
     "gmail.read_thread",
-    "gmail.create_draft",
-    "gmail.send_draft",
+    "google.search",
+    "google.read",
     "notion.search",
     "notion.fetch",
     "notion.create_page",
@@ -384,6 +397,18 @@ function assertProductionTools(tools: ToolRegistry): void {
   const actual = tools.definitions().map((tool) => tool.name);
   if (actual.length !== expected.length || actual.some((name, index) => name !== expected[index])) {
     throw new Error(`Production tool registry drifted: ${actual.join(", ")}`);
+  }
+}
+
+function assertAgentTools(agentTools: ToolRegistry, providerTools: ToolRegistry): void {
+  const expected = [
+    ...providerTools.definitions().map((tool) => tool.name),
+    "connections.list",
+    "connections.connect",
+  ];
+  const actual = agentTools.definitions().map((tool) => tool.name);
+  if (actual.length !== expected.length || actual.some((name, index) => name !== expected[index])) {
+    throw new Error(`Agent tool registry drifted: ${actual.join(", ")}`);
   }
 }
 

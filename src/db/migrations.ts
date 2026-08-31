@@ -584,6 +584,91 @@ const MIGRATIONS: readonly Migration[] = [
         ON jobs(chat_id) WHERE status = 'running';
     `,
   },
+  {
+    version: 6,
+    sql: `
+      UPDATE write_intents
+      SET state = 'confirmed_failed',
+          completed_at_ms = CAST(strftime('%s', 'now') AS INTEGER) * 1000,
+          updated_at_ms = CAST(strftime('%s', 'now') AS INTEGER) * 1000
+      WHERE kind IN ('gmail_create_draft', 'gmail_send_draft')
+        AND state = 'prepared';
+
+      UPDATE tool_executions
+      SET status = 'not_executed',
+          result_json = '{"error":{"code":"google_write_tools_removed","message":"Google write tools were removed"},"ok":false}',
+          updated_at_ms = CAST(strftime('%s', 'now') AS INTEGER) * 1000
+      WHERE tool_name IN ('gmail.create_draft', 'gmail.send_draft')
+        AND status IN ('validated', 'running')
+        AND NOT EXISTS (
+          SELECT 1 FROM write_intents
+          WHERE write_intents.tool_execution_id = tool_executions.id
+            AND write_intents.state = 'attempting'
+        );
+
+      UPDATE inbound_messages
+      SET state = 'blocked',
+          updated_at_ms = CAST(strftime('%s', 'now') AS INTEGER) * 1000
+      WHERE id IN (
+        SELECT agent_runs.inbound_id
+        FROM agent_runs
+        WHERE agent_runs.inbound_id IS NOT NULL
+          AND agent_runs.phase IN ('pending', 'running', 'finalizing')
+          AND EXISTS (
+            SELECT 1
+            FROM agent_messages, json_each(agent_messages.tool_calls_json) AS tool_call
+            WHERE agent_messages.run_id = agent_runs.id
+              AND agent_messages.role = 'assistant'
+              AND agent_messages.tool_calls_json IS NOT NULL
+              AND json_extract(tool_call.value, '$.name') IN (
+                'gmail.create_draft', 'gmail.send_draft'
+              )
+          )
+      );
+
+      UPDATE agent_runs
+      SET phase = 'blocked',
+          failure_code = 'google_write_tools_removed',
+          updated_at_ms = CAST(strftime('%s', 'now') AS INTEGER) * 1000
+      WHERE phase IN ('pending', 'running', 'finalizing')
+        AND EXISTS (
+          SELECT 1
+          FROM agent_messages, json_each(agent_messages.tool_calls_json) AS tool_call
+          WHERE agent_messages.run_id = agent_runs.id
+            AND agent_messages.role = 'assistant'
+            AND agent_messages.tool_calls_json IS NOT NULL
+            AND json_extract(tool_call.value, '$.name') IN (
+              'gmail.create_draft', 'gmail.send_draft'
+            )
+        );
+
+      UPDATE oauth_attempts
+      SET status = 'failed',
+          failure_code = 'google_scope_cutover',
+          updated_at_ms = CAST(strftime('%s', 'now') AS INTEGER) * 1000
+      WHERE provider = 'google'
+        AND status IN ('pending', 'exchange_started', 'tokens_saved');
+      DELETE FROM refresh_leases
+      WHERE connection_id IN (
+        SELECT id FROM connections WHERE provider = 'google'
+      );
+
+
+      DELETE FROM connection_capabilities
+      WHERE connection_id IN (
+        SELECT id FROM connections WHERE provider = 'google'
+      );
+
+      UPDATE connections
+      SET status = 'reconnect_required',
+          health_generation = health_generation + 1,
+          retry_at_ms = NULL,
+          last_error_code = 'google_scope_cutover',
+          last_error_summary = 'Reconnect Google to grant the fixed read-only Workspace bundle',
+          updated_at_ms = CAST(strftime('%s', 'now') AS INTEGER) * 1000
+      WHERE provider = 'google';
+    `,
+  },
 ];
 
 export function runMigrations(

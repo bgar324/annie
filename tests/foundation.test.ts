@@ -32,22 +32,29 @@ function validEnvironment(directory: string): NodeJS.ProcessEnv {
     GEMINI_API_KEY: "gemini_test_key",
     GOOGLE_CLIENT_ID: "google_test_client",
     GOOGLE_CLIENT_SECRET: "google_test_secret",
-    GOOGLE_WORKSPACE_SCOPES: "openid,email,https://www.googleapis.com/auth/gmail.readonly",
     CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
   };
 }
 
 describe("runtime configuration", () => {
-  it("derives fixed callbacks and storage paths from validated input", () => {
+  it("derives fixed callbacks, scopes, and storage paths from validated input", () => {
     testDatabase = createTestDatabase();
-    const config = loadRuntimeConfig(validEnvironment(testDatabase.directory));
+    const environment = validEnvironment(testDatabase.directory);
+    environment.GOOGLE_WORKSPACE_SCOPES =
+      "openid email https://www.googleapis.com/auth/gmail.modify";
+    const config = loadRuntimeConfig(environment);
 
     expect(config.google.callbackUrl).toBe("http://localhost:3000/oauth/google/callback");
     expect(config.notion.callbackUrl).toBe("http://localhost:3000/oauth/notion/callback");
     expect(config.google.scopes).toEqual([
+      "openid",
       "email",
       "https://www.googleapis.com/auth/gmail.readonly",
-      "openid",
+      "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+      "https://www.googleapis.com/auth/calendar.events.readonly",
+      "https://www.googleapis.com/auth/drive.readonly",
+      "https://www.googleapis.com/auth/contacts.readonly",
+      "https://www.googleapis.com/auth/tasks.readonly",
     ]);
     expect(config.credentialEncryptionKey).toHaveLength(32);
     expect(config.sendblue).toEqual({
@@ -70,11 +77,8 @@ describe("runtime configuration", () => {
     expect(config.databasePath).toBe(join(testDatabase.directory, "assistant.sqlite"));
   });
 
-  it("fails closed for incomplete identity scopes, unusable numbers, and production storage", () => {
+  it("fails closed for unusable numbers and production storage", () => {
     testDatabase = createTestDatabase();
-    const missingScope = validEnvironment(testDatabase.directory);
-    missingScope.GOOGLE_WORKSPACE_SCOPES = "openid";
-    expect(() => loadRuntimeConfig(missingScope)).toThrow(/must include email/u);
 
     const localFromNumber = validEnvironment(testDatabase.directory);
     localFromNumber.SENDBLUE_FROM_NUMBER = "5550000001";
@@ -416,6 +420,206 @@ describe("SQLite foundation", () => {
       db.close();
     }
   });
+  it("forces a safe read-only Google reconnect while preserving unrelated state", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    runMigrations(db, 5);
+    db.exec(`
+      INSERT INTO connections(
+        id, provider, provider_account_id, safe_label, normalized_safe_label,
+        status, credential_generation, health_generation, checked_at_ms,
+        last_success_at_ms, retry_at_ms, last_error_code, last_error_summary,
+        safe_metadata_json, provider_state_json, created_at_ms, updated_at_ms
+      ) VALUES
+        (
+          'connection_google', 'google', 'google_sub', 'Google', 'google',
+          'healthy', 1, 2, 1, 1, NULL, NULL, NULL, '{}',
+          '{"scopes":["https://www.googleapis.com/auth/gmail.modify"]}', 1, 1
+        ),
+        (
+          'connection_notion', 'notion', 'notion_workspace', 'Notion', 'notion',
+          'healthy', 1, 1, 1, 1, NULL, NULL, NULL, '{}', '{}', 1, 1
+        );
+      INSERT INTO connection_capabilities(connection_id, capability) VALUES
+        ('connection_google', 'gmail.search'),
+        ('connection_google', 'gmail.read_thread'),
+        ('connection_google', 'gmail.create_draft'),
+        ('connection_google', 'gmail.send_draft'),
+        ('connection_notion', 'notion.search');
+      INSERT INTO refresh_leases(
+        connection_id, credential_generation, lease_token, lease_expires_at_ms,
+        dispatch_state, updated_at_ms
+      ) VALUES ('connection_google', 1, 'lease_google', 999999, 'claimed', 1);
+
+      INSERT INTO oauth_link_tokens(
+        id, jti_hash, provider, purpose, expected_connection_id, trace_id,
+        issued_at_ms, expires_at_ms, consumed_at_ms
+      ) VALUES
+        ('link_google_pending', 'hash_google_pending', 'google', 'connect', NULL, 'trace_oauth_1', 1, 999, NULL),
+        ('link_google_active', 'hash_google_active', 'google', 'connect', NULL, 'trace_oauth_2', 1, 999, NULL),
+        ('link_notion_pending', 'hash_notion_pending', 'notion', 'connect', NULL, 'trace_oauth_3', 1, 999, NULL);
+      INSERT INTO oauth_attempts(
+        id, link_token_id, provider, expected_connection_id, state_hash, status,
+        key_version, nonce, ciphertext, auth_tag, authorization_url,
+        provider_identity, failure_code, expires_at_ms, state_consumed_at_ms,
+        created_at_ms, updated_at_ms
+      ) VALUES
+        (
+          'attempt_google_pending', 'link_google_pending', 'google', NULL,
+          'state_google_pending', 'pending', 1, X'01', X'02', X'03',
+          'https://accounts.google.example/auth', NULL, NULL, 999, NULL, 1, 1
+        ),
+        (
+          'attempt_google_active', 'link_google_active', 'google', NULL,
+          'state_google_active', 'active', 1, X'01', X'02', X'03',
+          'https://accounts.google.example/auth', 'google_sub', NULL, 999, 1, 1, 1
+        ),
+        (
+          'attempt_notion_pending', 'link_notion_pending', 'notion', NULL,
+          'state_notion_pending', 'pending', 1, X'01', X'02', X'03',
+          'https://notion.example/auth', NULL, NULL, 999, NULL, 1, 1
+        );
+
+      INSERT INTO webhook_deliveries(
+        id, provider_delivery_id, provider_message_id, event_kind, line_id,
+        line_handle, outbox_id, normalized_json, trace_id, received_at_ms
+      ) VALUES
+        ('delivery_write', 'provider_delivery_write', 'provider_message_write', 'message.received', 'line', '+15550000001', NULL, '{}', 'trace_write', 1),
+        ('delivery_read', 'provider_delivery_read', 'provider_message_read', 'message.received', 'line', '+15550000001', NULL, '{}', 'trace_read', 1);
+      INSERT INTO inbound_messages(
+        id, delivery_id, provider_message_id, chat_id, guid, sender, line_id,
+        line_handle, sequence, state, text, is_audio, attachment_json, trace_id,
+        created_at_ms, updated_at_ms
+      ) VALUES
+        ('inbound_write', 'delivery_write', 'provider_message_write', 'chat', 'guid_write', '+15550000002', 'line', '+15550000001', 1, 'processing', 'send it', 0, NULL, 'trace_write', 1, 1),
+        ('inbound_read', 'delivery_read', 'provider_message_read', 'chat', 'guid_read', '+15550000002', 'line', '+15550000001', 2, 'processing', 'read it', 0, NULL, 'trace_read', 1, 1);
+      INSERT INTO agent_runs(
+        id, inbound_id, scheduled_job_id, trace_id, phase, model_requests,
+        maintenance_requests, tool_calls, provider_writes, deadline_at_ms,
+        transcript_bytes, memory_maintenance_status, memory_before_digest,
+        memory_after_digest, ambiguous_write_id, final_response, failure_code,
+        created_at_ms, updated_at_ms
+      ) VALUES
+        ('run_write', 'inbound_write', NULL, 'trace_write', 'running', 1, 0, 1, 0, 999, 1, 'pending', NULL, NULL, NULL, NULL, NULL, 1, 1),
+        ('run_read', 'inbound_read', NULL, 'trace_read', 'running', 1, 0, 1, 0, 999, 1, 'pending', NULL, NULL, NULL, NULL, NULL, 1, 1);
+      INSERT INTO agent_messages(
+        run_id, sequence, role, content, reasoning_content, tool_calls_json,
+        tool_call_id, provider_response_id, finish_reason, usage_json,
+        byte_count, created_at_ms
+      ) VALUES
+        (
+          'run_write', 1, 'assistant', '', NULL,
+          '[{"id":"call_write","name":"gmail.send_draft","argumentsJson":"{}"}]',
+          NULL, NULL, 'tool_calls', NULL, 0, 1
+        ),
+        (
+          'run_read', 1, 'assistant', '', NULL,
+          '[{"id":"call_read","name":"gmail.search","argumentsJson":"{}"}]',
+          NULL, NULL, 'tool_calls', NULL, 0, 1
+        );
+      INSERT INTO tool_executions(
+        id, run_id, tool_call_id, tool_name, arguments_json, connection_id,
+        operation_class, status, result_json, write_intent_id, created_at_ms,
+        updated_at_ms
+      ) VALUES
+        (
+          'tool_write', 'run_write', 'call_write', 'gmail.send_draft', '{}',
+          'connection_google', 'write', 'running', NULL, 'write_google', 1, 1
+        ),
+        (
+          'tool_read', 'run_read', 'call_read', 'gmail.search', '{}',
+          'connection_google', 'read', 'running', NULL, NULL, 1, 1
+        );
+      INSERT INTO write_intents(
+        id, run_id, tool_execution_id, egress_id, connection_id, kind, state,
+        request_fingerprint, safe_summary_json, request_json,
+        connection_generation, provider_reference_json, attempted_at_ms,
+        completed_at_ms, created_at_ms, updated_at_ms
+      ) VALUES (
+        'write_google', 'run_write', 'tool_write', NULL, 'connection_google',
+        'gmail_send_draft', 'prepared', 'fingerprint', '{}', '{}', 1, NULL,
+        NULL, NULL, 1, 1
+      );
+    `);
+
+    try {
+      runMigrations(db);
+
+      expect(
+        db.prepare<[], {
+          status: string;
+          health_generation: number;
+          last_error_code: string | null;
+        }>(`
+          SELECT status, health_generation, last_error_code
+          FROM connections WHERE id = 'connection_google'
+        `).get(),
+      ).toEqual({
+        status: "reconnect_required",
+        health_generation: 3,
+        last_error_code: "google_scope_cutover",
+      });
+      expect(
+        db.prepare<[], { connection_id: string; capability: string }>(`
+          SELECT connection_id, capability FROM connection_capabilities
+          ORDER BY connection_id, capability
+        `).all(),
+      ).toEqual([{ connection_id: "connection_notion", capability: "notion.search" }]);
+      expect(db.prepare("SELECT * FROM refresh_leases").all()).toEqual([]);
+      expect(
+        db.prepare<[], { id: string; status: string; failure_code: string | null }>(`
+          SELECT id, status, failure_code FROM oauth_attempts ORDER BY id
+        `).all(),
+      ).toEqual([
+        { id: "attempt_google_active", status: "active", failure_code: null },
+        {
+          id: "attempt_google_pending",
+          status: "failed",
+          failure_code: "google_scope_cutover",
+        },
+        { id: "attempt_notion_pending", status: "pending", failure_code: null },
+      ]);
+      expect(
+        db.prepare<[], { id: string; phase: string; failure_code: string | null }>(`
+          SELECT id, phase, failure_code FROM agent_runs ORDER BY id
+        `).all(),
+      ).toEqual([
+        { id: "run_read", phase: "running", failure_code: null },
+        {
+          id: "run_write",
+          phase: "blocked",
+          failure_code: "google_write_tools_removed",
+        },
+      ]);
+      expect(
+        db.prepare<[], { id: string; state: string }>(`
+          SELECT id, state FROM inbound_messages ORDER BY id
+        `).all(),
+      ).toEqual([
+        { id: "inbound_read", state: "processing" },
+        { id: "inbound_write", state: "blocked" },
+      ]);
+      expect(
+        db.prepare<[], { status: string; result_json: string | null }>(
+          "SELECT status, result_json FROM tool_executions WHERE id = 'tool_write'",
+        ).get(),
+      ).toEqual({
+        status: "not_executed",
+        result_json:
+          '{"error":{"code":"google_write_tools_removed","message":"Google write tools were removed"},"ok":false}',
+      });
+      expect(
+        db.prepare<[], { state: string; completed: number }>(`
+          SELECT state, completed_at_ms IS NOT NULL AS completed
+          FROM write_intents WHERE id = 'write_google'
+        `).get(),
+      ).toEqual({ state: "confirmed_failed", completed: 1 });
+      expect(db.pragma("foreign_key_check")).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
 });
 
 describe("trace projection", () => {

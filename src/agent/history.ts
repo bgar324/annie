@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import type { InboundId } from "../core/ids.js";
 import type { ModelMessage } from "./model.js";
+import { assistantHistoryText } from "./prompt.js";
 
 interface CurrentInboundRow {
   chat_id: string;
@@ -46,6 +47,23 @@ export class ConversationHistoryStore {
           AND runs.phase = 'completed'
           AND inbound.text IS NOT NULL
           AND runs.final_response IS NOT NULL
+          AND (
+            NOT EXISTS (
+              SELECT 1
+              FROM tool_executions AS connect_tools
+              WHERE connect_tools.run_id = runs.id
+                AND connect_tools.tool_name = 'connections.connect'
+                AND connect_tools.status = 'succeeded'
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM trace_event_spool AS connect_events
+              WHERE connect_events.trace_id = runs.trace_id
+                AND connect_events.run_id = runs.id
+                AND connect_events.component = 'connection_control'
+                AND connect_events.event = 'connect_fulfilled'
+            )
+          )
         ORDER BY inbound.sequence DESC
         LIMIT @pair_limit
       `)
@@ -58,11 +76,12 @@ export class ConversationHistoryStore {
     const selected: HistoryRow[] = [];
     let bytes = 0;
     for (const row of rows) {
-      const pairBytes = Buffer.byteLength(row.user_text) + Buffer.byteLength(row.assistant_text);
+      const assistantText = assistantHistoryText(row.assistant_text);
+      const pairBytes = Buffer.byteLength(row.user_text) + Buffer.byteLength(assistantText);
       if (bytes + pairBytes > this.#maxBytes) {
         break;
       }
-      selected.push(row);
+      selected.push({ ...row, assistant_text: assistantText });
       bytes += pairBytes;
     }
     return selected.reverse().flatMap((row) => [

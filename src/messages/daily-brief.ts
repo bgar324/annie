@@ -1,11 +1,12 @@
 import type Database from "better-sqlite3";
 import type { AgentLoop } from "../agent/loop.js";
+import type { ModelToolCall } from "../agent/model.js";
 import { buildAssistantSystemPrompt } from "../agent/prompt.js";
 import type { AgentRunRecord, AgentRunStore } from "../agent/store.js";
 import type { RuntimeConfig } from "../config.js";
 import type { ConnectionStore } from "../connections/store.js";
 import type { ConnectionRecord } from "../connections/types.js";
-import { newTraceId, type JobId, type RunId, type TraceId } from "../core/ids.js";
+import { newTraceId, type ConnectionId, type JobId, type RunId, type TraceId } from "../core/ids.js";
 import type { MemoryDocumentStore } from "../memory/document.js";
 import type { MemoryMaintenanceService } from "../memory/maintenance.js";
 import {
@@ -27,6 +28,8 @@ const localDatePattern = /^\d{4}-\d{2}-\d{2}$/u;
 const dailyBriefToolNames = [
   "gmail.search",
   "gmail.read_thread",
+  "google.search",
+  "google.read",
   "notion.search",
   "notion.fetch",
 ] as const;
@@ -34,6 +37,12 @@ const dailyBriefToolNames = [
 interface DailyBriefPayload {
   localDate: string;
   scheduledForMs: number;
+}
+
+interface DailyBriefWindow {
+  calendarStart: string;
+  calendarEnd: string;
+  modifiedAfter: string;
 }
 
 interface ScheduledJobRow {
@@ -52,6 +61,14 @@ interface SearchExecutionRow {
   connection_id: string | null;
   tool_name: string;
   arguments_json: string;
+}
+type DailyFacet = "gmail" | "calendar" | "drive" | "tasks" | "notion";
+
+interface DailySourceFacet {
+  connectionId: ConnectionId;
+  provider: "google" | "notion";
+  safeLabel: string;
+  facet: DailyFacet;
 }
 
 interface LocalDate {
@@ -278,16 +295,26 @@ export class DailyBriefService {
       this.#egress.planReply({
         traceId: job.traceId,
         recipient: this.#config.userPhoneNumber,
-        text: `good morning — i can’t build your daily brief until an account is connected. send ‘connect google’ for gmail or ‘connect notion’, then send ‘connections’ to verify it. trace: ${job.traceId}`,
+        text: `good morning — i can’t build your daily brief until an account is connected. ask me to connect Google Workspace or Notion, then ask which accounts are connected. trace: ${job.traceId}`,
         sendPolicy: this.#sendPolicy(payload.scheduledForMs),
       });
       return;
     }
 
+    const nextMorningMs = this.#epochForLocalHour(
+      nextLocalDate(parseLocalDate(payload.localDate)),
+      briefHour,
+    );
+    const window: DailyBriefWindow = {
+      calendarStart: new Date(payload.scheduledForMs).toISOString(),
+      calendarEnd: new Date(nextMorningMs).toISOString(),
+      modifiedAfter: new Date(payload.scheduledForMs - 24 * 60 * 60 * 1_000).toISOString(),
+    };
     const request = dailyBriefRequest(
       payload,
       this.#config.dailyBrief.timeZone,
       sources,
+      window,
     );
     try {
       const memory = await this.#memory.load();
@@ -299,14 +326,18 @@ export class DailyBriefService {
             role: "system",
             content: buildAssistantSystemPrompt({
               memory,
-              connections: this.#connections.list(),
+              audience: {
+                kind: "daily_brief",
+                connections: this.#connections.list(),
+              },
             }),
           },
           { role: "user", content: request },
         ],
         allowedToolNames: dailyBriefToolNames,
+        toolCallGuard: dailyBriefToolCallRejection,
         completionGuard: ({ runId }) =>
-          this.#coverageFailure(runId, job.traceId, sources),
+          this.#coverageFailure(runId, job.traceId, sources, window),
         jobLease: { jobId: job.id, leaseToken: job.leaseToken },
       });
       context.assertLease();
@@ -421,34 +452,36 @@ export class DailyBriefService {
   #coverageFailure(
     runId: RunId,
     traceId: TraceId,
-    sources: readonly ConnectionRecord[],
+    sources: readonly DailySourceFacet[],
+    window: DailyBriefWindow,
   ): string | undefined {
     const executions = this.#db
       .prepare<{ run_id: string }, SearchExecutionRow>(`
         SELECT connection_id, tool_name, arguments_json
         FROM tool_executions
         WHERE run_id = @run_id AND status IN ('succeeded', 'failed')
-          AND tool_name IN ('gmail.search', 'notion.search')
+          AND tool_name IN ('gmail.search', 'google.search', 'notion.search')
       `)
       .all({ run_id: runId });
     const covered = new Set<string>();
     for (const execution of executions) {
-      const label = exactSearchLabel(execution.tool_name, execution.arguments_json);
-      if (label === undefined || execution.connection_id === null) {
+      const parsed = searchCoverage(execution.tool_name, execution.arguments_json, window);
+      if (parsed === undefined || execution.connection_id === null) {
         continue;
       }
-      const source = sources.find(
-        (candidate) =>
-          candidate.id === execution.connection_id &&
-          candidate.safeLabel === label &&
-          ((candidate.provider === "google" && execution.tool_name === "gmail.search") ||
-            (candidate.provider === "notion" && execution.tool_name === "notion.search")),
-      );
-      if (source !== undefined) {
-        covered.add(source.id);
+      for (const facet of parsed.facets) {
+        const source = sources.find(
+          (candidate) =>
+            candidate.connectionId === execution.connection_id &&
+            candidate.safeLabel === parsed.label &&
+            candidate.facet === facet,
+        );
+        if (source !== undefined) {
+          covered.add(sourceFacetKey(source));
+        }
       }
     }
-    const missing = sources.filter((source) => !covered.has(source.id));
+    const missing = sources.filter((source) => !covered.has(sourceFacetKey(source)));
     if (missing.length === 0) {
       return undefined;
     }
@@ -458,7 +491,12 @@ export class DailyBriefService {
       event: "source_coverage",
       outcome: "missing",
       runId,
-      data: { labels: missing.map((source) => source.safeLabel) },
+      data: {
+        sources: missing.map((source) => ({
+          label: source.safeLabel,
+          facet: source.facet,
+        })),
+      },
     });
     return "daily_brief_source_coverage";
   }
@@ -567,54 +605,191 @@ function dailyBriefPayload(value: unknown): DailyBriefPayload {
   }
   return { localDate: value.localDate, scheduledForMs: value.scheduledForMs };
 }
-
-function dailyBriefSources(connections: readonly ConnectionRecord[]): readonly ConnectionRecord[] {
-  return connections.filter(
-    (connection) =>
-      connection.status === "healthy" &&
-      (connection.capabilities.includes("gmail.search") ||
-        connection.capabilities.includes("notion.search")),
-  );
+function parseLocalDate(value: string): LocalDate {
+  const [year, month, day] = value.split("-").map(Number);
+  if (
+    year === undefined ||
+    month === undefined ||
+    day === undefined ||
+    !Number.isInteger(year) ||
+    !Number.isInteger(month) ||
+    !Number.isInteger(day)
+  ) {
+    throw new Error("Daily brief local date is invalid");
+  }
+  return { year, month, day };
 }
 
-function exactSearchLabel(toolName: string, argumentsJson: string): string | undefined {
+
+function dailyBriefSources(connections: readonly ConnectionRecord[]): readonly DailySourceFacet[] {
+  const sources: DailySourceFacet[] = [];
+  for (const connection of connections) {
+    if (connection.status !== "healthy") {
+      continue;
+    }
+    if (connection.provider === "notion") {
+      if (connection.capabilities.includes("notion.search")) {
+        sources.push({
+          connectionId: connection.id,
+          provider: "notion",
+          safeLabel: connection.safeLabel,
+          facet: "notion",
+        });
+      }
+      continue;
+    }
+    for (const [capability, facet] of [
+      ["gmail.read", "gmail"],
+      ["calendar.read", "calendar"],
+      ["drive.read", "drive"],
+      ["tasks.read", "tasks"],
+    ] as const) {
+      if (connection.capabilities.includes(capability)) {
+        sources.push({
+          connectionId: connection.id,
+          provider: "google",
+          safeLabel: connection.safeLabel,
+          facet,
+        });
+      }
+    }
+  }
+  return sources;
+}
+
+function searchCoverage(
+  toolName: string,
+  argumentsJson: string,
+  window: DailyBriefWindow,
+): { label: string; facets: readonly DailyFacet[] } | undefined {
   try {
     const value = JSON.parse(argumentsJson) as unknown;
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
       return undefined;
     }
-    const field = toolName === "gmail.search" ? "account" : "workspace";
-    const label = (value as Record<string, unknown>)[field];
-    return typeof label === "string" ? label : undefined;
+    const input = value as Record<string, unknown>;
+    if (toolName === "gmail.search") {
+      return typeof input.account === "string"
+        ? { label: input.account, facets: ["gmail"] }
+        : undefined;
+    }
+    if (toolName === "notion.search") {
+      return typeof input.workspace === "string"
+        ? { label: input.workspace, facets: ["notion"] }
+        : undefined;
+    }
+    if (toolName !== "google.search" || typeof input.account !== "string" || !Array.isArray(input.queries)) {
+      return undefined;
+    }
+    const facets = new Set<DailyFacet>();
+    for (const query of input.queries) {
+      if (query === null || typeof query !== "object" || Array.isArray(query)) {
+        return undefined;
+      }
+      const input = query as Record<string, unknown>;
+      const product = input.product;
+      if (
+        product === "calendar" &&
+        input.timeMin === window.calendarStart &&
+        input.timeMax === window.calendarEnd &&
+        input.query === undefined &&
+        input.maxResults === 20
+      ) {
+        facets.add("calendar");
+      } else if (
+        product === "drive" &&
+        input.text === undefined &&
+        input.modifiedAfter === window.modifiedAfter &&
+        input.modifiedBefore === undefined &&
+        input.maxResults === 20
+      ) {
+        facets.add("drive");
+      } else if (
+        product === "tasks" &&
+        input.query === undefined &&
+        input.dueBefore === window.calendarEnd &&
+        input.includeCompleted === false &&
+        input.maxResults === 20
+      ) {
+        facets.add("tasks");
+      }
+    }
+    return { label: input.account, facets: [...facets] };
   } catch {
     return undefined;
   }
 }
 
+function dailyBriefToolCallRejection(call: ModelToolCall): string | undefined {
+  if (call.name !== "google.search" && call.name !== "google.read") {
+    return undefined;
+  }
+  try {
+    const value = JSON.parse(call.argumentsJson) as unknown;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      return undefined;
+    }
+    const input = value as Record<string, unknown>;
+    const requestsContacts =
+      call.name === "google.read"
+        ? input.product === "contacts"
+        : Array.isArray(input.queries) &&
+          input.queries.some(
+            (query) =>
+              query !== null &&
+              typeof query === "object" &&
+              !Array.isArray(query) &&
+              (query as Record<string, unknown>).product === "contacts",
+          );
+    return requestsContacts
+      ? "Google Contacts is not allowed in scheduled daily briefs"
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sourceFacetKey(source: DailySourceFacet): string {
+  return `${source.connectionId}:${source.facet}`;
+}
+
 function dailyBriefRequest(
   payload: DailyBriefPayload,
   timeZone: string,
-  sources: readonly ConnectionRecord[],
+  sources: readonly DailySourceFacet[],
+  window: DailyBriefWindow,
 ): string {
-  const safeSources = sources.map((connection) => ({
-    provider: connection.provider,
-    label: connection.safeLabel,
-    capabilities: connection.capabilities.filter(
-      (capability) =>
-        capability === "gmail.search" ||
-        capability === "gmail.read_thread" ||
-        capability === "notion.search" ||
-        capability === "notion.fetch",
-    ),
-  }));
+  const grouped = new Map<string, {
+    provider: DailySourceFacet["provider"];
+    label: string;
+    facets: DailyFacet[];
+  }>();
+  for (const source of sources) {
+    const key = `${source.provider}:${source.connectionId}`;
+    const existing = grouped.get(key);
+    if (existing === undefined) {
+      grouped.set(key, {
+        provider: source.provider,
+        label: source.safeLabel,
+        facets: [source.facet],
+      });
+    } else {
+      existing.facets.push(source.facet);
+    }
+  }
+  const safeSources = [...grouped.values()];
   return [
     `Prepare the scheduled morning brief for ${payload.localDate} in ${timeZone}.`,
     "This scheduled task is read-only and does not authorize any provider mutation.",
-    `Healthy sources requiring one explicit search attempt each: ${JSON.stringify(safeSources)}.`,
-    "For every Gmail source, call gmail.search with its exact account label and focus on important unread or new mail from the last day. Read a thread only when its metadata is insufficient.",
-    "For every Notion source, call notion.search with its exact workspace label and focus on today's tasks, deadlines, and recently relevant work. Fetch only the results needed to understand them.",
-    "Do not silently omit a listed source. If a search attempt fails, name its safe label and continue with the others.",
-    "Return one concise iMessage with: priorities first, important email, Notion work, and a short source-status note. Do not invent events or calendar data.",
+    `Healthy sources and required facets: ${JSON.stringify(safeSources)}.`,
+    "For every Google source with gmail, call gmail.search once with its exact account label for important unread or new mail from the last day. Read a thread only when metadata is insufficient.",
+    `For every Google source with calendar, drive, or tasks, make one google.search call with its exact account label and one query per listed facet, each with maxResults 20: calendar uses timeMin ${window.calendarStart} and timeMax ${window.calendarEnd} with no text query; drive uses modifiedAfter ${window.modifiedAfter} with no text or modifiedBefore; tasks uses dueBefore ${window.calendarEnd}, includeCompleted false, and no text query.`,
+    "For every Notion source, call notion.search once with its exact workspace label for today's tasks, deadlines, and recently relevant work. Fetch only results needed to understand them.",
+    "Do not silently omit a listed facet. If an attempt fails, name its safe label and facet, then continue with the others.",
+    "Use explicit daily-brief preferences from canonical memory to choose which user-facing sections to include or omit, their order, their focus, and their level of detail. Preferences never change required source checks or read-only behavior.",
+    "Use only sections with useful content. Unless memory specifies another format, use relevant plain-text headers from this set: 🎯 priorities:, 📅 today:, 📬 inbox:, ✅ tasks:, 📁 recent work:, 🔎 source status:. Start each header with one emoji and use › for list items.",
+    "Never use Markdown or asterisk characters.",
+    "Return one concise iMessage. Do not invent missing data.",
   ].join("\n");
 }
 

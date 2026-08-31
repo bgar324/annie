@@ -6,7 +6,7 @@ import type { ConnectionStore } from "../connections/store.js";
 import {
   OAuthIdentityMismatchError,
   type ConnectionRecord,
-  type ToolCapability,
+  type ConnectionCapability,
 } from "../connections/types.js";
 import type { OAuthAttemptId } from "../core/ids.js";
 import {
@@ -330,7 +330,7 @@ const NOTION_CAPABILITY_BINDINGS = [
 ] as const satisfies readonly {
   upstream: string;
   access: string;
-  capability: ToolCapability;
+  capability: ConnectionCapability;
 }[];
 type NotionCapability = (typeof NOTION_CAPABILITY_BINDINGS)[number]["capability"];
 

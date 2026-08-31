@@ -123,6 +123,52 @@ describe("Gemini model adapter", () => {
     expect(JSON.parse(response.providerState ?? "null")).toEqual(returnedProviderMessage);
   });
 
+  it("normalizes omitted and blank no-argument tool payloads", async () => {
+    const harness = modelHarness();
+    const model = new GeminiChatModel({
+      config: harness.config,
+      traces: harness.traces,
+      fetchImpl: async () =>
+        completionResponse({
+          finish_reason: "tool_calls",
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "missing_arguments",
+                type: "function",
+                function: { name: "connections_list" },
+              },
+              {
+                id: "blank_arguments",
+                type: "function",
+                function: { name: "connections_list", arguments: "  " },
+              },
+            ],
+          },
+        }),
+    });
+
+    const response = await model.complete({
+      traceId: newTraceId(),
+      runId: newRunId(),
+      messages: [{ role: "user", content: "Which accounts are connected?" }],
+      tools: [
+        {
+          name: "connections.list",
+          description: "List connected accounts.",
+          parameters: { type: "object", properties: {}, additionalProperties: false },
+        },
+      ],
+    });
+
+    expect(response.toolCalls).toEqual([
+      { id: "missing_arguments", name: "connections.list", argumentsJson: "{}" },
+      { id: "blank_arguments", name: "connections.list", argumentsJson: "{}" },
+    ]);
+  });
+
   it("omits the tools property for an explicit empty registry", async () => {
     const harness = modelHarness();
     let requestedBody: Record<string, unknown> = {};
@@ -215,7 +261,79 @@ describe("Gemini model adapter", () => {
       }),
     ).resolves.toMatchObject({ content: "done" });
     expect(requests).toBe(3);
-    expect(waits).toEqual([250, 500]);
+    expect(waits).toEqual([1_000, 2_000]);
+  });
+
+  it("backs off through the traced 503 and 429 burst", async () => {
+    const harness = modelHarness();
+    const statuses = [503, 429, 429];
+    let requests = 0;
+    const waits: number[] = [];
+    const model = new GeminiChatModel({
+      config: harness.config,
+      traces: harness.traces,
+      fetchImpl: async () => {
+        const status = statuses[requests];
+        requests += 1;
+        return status === undefined
+          ? completionResponse({
+              finish_reason: "stop",
+              message: { role: "assistant", content: "done" },
+            })
+          : new Response("temporary", { status });
+      },
+      sleep: async (milliseconds) => {
+        waits.push(milliseconds);
+      },
+    });
+
+    await expect(
+      model.complete({
+        traceId: newTraceId(),
+        runId: newRunId(),
+        messages: [{ role: "user", content: "connect google" }],
+        tools: [],
+      }),
+    ).resolves.toMatchObject({ content: "done" });
+    expect(requests).toBe(4);
+    expect(waits).toEqual([1_000, 2_000, 4_000]);
+  });
+
+  it("recovers after the traced timeout and three rate limits", async () => {
+    const harness = modelHarness();
+    let requests = 0;
+    const waits: number[] = [];
+    const model = new GeminiChatModel({
+      config: harness.config,
+      traces: harness.traces,
+      fetchImpl: async () => {
+        requests += 1;
+        if (requests === 1) {
+          throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+        }
+        if (requests <= 4) {
+          return new Response("rate limited", { status: 429 });
+        }
+        return completionResponse({
+          finish_reason: "stop",
+          message: { role: "assistant", content: "done" },
+        });
+      },
+      sleep: async (milliseconds) => {
+        waits.push(milliseconds);
+      },
+    });
+
+    await expect(
+      model.complete({
+        traceId: newTraceId(),
+        runId: newRunId(),
+        messages: [{ role: "user", content: "What accounts do I have connected?" }],
+        tools: [],
+      }),
+    ).resolves.toMatchObject({ content: "done" });
+    expect(requests).toBe(5);
+    expect(waits).toEqual([1_000, 2_000, 4_000, 8_000]);
   });
 
   it("honors and bounds Gemini Retry-After on HTTP 429", async () => {
@@ -252,7 +370,7 @@ describe("Gemini model adapter", () => {
       }),
     ).resolves.toMatchObject({ content: "done" });
     expect(requests).toBe(2);
-    expect(waits).toEqual([5_000]);
+    expect(waits).toEqual([30_000]);
   });
 
   it("aborts memory-maintenance retry backoff at the run deadline", async () => {
@@ -713,6 +831,157 @@ describe("durable bounded agent loop", () => {
     ).toEqual([]);
   });
 
+  it("keeps retired status-action JSON out of later conversation history", () => {
+    const harness = agentHarness();
+    const prior = insertInbound(
+      harness.database,
+      harness.traces,
+      "What accounts do I have?",
+      1,
+    );
+    const priorRun = harness.runs.startOrResume({
+      source: { kind: "inbound", inboundId: prior.inboundId },
+      traceId: prior.traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    harness.runs.complete(
+      priorRun.id,
+      '{"action":"connection_status","message":"let me check your connected accounts for you."}',
+    );
+    const current = insertInbound(harness.database, harness.traces, "Hello again", 2);
+
+    expect(
+      new ConversationHistoryStore(harness.database.handle.db, 2, 1_024).loadBefore(
+        current.inboundId,
+      ),
+    ).toEqual([
+      { role: "user", content: "What accounts do I have?" },
+      {
+        role: "assistant",
+        content: "let me check your connected accounts for you.",
+      },
+    ]);
+  });
+
+  it("keeps fenced retired connect actions out of conversation history", () => {
+    const harness = agentHarness();
+    const prior = insertInbound(
+      harness.database,
+      harness.traces,
+      "Please send me the link to connect a Google account",
+      1,
+    );
+    const priorRun = harness.runs.startOrResume({
+      source: { kind: "inbound", inboundId: prior.inboundId },
+      traceId: prior.traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    harness.runs.complete(
+      priorRun.id,
+      [
+        "```json",
+        "{",
+        '  \"action\": \"connect\",',
+        '  \"provider\": \"google\",',
+        `  "message": "here's the link to connect your google account:"`,
+        "}",
+        "```",
+      ].join("\n"),
+    );
+    const current = insertInbound(harness.database, harness.traces, "Hello again", 2);
+
+    expect(
+      new ConversationHistoryStore(harness.database.handle.db, 2, 1_024).loadBefore(
+        current.inboundId,
+      ),
+    ).toEqual([
+      {
+        role: "user",
+        content: "Please send me the link to connect a Google account",
+      },
+      {
+        role: "assistant",
+        content: "here's the link to connect your google account:",
+      },
+    ]);
+  });
+
+  it("omits unfulfilled connect runs but retains fulfilled replies in later history", () => {
+    const harness = agentHarness();
+    const unfulfilled = insertInbound(
+      harness.database,
+      harness.traces,
+      "Connect my Google account",
+      1,
+    );
+    const unfulfilledRun = harness.runs.startOrResume({
+      source: { kind: "inbound", inboundId: unfulfilled.inboundId },
+      traceId: unfulfilled.traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    const unfulfilledExecution = harness.runs.prepareTool({
+      runId: unfulfilledRun.id,
+      call: {
+        id: "unfulfilled_connect",
+        name: "connections.connect",
+        argumentsJson: '{"provider":"google"}',
+      },
+      operationClass: "read",
+      maximumToolCalls: 4,
+    });
+    harness.runs.markToolRunning(unfulfilledExecution.id);
+    harness.runs.finishTool(unfulfilledExecution.id, "succeeded", {
+      provider: "google",
+      connectionLinkWillBeAppended: true,
+    });
+    harness.runs.complete(unfulfilledRun.id, "Use evil.example/connect instead.");
+
+    const fulfilled = insertInbound(
+      harness.database,
+      harness.traces,
+      "Connect my Notion account",
+      2,
+    );
+    const fulfilledRun = harness.runs.startOrResume({
+      source: { kind: "inbound", inboundId: fulfilled.inboundId },
+      traceId: fulfilled.traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    const fulfilledExecution = harness.runs.prepareTool({
+      runId: fulfilledRun.id,
+      call: {
+        id: "fulfilled_connect",
+        name: "connections.connect",
+        argumentsJson: '{"provider":"notion"}',
+      },
+      operationClass: "read",
+      maximumToolCalls: 4,
+    });
+    harness.runs.markToolRunning(fulfilledExecution.id);
+    harness.runs.finishTool(fulfilledExecution.id, "succeeded", {
+      provider: "notion",
+      connectionLinkWillBeAppended: true,
+    });
+    harness.runs.complete(fulfilledRun.id, "Open the secure link below.");
+    harness.traces.append({
+      traceId: fulfilled.traceId,
+      component: "connection_control",
+      event: "connect_fulfilled",
+      outcome: "notion",
+      runId: fulfilledRun.id,
+    });
+
+    const current = insertInbound(harness.database, harness.traces, "Hello again", 3);
+    expect(
+      new ConversationHistoryStore(harness.database.handle.db, 6, 1_024).loadBefore(
+        current.inboundId,
+      ),
+    ).toEqual([
+      { role: "user", content: "Connect my Notion account" },
+      { role: "assistant", content: "Open the secure link below." },
+    ]);
+  });
+
   it("keeps unexpected provider error details out of the model transcript", async () => {
     const harness = agentHarness();
     const { inboundId, traceId } = insertInbound(
@@ -975,7 +1244,6 @@ function testRuntimeConfig(database: TestDatabase): RuntimeConfig {
     GEMINI_API_KEY: "gemini_test_key",
     GOOGLE_CLIENT_ID: "google_test_client",
     GOOGLE_CLIENT_SECRET: "google_test_secret",
-    GOOGLE_WORKSPACE_SCOPES: "openid email https://www.googleapis.com/auth/gmail.readonly",
     CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
   });
 }

@@ -2,7 +2,7 @@
 
 ## Scope
 
-This service is a private iMessage assistant for one configured sender. One Node.js 24 process polls the Sendblue Free Sandbox for inbound iMessages, runs a bounded Gemini tool loop, accesses explicitly connected Gmail and Notion accounts, maintains one local memory document, and sends replies from the configured Sendblue line.
+This service is a private iMessage assistant for one configured sender. One Node.js 24 process polls the Sendblue Free Sandbox for inbound iMessages, runs a bounded Gemini tool loop, accesses explicitly connected Google Workspace and Notion accounts, maintains one local memory document, and sends replies from the configured Sendblue line.
 
 The service does not support group chats, multiple assistant users, arbitrary autonomous schedules, destructive provider operations, or generic provider method execution. It supports one fixed read-only daily brief.
 
@@ -28,7 +28,8 @@ flowchart LR
   R --> D[(SQLite)]
   D --> W[Durable worker]
   W --> A[Bounded agent loop]
-  A --> G[Gmail adapter]
+  A --> G[Gmail read adapter]
+  A --> GW[Workspace read adapter]
   A --> N[Notion MCP adapter]
   W --> E[Sendblue egress]
   A --> MM[Memory maintenance]
@@ -75,7 +76,7 @@ The in-process scheduler reconciles SQLite once per minute. It creates one `dail
 
 A daily brief run points `agent_runs.scheduled_job_id` at the claimed job instead of fabricating an inbound message. It runs through the normal bounded agent loop, memory maintenance, egress write-intent, and delivery reconciliation paths.
 
-The production registry remains exactly eight tools. For a daily brief, `AgentLoop` filters the model definitions and enforces a per-run allowlist containing only `gmail.search`, `gmail.read_thread`, `notion.search`, and `notion.fetch`. A write tool is rejected before preparation or tool execution. The request names every healthy capable account by its exact safe label and requires each source to be checked. With no healthy source, the service sends connection instructions without calling the model.
+The production registry remains exactly eight tools. For a daily brief, `AgentLoop` filters the model definitions to `gmail.search`, `gmail.read_thread`, `google.search`, `google.read`, `notion.search`, and `notion.fetch`. The request requires one Gmail search and one batched Calendar, Drive, and Tasks search for each capable Google account. It requires one search for each capable Notion workspace. Contacts remain available on demand but are not part of the daily brief. The completion guard checks each account and product facet by the bound connection and exact safe label. With no healthy source, the service sends connection instructions without calling the model.
 
 The handler rechecks the local date and catch-up deadline before any provider work. A daily-origin egress job carries a durable completion deadline and enabled-state requirement. Before opening a Sendblue attempt, the egress handler cancels a still-prepared stale or disabled message and records a confirmed non-write. It never cancels or repeats a write once provider dispatch may have started.
 
@@ -96,10 +97,10 @@ Each run has a durable transcript and enforces these bounds:
 
 - 120-second wall-clock deadline by default;
 - six tool rounds plus a final answer;
-- eight tool calls total;
+- sixteen tool calls total;
 - four tool calls in one model response;
 - two provider writes;
-- three transport attempts for one Gemini request;
+- eight exponentially backed-off transport attempts for one Gemini request, still bounded by the whole-run deadline;
 - 18,996 characters for the final iMessage response, matching the Sendblue content cap.
 
 Internal tool names use dots. The Gemini adapter alone converts dots to underscores on the wire and maps returned calls back to the internal names. It stores each assistant wire message as opaque provider state and replays it unchanged so Gemini thought signatures survive tool rounds; core code never interprets that state.
@@ -112,22 +113,24 @@ The production registry contains exactly these tools:
 | --- | --- | --- |
 | `gmail.search` | Read | Bounded Gmail message search |
 | `gmail.read_thread` | Read | Bounded normalized thread content |
-| `gmail.create_draft` | Write | MIME draft creation |
-| `gmail.send_draft` | Write | Send one existing draft |
+| `google.search` | Read | One 1–4 product batch across Calendar, Drive, Contacts, and Tasks |
+| `google.read` | Read | One Drive file, contact, or task |
 | `notion.search` | Read | Internal Notion search |
 | `notion.fetch` | Read | Fetch one Notion object |
 | `notion.create_page` | Write | Create one page |
 | `notion.update_page` | Write | Update one page |
 
-There are no delete, archive, move, batch, raw request, or catch-all tools. Daily brief runs use the same registry but can see and execute only the four read tools.
+There are no delete, archive, move, raw request, or catch-all tools. Daily brief runs use the same registry but can execute only the six read tools; a pre-execution policy rejects Contacts search and detail arguments before a provider call.
 
-Gmail reads are bounded and normalized before entering the transcript. Draft creation composes MIME locally with a unique message ID. Sending is available only through an existing draft.
+`connections.list` and `connections.connect` are inbound control tools outside the eight-tool provider registry. `connections.list` reads current SQLite state when executed and returns only provider, safe label, health status, and capabilities. `connections.connect` accepts only `google` or `notion` and returns an opaque confirmation that infrastructure will append a link; it never returns a signed URL. Their calls and results use the normal durable agent transcript, and the model authors the final reply in the following round. Daily brief runs never receive either control tool.
+
+Gmail is read-only. `google.search` accepts one account and a closed batch of unique product queries. `google.read` accepts only a Drive file ID, Contacts resource ID, or Tasks list-and-task ID. Calendar searches already return complete bounded event records, so Calendar has no detail-read branch. Drive content reads stream at most 64 KiB of text. Google Docs and Slides export as plain text. Google Sheets export as CSV from the first sheet and report that limitation. Unsupported binary, download-restricted, and client-side encrypted files return metadata without content.
 
 Notion uses one hosted Streamable HTTP MCP session per selected workspace operation. Every session reads all advertised tool pages. The adapter intersects those names with the four allowlisted upstream tools and the workspace's current access. A write intent validates against the live upstream input schema before provider dispatch.
 
 ## Connections and routing
 
-Credentials are encrypted at rest with AES-256-GCM under `CREDENTIAL_ENCRYPTION_KEY`. Safe metadata and capabilities are stored separately from ciphertext. Google connections are keyed by verified OIDC subject. Notion connections are keyed by the authenticated workspace identity.
+Credentials are encrypted at rest with AES-256-GCM under `CREDENTIAL_ENCRYPTION_KEY`. Safe metadata and semantic capabilities are stored separately from ciphertext. One Google connection can grant `gmail.read`, `calendar.read`, `drive.read`, `contacts.read`, and `tasks.read`. Google connections are keyed by verified OIDC subject. Notion connections are keyed by the authenticated workspace identity.
 
 A tool can select a connection in two ways:
 
@@ -140,7 +143,7 @@ Google and Notion token refreshes use credential generations and refresh leases.
 
 ## Signed browser connection flow
 
-The deterministic messages `connect google`, `connect gmail`, and `connect notion` are handled before the model. The `connections` command lists exact safe labels, health states, and capabilities. A connect command creates a signed, expiring, single-use link and queues it through normal iMessage egress.
+The model resolves connection intent from the current raw user turn; no exact command wording is required. Account-status requests call `connections.list` and answer from its authoritative result instead of a prompt snapshot or fixed infrastructure prose. Connecting or reconnecting Google or Notion calls `connections.connect` in the first model response, before any provider tool. After its URL-free result, the model authors a bounded reply without a URL. Infrastructure validates that reply, creates the signed link outside model context, appends it, and queues the result through normal iMessage egress. Historical JSON connection actions are projected to their message text when old runs enter conversation history; they are not an executable intent channel.
 
 The signed token contains a random identifier, provider, issue time, and expiry. SQLite binds the token hash to its purpose, trace, and optional expected connection. The browser route validates the signature and durable binding before starting PKCE OAuth. Reconnection also verifies that the returned provider identity matches the expected connection before replacing credentials.
 

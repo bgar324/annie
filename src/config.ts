@@ -8,6 +8,16 @@ const positiveInteger = (fallback: number, maximum: number) =>
   z.coerce.number().int().positive().max(maximum).default(fallback);
 const e164Number = z.string().trim().regex(/^\+[1-9]\d{7,14}$/u);
 const dailyBriefTimeZone = "America/Los_Angeles" as const;
+export const GOOGLE_WORKSPACE_READ_SCOPES = [
+  "openid",
+  "email",
+  "https://www.googleapis.com/auth/gmail.readonly",
+  "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+  "https://www.googleapis.com/auth/calendar.events.readonly",
+  "https://www.googleapis.com/auth/drive.readonly",
+  "https://www.googleapis.com/auth/contacts.readonly",
+  "https://www.googleapis.com/auth/tasks.readonly",
+] as const;
 const booleanFlag = z
   .enum(["true", "false"])
   .default("false")
@@ -45,14 +55,14 @@ const runtimeEnvSchema = storageEnvSchema.extend({
 
   GOOGLE_CLIENT_ID: nonEmpty,
   GOOGLE_CLIENT_SECRET: nonEmpty,
-  GOOGLE_WORKSPACE_SCOPES: nonEmpty,
+
 
   CREDENTIAL_ENCRYPTION_KEY: nonEmpty,
   NOTION_MCP_URL: z.url().default("https://mcp.notion.com/mcp"),
   DAILY_BRIEF_ENABLED: booleanFlag,
   MAX_AGENT_TOOL_ROUNDS: positiveInteger(6, 12),
   MAX_AGENT_RUN_MS: positiveInteger(120_000, 600_000),
-  MAX_AGENT_TOOL_CALLS: positiveInteger(8, 32),
+  MAX_AGENT_TOOL_CALLS: positiveInteger(16, 32),
   MAX_AGENT_WRITES: positiveInteger(2, 8),
   MEMORY_MAX_BYTES: positiveInteger(16_384, 16_384),
   RECENT_MESSAGE_LIMIT: positiveInteger(20, 100),
@@ -174,16 +184,10 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
   const storage = loadStorageConfig(env);
   const publicBaseUrl = normalizeOrigin(parsed.PUBLIC_BASE_URL, parsed.NODE_ENV);
   const credentialEncryptionKey = decodeMasterKey(parsed.CREDENTIAL_ENCRYPTION_KEY);
-  const scopes = parseScopes(parsed.GOOGLE_WORKSPACE_SCOPES);
   validateProviderUrl(parsed.SENDBLUE_BASE_URL, "SENDBLUE_BASE_URL", parsed.NODE_ENV);
   validateProviderUrl(parsed.GEMINI_BASE_URL, "GEMINI_BASE_URL", parsed.NODE_ENV);
   validateProviderUrl(parsed.NOTION_MCP_URL, "NOTION_MCP_URL", parsed.NODE_ENV);
 
-  for (const requiredScope of ["openid", "email"] as const) {
-    if (!scopes.includes(requiredScope)) {
-      throw new Error(`GOOGLE_WORKSPACE_SCOPES must include ${requiredScope}`);
-    }
-  }
 
   return {
     ...storage,
@@ -207,7 +211,7 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
     google: {
       clientId: parsed.GOOGLE_CLIENT_ID,
       clientSecret: parsed.GOOGLE_CLIENT_SECRET,
-      scopes,
+      scopes: GOOGLE_WORKSPACE_READ_SCOPES,
       callbackUrl: `${publicBaseUrl}/oauth/google/callback`,
     },
     credentialEncryptionKey,
@@ -243,13 +247,6 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
   };
 }
 
-function parseScopes(value: string): readonly string[] {
-  const scopes = value
-    .split(/[\s,]+/u)
-    .map((scope) => scope.trim())
-    .filter((scope) => scope.length > 0);
-  return [...new Set(scopes)].sort();
-}
 
 function decodeMasterKey(value: string): Buffer {
   if (!/^[A-Za-z0-9+/]+={0,2}$/u.test(value)) {

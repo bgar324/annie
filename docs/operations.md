@@ -13,16 +13,19 @@ Prepare the Sendblue Free Sandbox before the first deploy:
 Then deploy:
 
 1. Create a Railway service from this repository. Railway detects and builds the root `Dockerfile`.
-2. In the service deployment settings, keep one replica, set the health-check path to `/health` with a 30-second timeout, and use the `ON_FAILURE` restart policy with five retries. The image already starts `node dist/main.js`.
+2. In the service deployment settings, keep one replica. Set the health-check path to `/health` with a 30-second timeout. Use the `ON_FAILURE` restart policy with five retries. The image starts `node dist/main.js`.
 3. Add a persistent volume mounted at `/app/data`.
-4. Do not set `RAILWAY_VOLUME_MOUNT_PATH`, `DATA_DIR`, or `RAILWAY_RUN_UID`. Railway automatically provides the mount path, and the image starts as root only long enough to prepare the volume before dropping to `node`.
-5. Assign a public HTTPS domain and set `PUBLIC_BASE_URL` to its origin, without a trailing path.
+4. Do not set `RAILWAY_VOLUME_MOUNT_PATH`, `DATA_DIR`, or `RAILWAY_RUN_UID`. Railway provides the mount path. The image starts as root only to prepare the volume, then it drops to `node`.
+5. Assign a public HTTPS domain. Set `PUBLIC_BASE_URL` to its origin without a trailing path.
 6. Register `https://<domain>/oauth/google/callback` as an authorized Google OAuth redirect URI.
-7. Confirm that Notion can reach these endpoints:
-   - `https://<domain>/.well-known/notion-mcp-client.json`
-   - `https://<domain>/oauth/notion/callback`
-8. To send the daily brief, set `DAILY_BRIEF_ENABLED=true`. The schedule is fixed at 08:00 America/Los_Angeles.
-9. Deploy. Railway considers the service healthy only after `GET /health` returns HTTP 200.
+7. Enable the Gmail API, Google Calendar API, Google Drive API, People API, and Google Tasks API in the OAuth client's Google Cloud project.
+8. Add the fixed scopes listed in [Connect Google Workspace and Notion accounts](#connect-google-workspace-and-notion-accounts) to the OAuth consent screen. Do not set `GOOGLE_WORKSPACE_SCOPES`. The service does not read that variable.
+9. Complete the Google verification and security-assessment steps that apply to the OAuth client. `gmail.readonly` and `drive.readonly` are restricted, and this service transmits Gmail and Drive content to Gemini. A production publishing status alone does not approve restricted scopes.
+10. Confirm that Notion can reach these endpoints:
+    - `https://<domain>/.well-known/notion-mcp-client.json`
+    - `https://<domain>/oauth/notion/callback`
+11. To send the daily brief, set `DAILY_BRIEF_ENABLED=true`. The schedule is fixed at 08:00 America/Los_Angeles.
+12. Deploy. Railway considers the service healthy only after `GET /health` returns HTTP 200.
 
 The HTTP process serves health checks and browser OAuth flows. Messaging needs no public URL, webhook route, external cron, or inbound network path. The receiver polls Sendblue, and the daily brief scheduler writes future work to the same durable queue.
 
@@ -30,19 +33,33 @@ Startup does not contact Sendblue, Google Workspace, Notion, or Gemini. An unhea
 
 The process handles `SIGTERM` by failing health checks, closing the HTTP listener, and stopping the receiver, the scheduler, and the worker after in-flight work returns. It then projects remaining trace events and closes SQLite.
 
-## Connect Gmail and Notion accounts
+## Connect Google Workspace and Notion accounts
 
-One configured Google OAuth application and client ID can connect every Google account; the service stores and routes each account as a separate connection. If the OAuth app has an **External** user type and a **Testing** publishing status, open **Google Auth platform** > **Audience**. Add every account under **Test users** before starting OAuth. See [Configure the OAuth consent screen and choose scopes](https://developers.google.com/workspace/guides/configure-oauth-consent).
+One Google OAuth client can connect every Google account. The service stores and routes each account as a separate connection. Configure these exact scopes:
+
+- `openid`
+- `email`
+- `https://www.googleapis.com/auth/gmail.readonly`
+- `https://www.googleapis.com/auth/calendar.calendarlist.readonly`
+- `https://www.googleapis.com/auth/calendar.events.readonly`
+- `https://www.googleapis.com/auth/drive.readonly`
+- `https://www.googleapis.com/auth/contacts.readonly`
+- `https://www.googleapis.com/auth/tasks.readonly`
+
+If the OAuth app has an **External** user type and a **Testing** publishing status, open **Google Auth platform** > **Audience**. Add every account under **Test users** before starting OAuth. See [Configure the OAuth consent screen and choose scopes](https://developers.google.com/workspace/guides/configure-oauth-consent).
 
 Connect accounts from iMessage:
 
-1. Send `connect google` or `connect gmail` once for each Google account. Choose a different Google account in each browser flow.
-2. Send `connect notion` once for each Notion workspace. Notion does not need a static API key or integration token.
-3. Send `connections` to list the safe labels, health states, and granted capabilities.
+1. Remove any earlier Ben grant from the Google Account connections page if it included Gmail write access.
+2. Ask Ben in ordinary language to connect Google once for each Google account. Choose a different account in each browser flow and grant every requested permission.
+3. Ask Ben to connect Notion once for each Notion workspace. Notion does not need a static API key or integration token.
+4. Ask which accounts are connected to list their safe labels, health states, and semantic capabilities.
 
 When multiple accounts grant the same capability, include the exact safe label in the request. If you request all accounts, the agent calls each healthy account separately. It never chooses one account silently.
 
-Google refresh tokens expire after seven days when the app has an **External** user type, a **Testing** publishing status, and Gmail scopes. Reconnect each Google account every seven days until the app moves to production. See [Refresh token expiration](https://developers.google.com/identity/protocols/oauth2#expiration).
+Migration 6 marks every existing Google connection `reconnect_required`, removes its old capabilities, and queues one signed reconnect link. The callback rejects a grant that includes a write scope or omits any scope in the fixed bundle.
+
+Google refresh tokens expire after seven days when an External app remains in Testing with non-identity scopes. Reconnect each Google account every seven days until the app moves to production. See [Refresh token expiration](https://developers.google.com/identity/protocols/oauth2#expiration).
 
 ## Run the daily brief
 
@@ -50,7 +67,7 @@ Set `DAILY_BRIEF_ENABLED=true` to schedule one brief at 08:00 America/Los_Angele
 
 The scheduler stores at most one `daily_brief` job for each local date and maintains the current or next eligible date. A restart or overlapping scheduler pass resolves to the same date-keyed job. If the service returns within two hours after 08:00 and no job exists for that date, it sends a late brief. After that window, it schedules the next day. A persisted older job is skipped before provider work.
 
-The scheduled run can use only `gmail.search`, `gmail.read_thread`, `notion.search`, and `notion.fetch`. It checks every healthy capable account by exact safe label. If no source is ready, the message gives the `connect google`, `connect notion`, and `connections` commands instead.
+The scheduled run can use only `gmail.search`, `gmail.read_thread`, `google.search`, `google.read`, `notion.search`, and `notion.fetch`. For each capable Google account, it searches Gmail and batches Calendar, Drive, and Tasks in one `google.search` call. It does not include Contacts in the daily brief. It checks each account and product by exact safe label. If no source is ready, the message asks the user to request a Google or Notion connection in ordinary language and then ask which accounts are connected.
 
 A prepared daily message carries its own durable expiry. The send boundary cancels it without contacting Sendblue if the completion window has elapsed or `DAILY_BRIEF_ENABLED` was changed to `false`. An already attempted or ambiguous send is never canceled or replayed.
 

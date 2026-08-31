@@ -2,7 +2,7 @@
 
 ## Read this first
 
-This service controls real Gmail, Notion, and iMessage accounts. Preserve these rules in every change:
+This service controls real Google Workspace, Notion, and iMessage accounts. Preserve these rules in every change:
 
 - Accept an inbound message only when it names the exact Sendblue line (`SENDBLUE_FROM_NUMBER`) and the exact trusted sender (`USER_PHONE_NUMBER`) on both of their reported fields.
 - Treat the paged inbound list sweep as the authoritative ingress path. The event stream is a latency hint only; never let a stream event become the source of a message.
@@ -16,7 +16,7 @@ This service controls real Gmail, Notion, and iMessage accounts. Preserve these 
 - Change only the affected connection's health.
 - Keep `MEMORY.md` as the only canonical long-term memory file.
 - Keep the production registry at exactly eight tools. Do not expose destructive or catch-all provider methods.
-- Run daily briefs through the same eight-tool production registry, but expose and enforce only `gmail.search`, `gmail.read_thread`, `notion.search`, and `notion.fetch` for that run.
+- Run daily briefs through the same eight-tool production registry, but expose and enforce only `gmail.search`, `gmail.read_thread`, `google.search`, `google.read`, `notion.search`, and `notion.fetch` for that run.
 - Skip daily brief work outside its same-morning window, and cancel only still-prepared daily egress when it expires or the feature is disabled.
 
 The architecture rationale and failure semantics live in `docs/architecture.md`.
@@ -48,7 +48,7 @@ Use Node 24. Railway starts `node dist/main.js` directly so the process receives
 - `src/core` and `src/providers`: shared identifiers, canonical JSON, error types, and the traced timeout-bounded fetch used by provider adapters.
 - `src/writes`: write-intent preparation, attempt records, and ambiguous-write recovery.
 - `src/agent`: provider-neutral messages, Gemini wire mapping, bounds, and the fixed tool registry.
-- `src/gmail` and `src/notion`: the only provider tool adapters.
+- `src/gmail`, `src/google`, and `src/notion`: the only provider tool adapters.
 - `src/memory`: bounded load, maintenance validation, diff, and atomic replacement.
 
 Provider wire types stay inside their adapter. Core code consumes normalized application types.
@@ -75,7 +75,7 @@ Use `gemini-3.7-flash` through Google's OpenAI-compatible `/chat/completions`. T
 
 ### Google
 
-Create one OAuth client per connection. Key accounts by verified OIDC `sub`, not email. Derive capabilities from actual granted scopes. Every explicit send goes through a draft. Disable Google request retries and trace application-owned read retries.
+Create one OAuth client per connection. Key accounts by verified OIDC `sub`, not email. Request the fixed read-only Gmail, Calendar, Drive, Contacts, and Tasks scope bundle, reject partial or broader grants, and derive semantic capabilities from the actual granted scopes. Disable Google SDK retries; trace and bound application-owned read retries. Keep provider resource types and raw payloads inside `src/gmail` and `src/google`.
 
 ### Notion
 
@@ -94,13 +94,13 @@ Required regression cases include:
 - lease expiry with stale-token fencing;
 - persisted jobs after restart;
 - daily brief 08:00 scheduling across DST, restart, stale-job recovery, and exhausted leases;
-- daily brief read-only enforcement, all-account coverage, and stale or disabled egress cancellation;
+- daily brief six-tool read-only enforcement, per-account product coverage, and stale or disabled egress cancellation;
 - one-account selection and multi-account ambiguity;
 - reconnect identity mismatch;
 - expired and completed signed links;
 - refresh generation races;
 - write ambiguity without replay;
-- Gmail and Notion read normalization;
+- Gmail, Calendar, Drive, Contacts, Tasks, and Notion read normalization;
 - explicit write-intent gates;
 - memory atomicity and diff tracing;
 - trace redaction and JSONL repair;

@@ -1,6 +1,11 @@
 import { createServer } from "node:http";
+import Fastify from "fastify";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadRuntimeConfig, type RuntimeConfig } from "../src/config.js";
+import {
+  GOOGLE_WORKSPACE_READ_SCOPES,
+  loadRuntimeConfig,
+  type RuntimeConfig,
+} from "../src/config.js";
 import {
   RefreshBusyError,
   RefreshCoordinator,
@@ -11,6 +16,7 @@ import { ConnectionRouter } from "../src/connections/router.js";
 import { ConnectionStore } from "../src/connections/store.js";
 import {
   ConnectionRoutingError,
+  GOOGLE_CONNECTION_CAPABILITIES,
   OAuthIdentityMismatchError,
 } from "../src/connections/types.js";
 import { newTraceId } from "../src/core/ids.js";
@@ -19,7 +25,12 @@ import type { DeliveryResource, MessageSender } from "../src/messages/types.js";
 import { notionCapabilities } from "../src/oauth/notion.js";
 import { OAuthAttemptStore } from "../src/oauth/attempts.js";
 import { ConnectLinkError, ConnectLinkService } from "../src/oauth/links.js";
-import { createGoogleOAuthClient, googleCapabilities } from "../src/oauth/google.js";
+import {
+  createGoogleOAuthClient,
+  googleCapabilities,
+  googleScopeBundleStatus,
+  registerGoogleOAuth,
+} from "../src/oauth/google.js";
 import type { ProviderFetch } from "../src/providers/fetch.js";
 import { QueueStore } from "../src/queue/store.js";
 import { CredentialVault } from "../src/security/vault.js";
@@ -46,7 +57,7 @@ describe("multi-account connection store", () => {
       safeLabel: "Work",
       safeMetadata: { email: "a@example.test" },
       providerState: { scopes: ["gmail.readonly"] },
-      capabilities: ["gmail.search", "gmail.read_thread"],
+      capabilities: ["gmail.read"],
       credentials: { refreshToken: "refresh-account-a" },
     });
     const second = harness.connections.saveAuthorization({
@@ -56,7 +67,7 @@ describe("multi-account connection store", () => {
       safeLabel: "Work",
       safeMetadata: { email: "b@example.test" },
       providerState: { scopes: ["gmail.readonly"] },
-      capabilities: ["gmail.search", "gmail.read_thread"],
+      capabilities: ["gmail.read"],
       credentials: { refreshToken: "refresh-account-b" },
     });
 
@@ -73,11 +84,11 @@ describe("multi-account connection store", () => {
       .all();
     expect(encrypted.every((row) => !row.ciphertext.includes(Buffer.from("refresh-account")))).toBe(true);
 
-    expect(() => harness.router.select({ capability: "gmail.search" })).toThrow(
+    expect(() => harness.router.select({ capabilities: ["gmail.read"] })).toThrow(
       ConnectionRoutingError,
     );
     expect(
-      harness.router.select({ capability: "gmail.search", account: "work (2)" }).id,
+      harness.router.select({ capabilities: ["gmail.read"], account: "work (2)" }).id,
     ).toBe(second.id);
 
     expect(
@@ -89,9 +100,9 @@ describe("multi-account connection store", () => {
         errorSummary: "Google rejected the refresh token",
       }),
     ).toBe(true);
-    expect(harness.router.select({ capability: "gmail.search" }).id).toBe(second.id);
+    expect(harness.router.select({ capabilities: ["gmail.read"] }).id).toBe(second.id);
     expect(() =>
-      harness.router.select({ capability: "gmail.search", account: "Work" }),
+      harness.router.select({ capabilities: ["gmail.read"], account: "Work" }),
     ).toThrow(/requires reconnection/);
   });
 
@@ -104,7 +115,7 @@ describe("multi-account connection store", () => {
       safeLabel: "Personal",
       safeMetadata: {},
       providerState: {},
-      capabilities: ["gmail.search"],
+      capabilities: ["gmail.read"],
       credentials: { refreshToken: "old-refresh" },
     });
     expect(() =>
@@ -115,7 +126,7 @@ describe("multi-account connection store", () => {
         safeLabel: "Personal",
         safeMetadata: {},
         providerState: {},
-        capabilities: ["gmail.search"],
+        capabilities: ["gmail.read"],
         credentials: { refreshToken: "wrong-refresh" },
         expectedConnectionId: original.id,
       }),
@@ -128,7 +139,7 @@ describe("multi-account connection store", () => {
       safeLabel: "Personal",
       safeMetadata: {},
       providerState: {},
-      capabilities: ["gmail.search"],
+      capabilities: ["gmail.read"],
       credentials: { refreshToken: "new-refresh" },
       expectedConnectionId: original.id,
     });
@@ -197,8 +208,140 @@ describe("connection links and OAuth attempts", () => {
     const token = new URL(link.url).searchParams.get("token")!;
     expect(() => harness.links.resolve(token, "google", 1_500)).toThrow(/another provider/);
     expect(() => harness.links.resolve(token, "notion", 2_000)).toThrow(/expired/);
-    const tamperedToken = `${token.slice(0, -1)}${token.endsWith("x") ? "y" : "x"}`;
+    const signatureStart = token.indexOf(".") + 1;
+    const tamperedToken = `${token.slice(0, signatureStart)}${
+      token[signatureStart] === "A" ? "B" : "A"
+    }${token.slice(signatureStart + 1)}`;
     expect(() => harness.links.resolve(tamperedToken, "notion", 1_500)).toThrow(/invalid/);
+  });
+
+  it("fails incomplete saved grants and activates the complete Workspace bundle", async () => {
+    const harness = connectionHarness();
+    const config = testRuntimeConfig(harness.database);
+    const app = Fastify({ logger: false });
+    registerGoogleOAuth({
+      app,
+      config,
+      links: harness.links,
+      attempts: harness.attempts,
+      connections: harness.connections,
+      traces: harness.traces,
+    });
+
+    const saveGrant = (input: {
+      suffix: string;
+      scopes: readonly string[];
+    }): { attemptId: ReturnType<typeof harness.attempts.createOrReuse>["id"]; state: string } => {
+      const link = harness.links.issue({
+        provider: "google",
+        purpose: "connect",
+        traceId: newTraceId(),
+      });
+      const token = new URL(link.url).searchParams.get("token");
+      if (token === null) {
+        throw new Error("Expected the connection link to contain a token");
+      }
+      const binding = harness.links.resolve(token, "google");
+      let state = "";
+      const attempt = harness.attempts.createOrReuse({
+        link: binding,
+        build: (security) => {
+          state = security.state;
+          return {
+            authorizationUrl: `https://accounts.example/authorize?state=${security.state}`,
+            context: {},
+          };
+        },
+      });
+      harness.attempts.beginExchange({ provider: "google", state });
+      harness.attempts.saveExchangeResult({
+        attemptId: attempt.id,
+        providerIdentity: `sub_${input.suffix}`,
+        context: {
+          providerAccountId: `sub_${input.suffix}`,
+          safeLabel: `Google ${input.suffix}`,
+          safeMetadata: { email: `${input.suffix}@example.test`, emailVerified: true },
+          providerState: { scopes: [...input.scopes] },
+          credentials: {
+            accessToken: `access-${input.suffix}`,
+            refreshToken: `refresh-${input.suffix}`,
+            scopes: [...input.scopes],
+          },
+        },
+      });
+      return { attemptId: attempt.id, state };
+    };
+
+    try {
+      const incomplete = saveGrant({
+        suffix: "incomplete",
+        scopes: ["openid", "email", "https://www.googleapis.com/auth/gmail.readonly"],
+      });
+      const rejected = await app.inject({
+        method: "GET",
+        url: `/oauth/google/callback?state=${encodeURIComponent(incomplete.state)}`,
+      });
+      expect(rejected.statusCode).toBe(400);
+      expect(rejected.body).toContain("Google permissions are incomplete");
+      expect(harness.attempts.getRequired(incomplete.attemptId)).toMatchObject({
+        status: "failed",
+        failureCode: "scope_bundle_incomplete",
+      });
+      expect(harness.connections.list("google")).toHaveLength(0);
+      const missingIdentity = saveGrant({
+        suffix: "missing_identity",
+        scopes: GOOGLE_WORKSPACE_READ_SCOPES.filter((scope) => scope !== "email"),
+      });
+      const missingIdentityResponse = await app.inject({
+        method: "GET",
+        url: `/oauth/google/callback?state=${encodeURIComponent(missingIdentity.state)}`,
+      });
+      expect(missingIdentityResponse.statusCode).toBe(400);
+      expect(harness.attempts.getRequired(missingIdentity.attemptId)).toMatchObject({
+        status: "failed",
+        failureCode: "scope_bundle_incomplete",
+      });
+
+      const extraScope = saveGrant({
+        suffix: "extra_scope",
+        scopes: [...GOOGLE_WORKSPACE_READ_SCOPES, "profile"],
+      });
+      const extraScopeResponse = await app.inject({
+        method: "GET",
+        url: `/oauth/google/callback?state=${encodeURIComponent(extraScope.state)}`,
+      });
+      expect(extraScopeResponse.statusCode).toBe(400);
+      expect(harness.attempts.getRequired(extraScope.attemptId)).toMatchObject({
+        status: "failed",
+        failureCode: "scope_not_read_only",
+      });
+      expect(harness.connections.list("google")).toHaveLength(0);
+
+
+      const complete = saveGrant({
+        suffix: "complete",
+        scopes: GOOGLE_WORKSPACE_READ_SCOPES,
+      });
+      const accepted = await app.inject({
+        method: "GET",
+        url: `/oauth/google/callback?state=${encodeURIComponent(complete.state)}`,
+      });
+      expect(accepted.statusCode).toBe(200);
+      expect(accepted.body).toContain("Google is connected");
+      expect(harness.attempts.getRequired(complete.attemptId).status).toBe("active");
+      const connected = harness.connections.list("google");
+      expect(connected).toHaveLength(1);
+      expect(connected[0]).toMatchObject({
+        providerAccountId: "sub_complete",
+        status: "healthy",
+      });
+      expect(connected[0]?.capabilities).toHaveLength(GOOGLE_CONNECTION_CAPABILITIES.length);
+      expect(connected[0]?.capabilities).toEqual(
+        expect.arrayContaining([...GOOGLE_CONNECTION_CAPABILITIES]),
+      );
+    } finally {
+      await app.close();
+    }
   });
 });
 
@@ -219,14 +362,50 @@ describe("provider capability truth", () => {
     expect(notionCapabilities(access, advertised)).toEqual(["notion.search", "notion.fetch"]);
   });
 
-  it("derives Gmail capabilities from actual grants rather than requested scopes", () => {
+  it("derives semantic Google capabilities from exact read-only grants", () => {
     expect(
       googleCapabilities(["openid", "https://www.googleapis.com/auth/gmail.readonly"]),
-    ).toEqual(["gmail.search", "gmail.read_thread"]);
-    expect(googleCapabilities(["https://www.googleapis.com/auth/gmail.compose"])).toEqual([
-      "gmail.create_draft",
-      "gmail.send_draft",
-    ]);
+    ).toEqual(["gmail.read"]);
+    expect(
+      googleCapabilities([
+        "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+      ]),
+    ).toEqual([]);
+    expect(
+      googleCapabilities([
+        "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+        "https://www.googleapis.com/auth/calendar.events.readonly",
+        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/contacts.readonly",
+        "https://www.googleapis.com/auth/tasks.readonly",
+      ]),
+    ).toEqual(["calendar.read", "drive.read", "contacts.read", "tasks.read"]);
+    expect(googleCapabilities(["https://www.googleapis.com/auth/gmail.modify"])).toEqual([]);
+    expect(googleScopeBundleStatus(GOOGLE_WORKSPACE_READ_SCOPES)).toBe("complete");
+    expect(
+      googleScopeBundleStatus(["https://www.googleapis.com/auth/gmail.readonly"]),
+    ).toBe("incomplete");
+    expect(
+      googleScopeBundleStatus(["https://www.googleapis.com/auth/gmail.modify"]),
+    ).toBe("unsafe");
+    const broaderCalendarGrant: string[] = [
+      ...GOOGLE_WORKSPACE_READ_SCOPES.filter(
+        (scope) =>
+          scope !== "https://www.googleapis.com/auth/calendar.calendarlist.readonly" &&
+          scope !== "https://www.googleapis.com/auth/calendar.events.readonly",
+      ),
+      "https://www.googleapis.com/auth/calendar.readonly",
+    ];
+    expect(googleScopeBundleStatus(broaderCalendarGrant)).toBe("unsafe");
+    expect(
+      googleScopeBundleStatus([...GOOGLE_WORKSPACE_READ_SCOPES, "profile"]),
+    ).toBe("unsafe");
+    expect(
+      googleScopeBundleStatus([
+        ...GOOGLE_WORKSPACE_READ_SCOPES,
+        "https://www.googleapis.com/auth/userinfo.email",
+      ]),
+    ).toBe("complete");
   });
 });
 
@@ -310,6 +489,56 @@ describe("automatic credential refresh and recovery", () => {
     ).toBe(0);
   });
 
+  it("clears a dispatched refresh lease when cancellation follows a confirmed retryable response", async () => {
+    const harness = connectionHarness();
+    const config = testRuntimeConfig(harness.database);
+    const now = Date.now();
+    const connection = harness.connections.saveAuthorization({
+      traceId: newTraceId(),
+      provider: "google",
+      providerAccountId: "sub_cancelled_refresh",
+      safeLabel: "Cancelled refresh",
+      safeMetadata: {},
+      providerState: { scopes: [...GOOGLE_WORKSPACE_READ_SCOPES] },
+      capabilities: [...GOOGLE_CONNECTION_CAPABILITIES],
+      credentials: {
+        accessToken: "expired-access",
+        refreshToken: "refresh-cancelled",
+        expiryDateMs: now - 1,
+        scopes: [...GOOGLE_WORKSPACE_READ_SCOPES],
+      },
+      expiresAtMs: now - 1,
+    });
+    const controller = new AbortController();
+    let requests = 0;
+    const refresh = new RefreshCoordinator({
+      db: harness.database.handle.db,
+      config,
+      connections: harness.connections,
+      traces: harness.traces,
+      fetchImpl: async () => {
+        requests += 1;
+        controller.abort(new Error("run deadline"));
+        return new Response(JSON.stringify({ error: "temporarily_unavailable" }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        });
+      },
+      sleep: async () => undefined,
+    });
+
+    await expect(
+      refresh.credentials(connection.id, newTraceId(), now, controller.signal),
+    ).rejects.toThrow("run deadline");
+    expect(requests).toBe(1);
+    expect(
+      harness.database.handle.db
+        .prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM refresh_leases")
+        .get()?.count,
+    ).toBe(0);
+    expect(harness.connections.getRequired(connection.id).status).toBe("healthy");
+  });
+
   it("keeps a dispatched refresh fenced past the former lease boundary", async () => {
     const harness = connectionHarness();
     const config = testRuntimeConfig(harness.database, {
@@ -323,13 +552,13 @@ describe("automatic credential refresh and recovery", () => {
       safeLabel: "Concurrent",
       safeMetadata: {},
       providerState: {
-        scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+        scopes: [...GOOGLE_WORKSPACE_READ_SCOPES],
       },
-      capabilities: ["gmail.search", "gmail.read_thread"],
+      capabilities: [...GOOGLE_CONNECTION_CAPABILITIES],
       credentials: {
         refreshToken: "refresh-concurrent",
         expiryDateMs: now - 1,
-        scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+        scopes: [...GOOGLE_WORKSPACE_READ_SCOPES],
       },
       expiresAtMs: now - 1,
     });
@@ -371,6 +600,119 @@ describe("automatic credential refresh and recovery", () => {
     await expect(firstRefresh).resolves.toMatchObject({ accessToken: "new-access" });
     expect(requests).toBe(1);
     expect(harness.connections.getRequired(connection.id).status).toBe("healthy");
+  });
+
+  it.each([
+    {
+      suffix: "missing_identity",
+      refreshedScopes: GOOGLE_WORKSPACE_READ_SCOPES.filter((scope) => scope !== "email"),
+    },
+    {
+      suffix: "extra_scope",
+      refreshedScopes: [...GOOGLE_WORKSPACE_READ_SCOPES, "profile"],
+    },
+    {
+      suffix: "write_scope",
+      refreshedScopes: ["openid", "email", "https://www.googleapis.com/auth/gmail.modify"],
+    },
+  ])("rejects a refreshed Google token with an exact-grant mismatch: $suffix", async ({
+    suffix,
+    refreshedScopes,
+  }) => {
+    const harness = connectionHarness();
+    const config = testRuntimeConfig(harness.database);
+    const now = Date.now();
+    const connection = harness.connections.saveAuthorization({
+      traceId: newTraceId(),
+      provider: "google",
+      providerAccountId: `sub_scope_change_${suffix}`,
+      safeLabel: `Scope change ${suffix}`,
+      safeMetadata: {},
+      providerState: {
+        scopes: [...GOOGLE_WORKSPACE_READ_SCOPES],
+      },
+      capabilities: [...GOOGLE_CONNECTION_CAPABILITIES],
+      credentials: {
+        accessToken: "old-access",
+        refreshToken: `refresh-scope-change-${suffix}`,
+        expiryDateMs: now - 1,
+        scopes: [...GOOGLE_WORKSPACE_READ_SCOPES],
+      },
+      expiresAtMs: now - 1,
+    });
+    const refresh = new RefreshCoordinator({
+      db: harness.database.handle.db,
+      config,
+      connections: harness.connections,
+      traces: harness.traces,
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            access_token: "unsafe-access",
+            expires_in: 3_600,
+            scope: refreshedScopes.join(" "),
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      sleep: async () => undefined,
+    });
+
+    await expect(refresh.credentials(connection.id, newTraceId(), now)).rejects.toBeInstanceOf(
+      RefreshRequiredError,
+    );
+    expect(harness.connections.getRequired(connection.id)).toMatchObject({
+      status: "reconnect_required",
+      lastErrorCode: "google_scope_bundle_changed",
+      credentialGeneration: connection.credentialGeneration,
+    });
+    expect(harness.connections.loadCredentials(connection.id)).toMatchObject({
+      accessToken: "old-access",
+    });
+  });
+
+  it("never retries a Google refresh after its response is lost", async () => {
+    const harness = connectionHarness();
+    const config = testRuntimeConfig(harness.database);
+    const now = Date.now();
+    const connection = harness.connections.saveAuthorization({
+      traceId: newTraceId(),
+      provider: "google",
+      providerAccountId: "sub_lost_refresh",
+      safeLabel: "Lost refresh",
+      safeMetadata: {},
+      providerState: {
+        scopes: [...GOOGLE_WORKSPACE_READ_SCOPES],
+      },
+      capabilities: [...GOOGLE_CONNECTION_CAPABILITIES],
+      credentials: {
+        accessToken: "expired-access",
+        refreshToken: "rotating-google-refresh",
+        expiryDateMs: now - 1,
+        scopes: [...GOOGLE_WORKSPACE_READ_SCOPES],
+      },
+      expiresAtMs: now - 1,
+    });
+    let requests = 0;
+    const refresh = new RefreshCoordinator({
+      db: harness.database.handle.db,
+      config,
+      connections: harness.connections,
+      traces: harness.traces,
+      fetchImpl: async () => {
+        requests += 1;
+        throw new Error("The accepted refresh response was lost");
+      },
+      sleep: async () => undefined,
+    });
+
+    await expect(refresh.credentials(connection.id, newTraceId(), now)).rejects.toBeInstanceOf(
+      RefreshRequiredError,
+    );
+    expect(requests).toBe(1);
+    expect(harness.connections.getRequired(connection.id)).toMatchObject({
+      status: "reconnect_required",
+      lastErrorCode: "refresh_response_lost",
+    });
   });
 
   it("does not retry an ambiguous rotating-token response and deduplicates the recovery link", async () => {
@@ -541,7 +883,6 @@ function testRuntimeConfig(
     GEMINI_API_KEY: "gemini_test_key",
     GOOGLE_CLIENT_ID: "google_test_client",
     GOOGLE_CLIENT_SECRET: "google_test_secret",
-    GOOGLE_WORKSPACE_SCOPES: "openid email https://www.googleapis.com/auth/gmail.readonly",
     CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
     ...overrides,
   });

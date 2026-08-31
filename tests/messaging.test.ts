@@ -1101,7 +1101,6 @@ function testRuntimeConfig(database: TestDatabase): RuntimeConfig {
     GEMINI_API_KEY: "gemini_test_key",
     GOOGLE_CLIENT_ID: "google_test_client",
     GOOGLE_CLIENT_SECRET: "google_test_secret",
-    GOOGLE_WORKSPACE_SCOPES: "openid email https://www.googleapis.com/auth/gmail.compose",
     CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
   });
 }

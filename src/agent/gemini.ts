@@ -14,13 +14,17 @@ import {
   type ModelResponse,
 } from "./model.js";
 
+const maximumRequestAttempts = 8;
+const retryBaseDelayMs = 1_000;
+const maximumRetryDelayMs = 30_000;
+
 const toolCallSchema = z
   .object({
     id: z.string().min(1),
     type: z.literal("function"),
     function: z.object({
       name: z.string().min(1),
-      arguments: z.string(),
+      arguments: z.string().default("{}"),
     }),
   })
   .passthrough();
@@ -145,7 +149,7 @@ export class GeminiChatModel implements ChatModel, MemoryMaintenanceModel {
     });
     const url = `${this.#config.gemini.baseUrl}/chat/completions`;
 
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
+    for (let attempt = 1; attempt <= maximumRequestAttempts; attempt += 1) {
       input.signal?.throwIfAborted();
       let response: Response;
       try {
@@ -164,13 +168,13 @@ export class GeminiChatModel implements ChatModel, MemoryMaintenanceModel {
         if (input.signal?.aborted === true) {
           throw error;
         }
-        if (attempt < 3) {
-          await waitForRetry(this.#sleep, attempt * 250, input.signal);
+        if (attempt < maximumRequestAttempts) {
+          await waitForRetry(this.#sleep, retryBackoff(attempt), input.signal);
           continue;
         }
         throw new ModelProviderError({
           kind: "transient",
-          message: "Gemini could not be reached after three attempts",
+          message: `Gemini could not be reached after ${maximumRequestAttempts} attempts`,
           cause: error,
         });
       }
@@ -186,7 +190,7 @@ export class GeminiChatModel implements ChatModel, MemoryMaintenanceModel {
       }
       if (!response.ok) {
         const retryable = [429, 500, 502, 503, 504].includes(response.status);
-        if (retryable && attempt < 3) {
+        if (retryable && attempt < maximumRequestAttempts) {
           await waitForRetry(this.#sleep, retryDelay(response.headers, attempt), input.signal);
           continue;
         }
@@ -214,7 +218,8 @@ export class GeminiChatModel implements ChatModel, MemoryMaintenanceModel {
       const toolCalls = (choice.message.tool_calls ?? []).map((call) => ({
         id: call.id,
         name: input.wireToolNames.get(call.function.name) ?? call.function.name,
-        argumentsJson: call.function.arguments,
+        argumentsJson:
+          call.function.arguments.trim() === "" ? "{}" : call.function.arguments,
       }));
       if (new Set(toolCalls.map((call) => call.id)).size !== toolCalls.length) {
         throw new ModelProviderError({
@@ -305,10 +310,14 @@ function retryDelay(headers: Headers, attempt: number): number {
   if (retryAfter !== null) {
     const seconds = Number(retryAfter);
     if (Number.isFinite(seconds) && seconds >= 0) {
-      return Math.min(5_000, seconds * 1_000);
+      return Math.min(maximumRetryDelayMs, seconds * 1_000);
     }
   }
-  return attempt * 250;
+  return retryBackoff(attempt);
+}
+
+function retryBackoff(attempt: number): number {
+  return Math.min(maximumRetryDelayMs, retryBaseDelayMs * 2 ** (attempt - 1));
 }
 
 function delay(milliseconds: number): Promise<void> {
