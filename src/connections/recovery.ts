@@ -166,11 +166,11 @@ export class ConnectionRecoveryService {
 }
 
 function validateConnectReply(message: string): string {
-  const trimmed = message.trim();
+  const trimmed = message.trim().replace(/\r\n?/gu, "\n");
   if (trimmed.length === 0 || Buffer.byteLength(trimmed) > maximumConnectReplyBytes) {
     throw new TypeError("Connection-link reply must contain 1–512 bytes");
   }
-  if (/[\u0000-\u001f\u007f]/u.test(trimmed)) {
+  if (/[\u0000-\u0009\u000b-\u001f\u007f]/u.test(trimmed)) {
     throw new TypeError("Connection-link reply cannot contain control characters");
   }
   if (

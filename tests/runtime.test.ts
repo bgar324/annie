@@ -1304,7 +1304,7 @@ describe("production runtime", () => {
       },
       {
         id: "connect_answer",
-        content: "here's the link to connect your google account:",
+        content: "here's the link to connect your google account:\n\nit expires soon and works once.",
         providerState: null,
         toolCalls: [],
         finishReason: "stop",
@@ -1335,7 +1335,7 @@ describe("production runtime", () => {
     });
     expect(model.maintenanceRequests).toHaveLength(0);
     expect(reply?.body).toMatch(
-      /^here's the link to connect your google account:\nhttps:\/\/assistant\.example\/connect\/google\?token=/u,
+      /^here's the link to connect your google account:\n\nit expires soon and works once\.\nhttps:\/\/assistant\.example\/connect\/google\?token=/u,
     );
     expect(inboundState(item.runtime)).toBe("done");
 
@@ -1382,9 +1382,10 @@ describe("production runtime", () => {
     "<evil.example/connect>",
     "192.0.2.1/connect",
     "<ftp://evil.example/path>",
+    "\tconnect now",
   ])(
-    "rejects model-authored URL-like content %s before issuing a connection link",
-    async (unsafeLink) => {
+    "rejects unsafe model-authored connection-link content %s before issuing a link",
+    async (unsafeContent) => {
     const model = new FakeModel();
     model.responses.push(
       {
@@ -1403,7 +1404,7 @@ describe("production runtime", () => {
       },
       {
         id: "unsafe_connect_answer",
-        content: `use ${unsafeLink} to connect.`,
+        content: `use ${unsafeContent} to connect.`,
         providerState: null,
         toolCalls: [],
         finishReason: "stop",
