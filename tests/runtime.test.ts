@@ -1428,6 +1428,9 @@ describe("production runtime", () => {
 
     const retryAtMs = Date.now() + 20;
     item.runtime.database.db
+      .prepare("UPDATE inbound_messages SET state = 'processing'")
+      .run();
+    item.runtime.database.db
       .prepare<{ now_ms: number }>(`
         UPDATE jobs
         SET status = 'pending', available_at_ms = @now_ms,
@@ -1461,6 +1464,54 @@ describe("production runtime", () => {
     expect(buildSafeReplay(item.runtime.database.db, runRow.trace_id).transcript).toEqual(
       replay.transcript,
     );
+
+    const rejectedRetryAtMs = retryAtMs + 20;
+    item.runtime.database.db
+      .prepare<{ run_id: string; content: string }>(`
+        UPDATE agent_messages
+        SET content = @content
+        WHERE run_id = @run_id
+          AND sequence = (
+            SELECT MAX(sequence) FROM agent_messages
+            WHERE run_id = @run_id AND role = 'user'
+          )
+      `)
+      .run({
+        run_id: runRow.id,
+        content: "Send me a new Google reconnect link",
+      });
+    item.runtime.database.db
+      .prepare("UPDATE inbound_messages SET state = 'processing'")
+      .run();
+    item.runtime.database.db
+      .prepare<{ now_ms: number }>(`
+        UPDATE jobs
+        SET status = 'pending', available_at_ms = @now_ms,
+            lease_token = NULL, lease_expires_at_ms = NULL
+        WHERE type = 'inbound'
+      `)
+      .run({ now_ms: rejectedRetryAtMs });
+    item.runtime.database.db
+      .prepare<{ future_ms: number }>(`
+        UPDATE jobs SET available_at_ms = @future_ms WHERE type = 'egress_send'
+      `)
+      .run({ future_ms: rejectedRetryAtMs + 60_000 });
+    await runNextJob(item.runtime, rejectedRetryAtMs);
+
+    expect(
+      item.runtime.traces
+        .list(runRow.trace_id)
+        .some(
+          (event) =>
+            event.component === "agent" &&
+            event.event === "turn_failed" &&
+            typeof event.data === "object" &&
+            event.data !== null &&
+            "error" in event.data &&
+            event.data.error ===
+              "Infrastructure tool transcript is not authorized by the current user message",
+        ),
+    ).toBe(true);
   });
 
   it("lets the model resolve a natural Google connection request and fulfills it once", async () => {

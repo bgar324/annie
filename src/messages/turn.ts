@@ -274,18 +274,6 @@ export class InboundTurnService {
     });
     this.#runs.bindJob(run.id, job.id, job.leaseToken);
     this.#runs.appendInitialMessages(run.id, initialMessages);
-    if (run.phase === "completed") {
-      const completedProvider = this.#connectProviderForRun(run.id);
-      if (run.finalResponse === null || completedProvider !== provider) {
-        throw new Error(`Explicit connection run ${run.id} completed with inconsistent state`);
-      }
-      this.#fulfillConnectTool(inbound, run.id, completedProvider, run.finalResponse);
-      return;
-    }
-    if (run.phase !== "running") {
-      throw new Error(`Explicit connection run ${run.id} cannot resume from ${run.phase}`);
-    }
-
     const call = {
       id: "explicit_connection_request",
       name: "connections.connect",
@@ -295,6 +283,26 @@ export class InboundTurnService {
       provider,
       connectionLinkWillBeAppended: true,
     };
+    const response = `here's your new ${provider} connection link:`;
+    if (run.phase === "completed") {
+      this.#runs.appendInfrastructureToolTurn({
+        runId: run.id,
+        authorizationMessage,
+        call,
+        result,
+        completion: response,
+      });
+      const completedProvider = this.#connectProviderForRun(run.id);
+      if (run.finalResponse !== response || completedProvider !== provider) {
+        throw new Error(`Explicit connection run ${run.id} completed with inconsistent state`);
+      }
+      this.#fulfillConnectTool(inbound, run.id, completedProvider, response);
+      return;
+    }
+    if (run.phase !== "running") {
+      throw new Error(`Explicit connection run ${run.id} cannot resume from ${run.phase}`);
+    }
+
     let execution = this.#runs.prepareTool({
       runId: run.id,
       call,
@@ -311,7 +319,6 @@ export class InboundTurnService {
       throw new Error(`Explicit connection tool cannot resume from ${execution.status}`);
     }
 
-    const response = `here's your new ${provider} connection link:`;
     this.#runs.appendInfrastructureToolTurn({
       runId: run.id,
       authorizationMessage,
