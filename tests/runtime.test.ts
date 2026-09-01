@@ -17,6 +17,7 @@ import {
   asTraceId,
   newTraceId,
   type ConnectionId,
+  type RunId,
   type TraceId,
 } from "../src/core/ids.js";
 import type { GmailApi, GmailClientProvider } from "../src/gmail/client.js";
@@ -27,6 +28,7 @@ import type {
 import type { NotionClientProvider, NotionSession } from "../src/notion/client.js";
 import type { ClaimedJob, JobType } from "../src/queue/store.js";
 import type { JobContext } from "../src/queue/worker.js";
+import { buildSafeReplay } from "../src/replay.js";
 import { createRuntime, type AssistantModel, type AssistantRuntime } from "../src/runtime.js";
 import {
   MessagingProviderError,
@@ -1327,6 +1329,71 @@ describe("production runtime", () => {
         .get()?.count,
     ).toBe(1);
     expect(inboundState(item.runtime)).toBe("done");
+    const runRow = item.runtime.database.db
+      .prepare<[], { id: RunId; trace_id: TraceId }>("SELECT id, trace_id FROM agent_runs")
+      .get();
+    if (runRow === undefined) {
+      throw new Error("Expected a durable explicit connection run");
+    }
+    const runs = new AgentRunStore(item.runtime.database.db, item.runtime.traces);
+    const transcript = runs.loadMessages(runRow.id);
+    expect(transcript.slice(-3)).toEqual([
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [
+          {
+            id: "explicit_connection_request",
+            name: "connections.connect",
+            argumentsJson: '{"provider":"notion"}',
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: '{"connectionLinkWillBeAppended":true,"provider":"notion"}',
+        toolCallId: "explicit_connection_request",
+      },
+      {
+        role: "assistant",
+        content: "here's your new notion connection link:",
+      },
+    ]);
+    const replay = buildSafeReplay(item.runtime.database.db, runRow.trace_id);
+    expect(replay.transcript.slice(-3)).toMatchObject([
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [
+          {
+            id: "explicit_connection_request",
+            name: "connections.connect",
+            argumentsJson: '{"provider":"notion"}',
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: '{"connectionLinkWillBeAppended":true,"provider":"notion"}',
+        toolCallId: "explicit_connection_request",
+      },
+      {
+        role: "assistant",
+        content: "here's your new notion connection link:",
+      },
+    ]);
+    expect(replay.mockedTools).toEqual([
+      expect.objectContaining({
+        toolCallId: "explicit_connection_request",
+        toolName: "connections.connect",
+        operationClass: "read",
+        status: "succeeded",
+        result: {
+          provider: "notion",
+          connectionLinkWillBeAppended: true,
+        },
+      }),
+    ]);
 
     const retryAtMs = Date.now() + 20;
     item.runtime.database.db
@@ -1359,6 +1426,10 @@ describe("production runtime", () => {
         .get(),
     ).toEqual({ tools: 1, links: 1, recovery_messages: 1 });
     expect(model.requests).toHaveLength(0);
+    expect(runs.loadMessages(runRow.id)).toEqual(transcript);
+    expect(buildSafeReplay(item.runtime.database.db, runRow.trace_id).transcript).toEqual(
+      replay.transcript,
+    );
   });
 
   it("lets the model resolve a natural Google connection request and fulfills it once", async () => {

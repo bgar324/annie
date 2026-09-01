@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import type { AgentLoop } from "../agent/loop.js";
+import type { ModelMessage } from "../agent/model.js";
 import type { ConversationHistoryStore } from "../agent/history.js";
 import type { AgentRunRecord, AgentRunStore } from "../agent/store.js";
 import { buildAssistantSystemPrompt } from "../agent/prompt.js";
@@ -124,21 +125,27 @@ export class InboundTurnService {
         });
         return;
       }
-      const explicitConnectProvider = explicitConnectRequestProvider(userMessage);
-      if (explicitConnectProvider !== undefined) {
-        this.#fulfillExplicitConnectRequest(inbound, job, explicitConnectProvider);
-        return;
-      }
       const memory = await this.#memory.load();
       const history = this.#history.loadBefore(inbound.id);
+      const initialMessages: readonly ModelMessage[] = [
+        { role: "system", content: this.#systemPrompt(memory) },
+        ...history,
+        { role: "user", content: userMessage },
+      ];
+      const explicitConnectProvider = explicitConnectRequestProvider(userMessage);
+      if (explicitConnectProvider !== undefined) {
+        this.#fulfillExplicitConnectRequest(
+          inbound,
+          job,
+          explicitConnectProvider,
+          initialMessages,
+        );
+        return;
+      }
       const result = await this.#agent.execute({
         source: { kind: "inbound", inboundId: inbound.id },
         traceId: inbound.trace_id,
-        initialMessages: [
-          { role: "system", content: this.#systemPrompt(memory) },
-          ...history,
-          { role: "user", content: userMessage },
-        ],
+        initialMessages,
         toolCallGuard: (call) =>
           this.#connectionToolCallRejection(inbound.id, call.name, call.id),
         jobLease: { jobId: job.id, leaseToken: job.leaseToken },
@@ -256,6 +263,7 @@ export class InboundTurnService {
     inbound: InboundTurnRow,
     job: ClaimedJob,
     provider: ConnectionProvider,
+    initialMessages: readonly ModelMessage[],
   ): void {
     const run = this.#runs.startOrResume({
       source: { kind: "inbound", inboundId: inbound.id },
@@ -263,6 +271,7 @@ export class InboundTurnService {
       deadlineAtMs: Date.now() + this.#config.limits.maxAgentRunMs,
     });
     this.#runs.bindJob(run.id, job.id, job.leaseToken);
+    this.#runs.appendInitialMessages(run.id, initialMessages);
     if (run.phase === "completed") {
       const completedProvider = this.#connectProviderForRun(run.id);
       if (run.finalResponse === null || completedProvider !== provider) {
@@ -275,13 +284,18 @@ export class InboundTurnService {
       throw new Error(`Explicit connection run ${run.id} cannot resume from ${run.phase}`);
     }
 
+    const call = {
+      id: "explicit_connection_request",
+      name: "connections.connect",
+      argumentsJson: JSON.stringify({ provider }),
+    };
+    const result = {
+      provider,
+      connectionLinkWillBeAppended: true,
+    };
     let execution = this.#runs.prepareTool({
       runId: run.id,
-      call: {
-        id: "explicit_connection_request",
-        name: "connections.connect",
-        argumentsJson: JSON.stringify({ provider }),
-      },
+      call,
       operationClass: "read",
       maximumToolCalls: this.#config.limits.maxAgentToolCalls,
     });
@@ -289,16 +303,19 @@ export class InboundTurnService {
       this.#runs.markToolRunning(execution.id);
     }
     if (execution.status === "validated" || execution.status === "running") {
-      execution = this.#runs.finishTool(execution.id, "succeeded", {
-        provider,
-        connectionLinkWillBeAppended: true,
-      });
+      execution = this.#runs.finishTool(execution.id, "succeeded", result);
     }
     if (execution.status !== "succeeded") {
       throw new Error(`Explicit connection tool cannot resume from ${execution.status}`);
     }
 
     const response = `here's your new ${provider} connection link:`;
+    this.#runs.appendInfrastructureToolTurn({
+      runId: run.id,
+      call,
+      result,
+      completion: response,
+    });
     this.#runs.complete(run.id, response);
     this.#fulfillConnectTool(inbound, run.id, provider, response);
   }

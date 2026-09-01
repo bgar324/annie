@@ -280,6 +280,83 @@ export class AgentRunStore {
     transaction.immediate();
   }
 
+  appendInfrastructureToolTurn(input: {
+    runId: RunId;
+    call: ModelToolCall;
+    result: unknown;
+    completion: string;
+  }): void {
+    const transaction = this.#db.transaction(() => {
+      const messages = this.loadMessages(input.runId);
+      const callIndex = messages.findIndex(
+        (message) =>
+          message.role === "assistant" &&
+          message.toolCalls?.some((call) => call.id === input.call.id),
+      );
+      const resultIndex = messages.findIndex(
+        (message) => message.role === "tool" && message.toolCallId === input.call.id,
+      );
+      const serializedResult = canonicalJson(input.result);
+      if (callIndex !== -1 || resultIndex !== -1) {
+        if (callIndex === -1 || resultIndex <= callIndex) {
+          throw new Error("Infrastructure tool transcript is incomplete");
+        }
+        const storedCall = messages[callIndex];
+        const matchingCall =
+          storedCall?.role === "assistant"
+            ? storedCall.toolCalls?.find((call) => call.id === input.call.id)
+            : undefined;
+        const storedResult = messages[resultIndex];
+        const completion = messages
+          .slice(resultIndex + 1)
+          .find(
+            (message) =>
+              message.role === "assistant" && (message.toolCalls?.length ?? 0) === 0,
+          );
+        if (
+          matchingCall === undefined ||
+          canonicalJson(matchingCall) !== canonicalJson(input.call) ||
+          storedResult?.role !== "tool" ||
+          storedResult.content !== serializedResult ||
+          completion?.content !== input.completion
+        ) {
+          throw new Error("Infrastructure tool transcript does not match the durable action");
+        }
+        return;
+      }
+
+      this.#appendMessageInTransaction(
+        input.runId,
+        { role: "assistant", content: "", toolCalls: [input.call] },
+        {},
+      );
+      this.#appendMessageInTransaction(
+        input.runId,
+        {
+          role: "tool",
+          content: serializedResult,
+          toolCallId: input.call.id,
+        },
+        {},
+      );
+      this.#appendMessageInTransaction(
+        input.runId,
+        { role: "assistant", content: input.completion },
+        {},
+      );
+      const run = this.getRequired(input.runId);
+      this.#traces.appendInTransaction({
+        traceId: run.traceId,
+        component: "agent",
+        event: "infrastructure_turn_saved",
+        outcome: input.call.name,
+        runId: input.runId,
+        data: { toolCallId: input.call.id },
+      });
+    });
+    transaction.immediate();
+  }
+
   loadMessages(runId: RunId): readonly ModelMessage[] {
     return this.#db
       .prepare<{ run_id: string }, MessageRow>(`
