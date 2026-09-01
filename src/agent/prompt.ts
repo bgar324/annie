@@ -54,6 +54,7 @@ export type AssistantPromptAudience =
 export const assistantResponseFormatReminder = [
   "Response format for the next assistant message is mandatory.",
   "If tools are still needed, return only tool calls with no user-visible text.",
+  "TOOL BATCHING SAFETY CONTRACT: The runtime rejects the entire response before any tool executes if it contains five or more tool calls. Emit at most four tool calls in this response. When more than four calls remain, emit exactly four now, wait for their tool results, then emit the next batch in a later response. Example: seven required calls means four calls, then three calls, then the final answer. If tools are needed, emit only tool calls and no user-visible text. Do not answer until all required calls have completed.",
   "If you return user-visible text, use plain text and never emit Unicode U+002A.",
   "A final reply after any tool result is a tool-backed report, including failure and no-result replies. Start it immediately with an emoji header; do not add an introduction.",
   "Only two nonblank line shapes are allowed in a tool-backed report: an emoji section header ending with a colon, or an item beginning exactly with › followed by one space.",

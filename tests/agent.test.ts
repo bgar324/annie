@@ -798,6 +798,86 @@ describe("durable bounded agent loop", () => {
     expect(executions).toBe(1);
   });
 
+  it("executes six brief reads split across bounded tool rounds", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(
+      harness.database,
+      harness.traces,
+      "Dry-run the daily brief",
+    );
+    const requests: ModelRequest[] = [];
+    let executions = 0;
+    const registry = new ToolRegistry([
+      {
+        ...echoTool,
+        async execute() {
+          executions += 1;
+          return { ok: true };
+        },
+      },
+    ]);
+    const calls = Array.from({ length: 6 }, (_, index) => ({
+      id: `call_${index}`,
+      name: "test.echo",
+      argumentsJson: `{"value":"${index}"}`,
+    }));
+    const model = scriptedModel(
+      [
+        {
+          id: "first_brief_batch",
+          content: "",
+          providerState: "Run the first four reads",
+          toolCalls: calls.slice(0, 4),
+          finishReason: "tool_calls",
+          usage: emptyUsage,
+        },
+        {
+          id: "second_brief_batch",
+          content: "",
+          providerState: "Run the remaining two reads",
+          toolCalls: calls.slice(4),
+          finishReason: "tool_calls",
+          usage: emptyUsage,
+        },
+        {
+          id: "brief_done",
+          content: "All six reads are complete.",
+          providerState: "Summarize six reads",
+          toolCalls: [],
+          finishReason: "stop",
+          usage: emptyUsage,
+        },
+      ],
+      requests,
+    );
+
+    const result = await createAgentLoop(
+      harness.runs,
+      harness.writes,
+      model,
+      registry,
+    ).execute({
+      source: { kind: "inbound", inboundId },
+      traceId,
+      initialMessages: [{ role: "user", content: "Dry-run the daily brief" }],
+    });
+
+    expect(result).toMatchObject({
+      outcome: "completed",
+      response: "All six reads are complete.",
+      run: { toolCalls: 6 },
+    });
+    expect(executions).toBe(6);
+    expect(requests).toHaveLength(3);
+    expect(
+      requests.every((request) =>
+        request.messages
+          .at(-1)
+          ?.content.includes("The runtime rejects the entire response before any tool executes"),
+      ),
+    ).toBe(true);
+  });
+
   it("executes none of five tool calls returned in one model response", async () => {
     const harness = agentHarness();
     const { inboundId, traceId } = insertInbound(
