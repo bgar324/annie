@@ -315,6 +315,7 @@ describe("Notion MCP boundary", () => {
         {
           name: "notion-search",
           inputSchema: {
+            $schema: "https://json-schema.org/draft/2020-12/schema",
             type: "object",
             properties: {
               query: { type: "string" },

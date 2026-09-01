@@ -487,25 +487,24 @@ describe("durable bounded agent loop", () => {
       {
         role: "system",
         content: expect.stringContaining(
-          "Every section header in a tool-backed report must begin with an emoji",
+          "A final reply after any tool result is a tool-backed report",
         ),
       },
       {
         role: "system",
         content: expect.stringContaining(
-          "Every section header in a tool-backed report must begin with an emoji",
+          "A final reply after any tool result is a tool-backed report",
         ),
       },
     ]);
     expect(assistantResponseFormatReminder).toContain(
-      "Wrong patterns: wrapping any header in Unicode U+002A; starting an item with a hyphen followed by ›; placing an introduction before the first emoji header.",
+      "Only two nonblank line shapes are allowed in a tool-backed report",
     );
     expect(assistantResponseFormatReminder).toContain(
-      "Incorrect example — never copy:\n**worth a peek:**\n- › item",
+      "Use this structure:\n📬 inbox:\n\n🚨 needs attention:\n› first item\n\n👀 worth a peek:\n› second item\n\n🗑️ ignore:\n› third item",
     );
-    expect(assistantResponseFormatReminder).toContain(
-      "Correct example:\n📬 inbox:\n\n🚨 needs attention:\n› first item\n\n👀 worth a peek:\n› second item\n\n🗑️ ignore:\n› third item",
-    );
+    expect(assistantResponseFormatReminder).not.toContain("- ›");
+    expect(assistantResponseFormatReminder).not.toContain("**");
     expect(requests[1]?.messages).toEqual([
       { role: "system", content: "Be concise." },
       { role: "user", content: "Do both" },

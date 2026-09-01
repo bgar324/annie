@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { Ajv } from "ajv";
+import { Ajv2020 } from "ajv/dist/2020.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type {
@@ -90,7 +90,7 @@ export class NotionMcpSession implements NotionSession {
     if (descriptor === undefined) {
       throw new NotionMcpError("tool_unavailable", `The workspace does not advertise ${name}`);
     }
-    const validate = new Ajv({ strict: false, allErrors: true, validateFormats: false }).compile(
+    const validate = new Ajv2020({ strict: false, allErrors: true, validateFormats: false }).compile(
       descriptor.inputSchema,
     );
     if (!validate(argumentsValue)) {
