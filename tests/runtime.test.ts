@@ -1297,9 +1297,10 @@ describe("production runtime", () => {
     const model = new FakeModel();
     const gateway = new FakeGateway();
     const item = await newRuntime(model, gateway);
+    const userMessage = "Send me a new Notion reconnect link";
     gateway.inbox.push(
       inboundMessage("msg_explicit_notion_connect", {
-        text: "Send me a new Notion reconnect link",
+        text: userMessage,
       }),
     );
 
@@ -1337,7 +1338,11 @@ describe("production runtime", () => {
     }
     const runs = new AgentRunStore(item.runtime.database.db, item.runtime.traces);
     const transcript = runs.loadMessages(runRow.id);
-    expect(transcript.slice(-3)).toEqual([
+    expect(transcript.slice(-4)).toEqual([
+      {
+        role: "user",
+        content: userMessage,
+      },
       {
         role: "assistant",
         content: "",
@@ -1360,7 +1365,11 @@ describe("production runtime", () => {
       },
     ]);
     const replay = buildSafeReplay(item.runtime.database.db, runRow.trace_id);
-    expect(replay.transcript.slice(-3)).toMatchObject([
+    expect(replay.transcript.slice(-4)).toMatchObject([
+      {
+        role: "user",
+        content: userMessage,
+      },
       {
         role: "assistant",
         content: "",
@@ -1394,6 +1403,28 @@ describe("production runtime", () => {
         },
       }),
     ]);
+    const infrastructureTurn = {
+      runId: runRow.id,
+      authorizationMessage: userMessage,
+      call: {
+        id: "explicit_connection_request",
+        name: "connections.connect",
+        argumentsJson: '{"provider":"notion"}',
+      },
+      result: {
+        provider: "notion",
+        connectionLinkWillBeAppended: true,
+      },
+      completion: "here's your new notion connection link:",
+    };
+    runs.appendInfrastructureToolTurn(infrastructureTurn);
+    expect(runs.loadMessages(runRow.id)).toEqual(transcript);
+    expect(() =>
+      runs.appendInfrastructureToolTurn({
+        ...infrastructureTurn,
+        authorizationMessage: "Send me a new Google reconnect link",
+      }),
+    ).toThrow("not authorized by the current user message");
 
     const retryAtMs = Date.now() + 20;
     item.runtime.database.db

@@ -138,6 +138,7 @@ export class InboundTurnService {
           inbound,
           job,
           explicitConnectProvider,
+          userMessage,
           initialMessages,
         );
         return;
@@ -263,6 +264,7 @@ export class InboundTurnService {
     inbound: InboundTurnRow,
     job: ClaimedJob,
     provider: ConnectionProvider,
+    authorizationMessage: string,
     initialMessages: readonly ModelMessage[],
   ): void {
     const run = this.#runs.startOrResume({
@@ -312,6 +314,7 @@ export class InboundTurnService {
     const response = `here's your new ${provider} connection link:`;
     this.#runs.appendInfrastructureToolTurn({
       runId: run.id,
+      authorizationMessage,
       call,
       result,
       completion: response,

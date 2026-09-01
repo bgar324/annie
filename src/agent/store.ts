@@ -282,6 +282,7 @@ export class AgentRunStore {
 
   appendInfrastructureToolTurn(input: {
     runId: RunId;
+    authorizationMessage: string;
     call: ModelToolCall;
     result: unknown;
     completion: string;
@@ -297,6 +298,16 @@ export class AgentRunStore {
         (message) => message.role === "tool" && message.toolCallId === input.call.id,
       );
       const serializedResult = canonicalJson(input.result);
+      const authorizationIndex = messages.findLastIndex((message) => message.role === "user");
+      if (
+        authorizationIndex === -1 ||
+        messages[authorizationIndex]?.content !== input.authorizationMessage ||
+        (callIndex !== -1 && authorizationIndex >= callIndex)
+      ) {
+        throw new Error(
+          "Infrastructure tool transcript is not authorized by the current user message",
+        );
+      }
       if (callIndex !== -1 || resultIndex !== -1) {
         if (callIndex === -1 || resultIndex <= callIndex) {
           throw new Error("Infrastructure tool transcript is incomplete");
