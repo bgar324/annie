@@ -3,7 +3,7 @@ import { defineRailway, github, preserve, project, service, volume } from "railw
 export default defineRailway(() => {
   const benVolume = volume("ben-volume", { alerts: { usage: { "100": {}, "80": {}, "95": {} } }, allowOnlineResize: true, region: "ams", sizeMB: 500 });
   const ben = service("ben", {
-    source: github("bgar324/ben", { checkSuites: false }),
+    source: github("bgar324/annie", { checkSuites: false }),
     replicas: { "ams": 1 },
     healthcheck: "/health",
     healthcheckTimeout: 30,
