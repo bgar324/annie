@@ -1291,6 +1291,76 @@ describe("production runtime", () => {
     expect(gateway.statusReads).toHaveLength(0);
   });
 
+  it("issues an explicitly requested named connection link without model routing", async () => {
+    const model = new FakeModel();
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway);
+    gateway.inbox.push(
+      inboundMessage("msg_explicit_notion_connect", {
+        text: "Send me a new Notion reconnect link",
+      }),
+    );
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    const reply = item.runtime.database.db
+      .prepare<[], { body: string; purpose: string }>(
+        "SELECT body, purpose FROM egress_messages ORDER BY created_at_ms, id",
+      )
+      .get();
+    const tool = item.runtime.database.db
+      .prepare<[], { tool_name: string; status: string }>(
+        "SELECT tool_name, status FROM tool_executions",
+      )
+      .get();
+    expect(model.requests).toHaveLength(0);
+    expect(model.maintenanceRequests).toHaveLength(0);
+    expect(reply).toMatchObject({ purpose: "recovery" });
+    expect(reply?.body).toMatch(
+      /^here's your new notion connection link:\nhttps:\/\/assistant\.example\/connect\/notion\?token=/u,
+    );
+    expect(tool).toEqual({ tool_name: "connections.connect", status: "succeeded" });
+    expect(
+      item.runtime.database.db
+        .prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM oauth_link_tokens")
+        .get()?.count,
+    ).toBe(1);
+    expect(inboundState(item.runtime)).toBe("done");
+
+    const retryAtMs = Date.now() + 20;
+    item.runtime.database.db
+      .prepare<{ now_ms: number }>(`
+        UPDATE jobs
+        SET status = 'pending', available_at_ms = @now_ms,
+            lease_token = NULL, lease_expires_at_ms = NULL
+        WHERE type = 'inbound'
+      `)
+      .run({ now_ms: retryAtMs });
+    item.runtime.database.db
+      .prepare<{ future_ms: number }>(`
+        UPDATE jobs SET available_at_ms = @future_ms WHERE type = 'egress_send'
+      `)
+      .run({ future_ms: retryAtMs + 60_000 });
+    await runNextJob(item.runtime, retryAtMs);
+
+    expect(
+      item.runtime.database.db
+        .prepare<
+          [],
+          { tools: number; links: number; recovery_messages: number }
+        >(`
+          SELECT
+            (SELECT COUNT(*) FROM tool_executions
+             WHERE tool_name = 'connections.connect' AND status = 'succeeded') AS tools,
+            (SELECT COUNT(*) FROM oauth_link_tokens WHERE purpose = 'connect') AS links,
+            (SELECT COUNT(*) FROM egress_messages WHERE purpose = 'recovery') AS recovery_messages
+        `)
+        .get(),
+    ).toEqual({ tools: 1, links: 1, recovery_messages: 1 });
+    expect(model.requests).toHaveLength(0);
+  });
+
   it("lets the model resolve a natural Google connection request and fulfills it once", async () => {
     const model = new FakeModel();
     model.responses.push(

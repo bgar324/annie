@@ -5,7 +5,10 @@ import type { AgentRunRecord, AgentRunStore } from "../agent/store.js";
 import { buildAssistantSystemPrompt } from "../agent/prompt.js";
 import type { RuntimeConfig } from "../config.js";
 import type { ConnectionRecoveryService } from "../connections/recovery.js";
-import { parseConnectToolArguments } from "../connections/tools.js";
+import {
+  explicitConnectRequestProvider,
+  parseConnectToolArguments,
+} from "../connections/tools.js";
 import type { ConnectionProvider } from "../connections/types.js";
 import { asInboundId, type InboundId, type RunId, type TraceId } from "../core/ids.js";
 import type { MemoryDocumentStore } from "../memory/document.js";
@@ -119,6 +122,11 @@ export class InboundTurnService {
           failureCode: "missing_text",
           replyToGuid: inbound.guid,
         });
+        return;
+      }
+      const explicitConnectProvider = explicitConnectRequestProvider(userMessage);
+      if (explicitConnectProvider !== undefined) {
+        this.#fulfillExplicitConnectRequest(inbound, job, explicitConnectProvider);
         return;
       }
       const memory = await this.#memory.load();
@@ -242,6 +250,57 @@ export class InboundTurnService {
       });
     });
     transaction.immediate();
+  }
+
+  #fulfillExplicitConnectRequest(
+    inbound: InboundTurnRow,
+    job: ClaimedJob,
+    provider: ConnectionProvider,
+  ): void {
+    const run = this.#runs.startOrResume({
+      source: { kind: "inbound", inboundId: inbound.id },
+      traceId: inbound.trace_id,
+      deadlineAtMs: Date.now() + this.#config.limits.maxAgentRunMs,
+    });
+    this.#runs.bindJob(run.id, job.id, job.leaseToken);
+    if (run.phase === "completed") {
+      const completedProvider = this.#connectProviderForRun(run.id);
+      if (run.finalResponse === null || completedProvider !== provider) {
+        throw new Error(`Explicit connection run ${run.id} completed with inconsistent state`);
+      }
+      this.#fulfillConnectTool(inbound, run.id, completedProvider, run.finalResponse);
+      return;
+    }
+    if (run.phase !== "running") {
+      throw new Error(`Explicit connection run ${run.id} cannot resume from ${run.phase}`);
+    }
+
+    let execution = this.#runs.prepareTool({
+      runId: run.id,
+      call: {
+        id: "explicit_connection_request",
+        name: "connections.connect",
+        argumentsJson: JSON.stringify({ provider }),
+      },
+      operationClass: "read",
+      maximumToolCalls: this.#config.limits.maxAgentToolCalls,
+    });
+    if (execution.status === "validated") {
+      this.#runs.markToolRunning(execution.id);
+    }
+    if (execution.status === "validated" || execution.status === "running") {
+      execution = this.#runs.finishTool(execution.id, "succeeded", {
+        provider,
+        connectionLinkWillBeAppended: true,
+      });
+    }
+    if (execution.status !== "succeeded") {
+      throw new Error(`Explicit connection tool cannot resume from ${execution.status}`);
+    }
+
+    const response = `here's your new ${provider} connection link:`;
+    this.#runs.complete(run.id, response);
+    this.#fulfillConnectTool(inbound, run.id, provider, response);
   }
 
   #connectionToolCallRejection(
