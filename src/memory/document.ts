@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { open, mkdir, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
@@ -10,9 +10,30 @@ const forbiddenMemoryPatterns = [
   /https?:\/\/\S+\/connect\/(?:google|notion)\?\S*\btoken=/iu,
 ] as const;
 
+declare const preparedMemory: unique symbol;
+
 export interface MemoryReplacement {
-  content: string;
+  readonly content: string;
+  readonly revision: string;
+  readonly bytes: number;
+  readonly [preparedMemory]: true;
 }
+
+export interface MemorySnapshot {
+  readonly content: string;
+  readonly revision: string;
+  readonly bytes: number;
+  readonly maximumBytes: number;
+}
+
+export type MemoryReplaceResult =
+  | {
+      readonly kind: "replaced";
+      readonly previous: MemorySnapshot;
+      readonly snapshot: MemorySnapshot;
+    }
+  | { readonly kind: "unchanged"; readonly snapshot: MemorySnapshot }
+  | { readonly kind: "conflict"; readonly snapshot: MemorySnapshot };
 
 export class MemoryValidationError extends Error {
   readonly code: "invalid_structure" | "too_large" | "forbidden_secret";
@@ -28,6 +49,7 @@ export class MemoryDocumentStore {
   readonly #path: string;
   readonly #maximumBytes: number;
   readonly #forbiddenValues: readonly string[];
+  #mutationTail: Promise<void> = Promise.resolve();
 
   constructor(input: {
     path: string;
@@ -74,27 +96,71 @@ export class MemoryDocumentStore {
   }
 
   async load(): Promise<string> {
+    return (await this.loadSnapshot()).content;
+  }
+
+  async loadSnapshot(): Promise<MemorySnapshot> {
     const content = normalizeMemory(await readFile(this.#path, "utf8"));
-    this.#validate(content);
-    if (Buffer.byteLength(content) > this.#maximumBytes) {
-      throw new MemoryValidationError("too_large", "The memory document exceeds its configured cap");
-    }
-    return content;
+    this.#validateSize(content, "The memory document exceeds its configured cap");
+    return this.#snapshot(content);
   }
 
   prepareReplacement(proposed: string): MemoryReplacement {
-    const normalized = normalizeMemory(proposed);
-    this.#validate(normalized);
-    if (Buffer.byteLength(normalized) > this.#maximumBytes) {
-      throw new MemoryValidationError("too_large", "The proposed memory exceeds its configured cap");
-    }
-    return { content: normalized };
+    const content = normalizeMemory(proposed);
+    this.#validateSize(content, "The proposed memory exceeds its configured cap");
+    return {
+      content,
+      revision: memoryRevision(content),
+      bytes: Buffer.byteLength(content),
+    } as MemoryReplacement;
   }
 
-  async replace(proposed: string): Promise<MemoryReplacement> {
-    const replacement = this.prepareReplacement(proposed);
-    await this.#atomicWrite(replacement.content);
-    return replacement;
+  async replaceIfRevision(
+    expectedRevision: string,
+    replacement: MemoryReplacement,
+    signal?: AbortSignal,
+  ): Promise<MemoryReplaceResult> {
+    if (!/^[a-f0-9]{64}$/u.test(expectedRevision)) {
+      throw new Error("Expected memory revision must be a SHA-256 digest");
+    }
+    return this.#serializeMutation(
+      async () => {
+        const current = await this.loadSnapshot();
+        signal?.throwIfAborted();
+        if (replacement.revision === current.revision) {
+          return { kind: "unchanged", snapshot: current };
+        }
+        if (expectedRevision !== current.revision) {
+          return { kind: "conflict", snapshot: current };
+        }
+        signal?.throwIfAborted();
+        await this.#atomicWrite(replacement.content);
+        return {
+          kind: "replaced",
+          previous: current,
+          snapshot: this.#snapshot(replacement.content),
+        };
+      },
+      signal,
+    );
+  }
+
+  async #serializeMutation<T>(
+    operation: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const previous = this.#mutationTail;
+    let release = (): void => undefined;
+    this.#mutationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      signal?.throwIfAborted();
+      return await operation();
+    } finally {
+      release();
+    }
   }
 
   async #atomicWrite(content: string): Promise<void> {
@@ -133,6 +199,22 @@ export class MemoryDocumentStore {
     await Promise.all(paths.map((path) => rm(path, { force: true })));
   }
 
+  #snapshot(content: string): MemorySnapshot {
+    return {
+      content,
+      revision: memoryRevision(content),
+      bytes: Buffer.byteLength(content),
+      maximumBytes: this.#maximumBytes,
+    };
+  }
+
+  #validateSize(content: string, message: string): void {
+    this.#validate(content);
+    if (Buffer.byteLength(content) > this.#maximumBytes) {
+      throw new MemoryValidationError("too_large", message);
+    }
+  }
+
   #validate(content: string): void {
     const lines = content.split("\n");
     if (lines[0] !== "# Memory" || lines.slice(1).some((line) => line.startsWith("# "))) {
@@ -157,6 +239,10 @@ export class MemoryDocumentStore {
 
 function normalizeMemory(value: string): string {
   return `${value.replaceAll("\r\n", "\n").replaceAll("\r", "\n").trimEnd()}\n`;
+}
+
+function memoryRevision(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
 }
 
 

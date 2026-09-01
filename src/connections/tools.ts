@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import type { RegisteredTool } from "../agent/tools.js";
 import type { ConnectionStore } from "./store.js";
+import { toSafeConnectionView } from "./types.js";
 
 const connectArgumentsSchema = z
   .object({ provider: z.enum(["google", "notion"]) })
@@ -29,12 +30,7 @@ export function connectionTools(connections: ConnectionStore): readonly Register
       },
       operationClass: "read",
       execute: async () => ({
-        connections: connections.list().map((connection) => ({
-          provider: connection.provider,
-          label: connection.safeLabel,
-          status: connection.status,
-          capabilities: connection.capabilities,
-        })),
+        connections: connections.list().map(toSafeConnectionView),
       }),
     },
     {

@@ -63,6 +63,12 @@ export interface RuntimeOverrides {
   logger?: false;
 }
 
+export interface LocalUiServices {
+  readonly connections: ConnectionStore;
+  readonly links: ConnectLinkService;
+  readonly memory: MemoryDocumentStore;
+}
+
 export interface AssistantRuntime {
   app: FastifyInstance;
   database: DatabaseHandle;
@@ -74,6 +80,8 @@ export interface AssistantRuntime {
   traces: TraceStore;
   projector: TraceProjector;
   tools: ToolRegistry;
+  localUi: LocalUiServices;
+  isReady(): boolean;
   setReady(value: boolean): void;
   close(): Promise<void>;
 }
@@ -330,6 +338,10 @@ export async function createRuntime(
       traces,
       projector,
       tools,
+      localUi: { connections, links, memory },
+      isReady() {
+        return ready;
+      },
       setReady(value) {
         ready = value;
       },

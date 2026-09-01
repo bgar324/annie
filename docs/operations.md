@@ -25,13 +25,24 @@ Then deploy:
     - `https://<domain>/.well-known/notion-mcp-client.json`
     - `https://<domain>/oauth/notion/callback`
 11. To send the daily brief, set `DAILY_BRIEF_ENABLED=true`. The schedule is fixed at 08:00 America/Los_Angeles.
-12. Deploy. Railway considers the service healthy only after `GET /health` returns HTTP 200.
+12. Set `LOCAL_UI_ENABLED=true` and `LOCAL_UI_PORT=3001`. The listener binds container loopback and is not published by Railway.
+13. Deploy. Railway considers the service healthy only after `GET /health` returns HTTP 200.
 
 The HTTP process serves health checks and browser OAuth flows. Messaging needs no public URL, webhook route, external cron, or inbound network path. The receiver polls Sendblue, and the daily brief scheduler writes future work to the same durable queue.
 
 Startup does not contact Sendblue, Google Workspace, Notion, or Gemini. An unhealthy provider connection cannot prevent the process from becoming ready. Startup validates configuration, migrates SQLite, repairs interrupted memory and write state, projects pending traces, and applies trace retention. The scheduler can insert the next daily brief job without contacting a provider.
 
 The process handles `SIGTERM` by failing health checks, closing the HTTP listener, and stopping the receiver, the scheduler, and the worker after in-flight work returns. It then projects remaining trace events and closes SQLite.
+
+## Open the control UI
+
+From the linked repository checkout, run:
+
+```sh
+pnpm dev:ui
+```
+
+Open `http://127.0.0.1:3001`. This command creates an authenticated Railway SSH local forward to the loopback listener in the existing production process. It does not start another assistant, open a second SQLite database, or poll Sendblue. Stop the tunnel with `Ctrl-C`; the deployed assistant continues running.
 
 ## Connect Google Workspace and Notion accounts
 

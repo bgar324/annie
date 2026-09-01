@@ -1,66 +1,37 @@
-import { loadLocalEnv, loadRuntimeConfig } from "./config.js";
+import { loadLocalEnv, loadLocalUiConfig, loadRuntimeConfig } from "./config.js";
+import { runAssistantProcess, type RuntimeListener } from "./lifecycle.js";
+import { createLocalUiApp } from "./local-ui/server.js";
 import { createRuntime } from "./runtime.js";
 
 loadLocalEnv();
 const config = loadRuntimeConfig();
+const localUiConfig = loadLocalUiConfig(config);
 const runtime = await createRuntime(config);
-const abort = new AbortController();
-let stopping: Promise<void> | undefined;
-let actors: Promise<void> | undefined;
+const listeners: RuntimeListener[] = [
+  {
+    name: "public",
+    app: runtime.app,
+    host: config.host,
+    port: config.port,
+  },
+];
 
-async function stop(reason: string, exitCode = 0): Promise<void> {
-  if (stopping !== undefined) {
-    return stopping;
-  }
-  stopping = (async () => {
-    runtime.setReady(false);
-    runtime.app.log.info({ reason }, "assistant_stopping");
-    const httpClosed = runtime.app.close();
-    abort.abort();
-    await actors?.catch(() => undefined);
-    await httpClosed;
-    runtime.projector.projectPending();
-    runtime.database.close();
-    process.exitCode = exitCode;
-  })();
-  return stopping;
+if (localUiConfig !== undefined) {
+  listeners.push({
+    name: "local_ui",
+    app: createLocalUiApp({
+      config: localUiConfig,
+      publicBaseUrl: config.publicBaseUrl,
+      memoryMaximumBytes: config.limits.memoryMaxBytes,
+      connections: runtime.localUi.connections,
+      links: runtime.localUi.links,
+      memory: runtime.localUi.memory,
+      traces: runtime.traces,
+      isReady: runtime.isReady,
+    }),
+    host: localUiConfig.host,
+    port: localUiConfig.port,
+  });
 }
 
-process.once("SIGTERM", () => void stop("sigterm"));
-process.once("SIGINT", () => void stop("sigint"));
-
-try {
-  const address = await runtime.app.listen({ host: config.host, port: config.port });
-  runtime.setReady(true);
-  runtime.app.log.info({ address }, "assistant_ready");
-  let actorFailed = false;
-  let firstActorFailure: unknown;
-  const settleActor = async (actor: Promise<void>): Promise<void> => {
-    try {
-      await actor;
-    } catch (error) {
-      if (!actorFailed) {
-        actorFailed = true;
-        firstActorFailure = error;
-        runtime.setReady(false);
-        abort.abort();
-      }
-    }
-  };
-  actors = Promise.all([
-    settleActor(runtime.worker.run(abort.signal)),
-    settleActor(runtime.receiver.run(abort.signal)),
-    settleActor(runtime.dailyBrief.run(abort.signal)),
-  ]).then(() => {
-    if (actorFailed) {
-      throw firstActorFailure;
-    }
-  });
-  void actors.catch((error: unknown) => {
-    runtime.app.log.error({ error }, "background_actor_stopped_unexpectedly");
-    void stop("background_actor_failure", 1);
-  });
-} catch (error) {
-  runtime.app.log.error({ error }, "assistant_startup_failed");
-  await stop("startup_failure", 1);
-}
+await runAssistantProcess({ runtime, listeners });

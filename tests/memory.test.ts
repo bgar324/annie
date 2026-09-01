@@ -35,8 +35,15 @@ describe("canonical memory document", () => {
     });
 
     await expect(store.repairAndLoad()).resolves.toBe("# Memory\n");
-    await expect(store.replace("# Memory\r\n\r\n## User\r\n- Likes tea  ")).resolves.toEqual({
-      content: "# Memory\n\n## User\n- Likes tea\n",
+    const before = await store.loadSnapshot();
+    await expect(
+      store.replaceIfRevision(
+        before.revision,
+        store.prepareReplacement("# Memory\r\n\r\n## User\r\n- Likes tea  "),
+      ),
+    ).resolves.toMatchObject({
+      kind: "replaced",
+      snapshot: { content: "# Memory\n\n## User\n- Likes tea\n" },
     });
     await writeFile(`${database.config.memoryPath}.tmp-stale`, "partial", "utf8");
     await expect(store.repairAndLoad()).resolves.toBe("# Memory\n\n## User\n- Likes tea\n");
@@ -55,6 +62,55 @@ describe("canonical memory document", () => {
     );
   });
 
+  it("serializes revision-checked replacements so only one stale writer wins", async () => {
+    const database = trackedDatabase();
+    const store = new MemoryDocumentStore({
+      path: database.config.memoryPath,
+      maximumBytes: 16_384,
+    });
+    await store.repairAndLoad();
+    const before = await store.loadSnapshot();
+
+    const [first, second] = await Promise.all([
+      store.replaceIfRevision(
+        before.revision,
+        store.prepareReplacement("# Memory\n\n- First writer\n"),
+      ),
+      store.replaceIfRevision(
+        before.revision,
+        store.prepareReplacement("# Memory\n\n- Second writer\n"),
+      ),
+    ]);
+
+    expect([first.kind, second.kind].sort()).toEqual(["conflict", "replaced"]);
+    const current = await store.loadSnapshot();
+    expect(current.revision).not.toBe(before.revision);
+    expect(["# Memory\n\n- First writer\n", "# Memory\n\n- Second writer\n"]).toContain(
+      current.content,
+    );
+  });
+
+  it("does not begin a queued replacement after its abort signal fires", async () => {
+    const database = trackedDatabase();
+    const store = new MemoryDocumentStore({
+      path: database.config.memoryPath,
+      maximumBytes: 16_384,
+    });
+    await store.repairAndLoad();
+    const before = await store.loadSnapshot();
+    const controller = new AbortController();
+
+    const replacing = store.replaceIfRevision(
+      before.revision,
+      store.prepareReplacement("# Memory\n\n- Too late\n"),
+      controller.signal,
+    );
+    controller.abort();
+
+    await expect(replacing).rejects.toMatchObject({ name: "AbortError" });
+    await expect(store.loadSnapshot()).resolves.toEqual(before);
+  });
+
   it("rejects oversized or secret-bearing replacements without truncating memory", async () => {
     const database = trackedDatabase();
     const secret = "gemini-secret-value";
@@ -64,16 +120,21 @@ describe("canonical memory document", () => {
       forbiddenValues: [secret],
     });
     await store.repairAndLoad();
-    await store.replace("# Memory\n\n- Stable fact\n");
+    await replaceMemory(store, "# Memory\n\n- Stable fact\n");
 
-    await expect(store.replace(`# Memory\n${"x".repeat(16_384)}`)).rejects.toMatchObject({
-      code: "too_large",
-    });
-    await expect(store.replace(`# Memory\n\n- ${secret}\n`)).rejects.toMatchObject({
+    await expect(replaceMemory(store, `# Memory\n${"x".repeat(16_384)}`)).rejects.toMatchObject(
+      {
+        code: "too_large",
+      },
+    );
+    await expect(replaceMemory(store, `# Memory\n\n- ${secret}\n`)).rejects.toMatchObject({
       code: "forbidden_secret",
     });
     await expect(
-      store.replace("# Memory\n\n- https://assistant.example/connect/google?token=signed-value\n"),
+      replaceMemory(
+        store,
+        "# Memory\n\n- https://assistant.example/connect/google?token=signed-value\n",
+      ),
     ).rejects.toMatchObject({ code: "forbidden_secret" });
     await expect(store.load()).resolves.toBe("# Memory\n\n- Stable fact\n");
   });
@@ -157,7 +218,7 @@ describe("post-turn memory maintenance", () => {
 
   it("leaves memory unchanged when the model returns an oversized replacement", async () => {
     const harness = await maintenanceHarness();
-    await harness.documents.replace("# Memory\n\n- Keep this\n");
+    await replaceMemory(harness.documents, "# Memory\n\n- Keep this\n");
     const { runId, traceId } = completedRun(harness, "Store too much", 1);
     let requests = 0;
     const service = new MemoryMaintenanceService({
@@ -224,6 +285,64 @@ describe("post-turn memory maintenance", () => {
         `)
         .get({ id: runId }),
     ).toEqual({ phase: "completed", final_response: "Reply remains available" });
+  });
+
+  it("does not overwrite a human edit completed while the model is running", async () => {
+    const harness = await maintenanceHarness();
+    const { runId, traceId } = completedRun(harness, "Remember the agent proposal", 1);
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const service = new MemoryMaintenanceService({
+      db: harness.database.handle.db,
+      documents: harness.documents,
+      traces: harness.traces,
+      model: {
+        async maintainMemory() {
+          started.resolve();
+          await release.promise;
+          return {
+            id: "stale-memory-proposal",
+            content: JSON.stringify({
+              action: "replace",
+              memory: "# Memory\n\n- Agent proposal\n",
+            }),
+            usage: { promptTokens: 8, completionTokens: 4, totalTokens: 12 },
+          };
+        },
+      },
+    });
+
+    const maintaining = service.maintain({
+      runId,
+      traceId,
+      userMessage: "Remember the agent proposal",
+      finalResponse: "Reply remains available",
+      toolOutcomes: [],
+    });
+    await started.promise;
+    const current = await harness.documents.loadSnapshot();
+    await harness.documents.replaceIfRevision(
+      current.revision,
+      harness.documents.prepareReplacement("# Memory\n\n- Human edit\n"),
+    );
+    release.resolve();
+
+    await expect(maintaining).resolves.toEqual({
+      status: "failed",
+      memory: "# Memory\n\n- Human edit\n",
+    });
+    await expect(harness.documents.load()).resolves.toBe("# Memory\n\n- Human edit\n");
+    expect(runMaintenanceStatus(harness.database, runId)).toBe("failed");
+    expect(
+      harness.traces
+        .list(traceId)
+        .some(
+          (event) =>
+            event.component === "memory" &&
+            event.event === "failed" &&
+            event.outcome === "memory_changed",
+        ),
+    ).toBe(true);
   });
 
   it("records a failed maintenance boundary when the run deadline already elapsed", async () => {
@@ -323,7 +442,7 @@ describe("post-turn memory maintenance", () => {
     const before = await harness.documents.load();
     const after = "# Memory\n\n## User\n- Values crash safety\n";
     const prepared = prepareInterruptedMemoryUpdate(harness, runId, before, after);
-    await harness.documents.replace(after);
+    await replaceMemory(harness.documents, after);
     const service = recoveryService(harness);
 
     await expect(service.recoverInterrupted()).resolves.toBe(1);
@@ -393,6 +512,17 @@ async function maintenanceHarness(): Promise<MaintenanceHarness> {
     runs: new AgentRunStore(database.handle.db, traces),
     documents,
   };
+}
+
+async function replaceMemory(documents: MemoryDocumentStore, content: string): Promise<void> {
+  const current = await documents.loadSnapshot();
+  const result = await documents.replaceIfRevision(
+    current.revision,
+    documents.prepareReplacement(content),
+  );
+  if (result.kind === "conflict") {
+    throw new Error("Memory test fixture lost its revision");
+  }
 }
 
 function completedRun(

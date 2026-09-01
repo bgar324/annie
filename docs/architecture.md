@@ -38,11 +38,13 @@ flowchart LR
   H[Fastify boundary] --> D
 ```
 
-The Fastify instance serves only `/health`, the signed connection routes, the OAuth callbacks, and the Notion client metadata document. No provider posts to this service, so the HTTP surface is not part of message transport.
+The public Fastify instance serves only `/health`, the signed connection routes, the OAuth callbacks, and the Notion client metadata document. No provider posts to this service, so the public HTTP surface is not part of message transport.
+
+When enabled, the authoritative process adds a second Fastify instance bound only to container `127.0.0.1`. It reuses that process's database handle, connection store, signed-link service, and memory store. Railway publishes only the public listener; an authenticated SSH local forward is the sole browser path to account health, new Google connection, and revision-checked `MEMORY.md` editing. The tunnel starts no second assistant runtime.
 
 SQLite, `MEMORY.md`, and projected traces share the Railway volume. Production runs one replica because the queue, worker, and WAL database are one local durability unit.
 
-Startup performs configuration validation, SQLite migration and integrity checks, interrupted-write recovery, interrupted-memory recovery, pending trace projection, and trace retention. Startup does not contact Sendblue, Gemini, Google Workspace, or Notion. The receiver, the daily brief scheduler, and the worker start after the HTTP listener is bound.
+Startup performs configuration validation, SQLite migration and integrity checks, interrupted-write recovery, interrupted-memory recovery, pending trace projection, and trace retention. Startup does not contact Sendblue, Gemini, Google Workspace, or Notion. The receiver, the daily brief scheduler, and the worker start after every configured HTTP listener is bound.
 
 ## Inbound message flow
 
@@ -68,7 +70,7 @@ The queue holds four job types: `inbound`, `daily_brief`, `egress_send`, and `eg
 
 Only one job for a chat can run at once. Inbound sequence numbers preserve per-chat order. Internal egress jobs are capacity-exempt so a full user queue cannot prevent a committed result or failure notice from being sent.
 
-A process stop does not release a lease while its handler may still be running. On `SIGTERM`, the HTTP listener closes; the receiver, the daily brief scheduler, and the worker observe one shared abort signal and stop after their in-flight sweep or handler returns. Pending traces then project and SQLite closes. If the platform kills the process first, the lease expires and the durable ingress cursor and queue let the next process resume without losing work.
+A process stop does not release a lease while its handler may still be running. On `SIGTERM`, the configured HTTP listeners begin draining; the receiver, the daily brief scheduler, and the worker observe one shared abort signal and stop after their in-flight sweep or handler returns. SQLite stays open unless every listener drains successfully. Pending traces then project and SQLite closes. If the platform kills the process first, the lease expires and the durable ingress cursor and queue let the next process resume without losing work.
 
 ## Daily brief flow
 

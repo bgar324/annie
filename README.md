@@ -13,6 +13,7 @@ This is deliberately not a general-purpose bot framework. It is built around one
 - Send an optional read-only morning brief at 08:00 America/Los_Angeles.
 - Maintain one bounded `MEMORY.md` document for durable user preferences.
 - Render every run as a redacted, replayable trace.
+- Open an SSH-tunneled loopback UI for account health, Google connection, and direct `MEMORY.md` editing.
 
 Gmail is read-only. Annie cannot delete, archive, move, or invoke arbitrary provider methods.
 
@@ -86,6 +87,8 @@ Start the development process:
 pnpm dev
 ```
 
+To inspect the authoritative deployed assistant, set `LOCAL_UI_ENABLED=true` on Railway, deploy, and run `pnpm dev:ui`. The command opens only an SSH tunnel to the loopback UI inside the existing production process; it never opens a local database or starts another receiver, worker, or scheduler. Then open `http://127.0.0.1:3001`.
+
 The Sendblue sandbox requires one setup message before Annie can reply: verify `USER_PHONE_NUMBER` as a contact, then text `SENDBLUE_FROM_NUMBER` from that number once.
 
 For OAuth setup and the first end-to-end message, follow [Local development](docs/local-development.md).
@@ -105,12 +108,15 @@ The complete template is [.env.example](.env.example). The main groups are:
 | `CREDENTIAL_ENCRYPTION_KEY` | Encrypt provider credentials with AES-256-GCM |
 | `DAILY_BRIEF_ENABLED` | Enable the optional scheduled morning brief |
 | `RAILWAY_VOLUME_MOUNT_PATH` or `DATA_DIR` | Place SQLite, traces, and memory on persistent storage |
+| `LOCAL_UI_ENABLED`, `LOCAL_UI_PORT` | Enable the production loopback control listener reached only through Railway SSH |
 
 `.env`, SQLite files, traces, `data/`, and build output are ignored by Git. Keep them out of commits and bug reports.
 
 ## Commands
 
 ```sh
+pnpm dev
+pnpm dev:ui
 pnpm typecheck
 pnpm test
 pnpm build

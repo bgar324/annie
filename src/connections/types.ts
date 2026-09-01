@@ -50,6 +50,22 @@ export interface ConnectionRecord {
   expiresAtMs: number | null;
 }
 
+export interface SafeConnectionView {
+  readonly provider: ConnectionProvider;
+  readonly label: string;
+  readonly status: ConnectionStatus;
+  readonly capabilities: readonly ConnectionCapability[];
+}
+
+export function toSafeConnectionView(connection: ConnectionRecord): SafeConnectionView {
+  return {
+    provider: connection.provider,
+    label: connection.safeLabel,
+    status: connection.status,
+    capabilities: connection.capabilities,
+  };
+}
+
 export interface ConnectionAuthorization {
   traceId: TraceId;
   provider: ConnectionProvider;

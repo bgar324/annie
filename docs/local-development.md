@@ -17,18 +17,41 @@ Use `PUBLIC_BASE_URL=http://localhost:3000`. Messaging never needs a public URL;
 
 ## Start the assistant
 
+Start the assistant without the browser UI:
+
 ```sh
 pnpm install
 pnpm dev
 ```
 
-The process opens SQLite and `MEMORY.md` under `DATA_DIR`, listens on port 3000 by default, and then starts the durable worker, the Sendblue receiver, and the daily brief scheduler. Startup fails instead of using ephemeral storage when production volume configuration is missing or invalid. Startup contacts no provider, so a bad Sendblue key surfaces on the first sweep, not at boot.
+`pnpm dev` intentionally starts a complete local assistant against `DATA_DIR`. Never run it while the deployed assistant uses the same Sendblue line.
+
+## Open the deployed control UI
+
+The control UI runs inside the one authoritative Railway process so it reads the live connection registry and `/app/data/MEMORY.md`. Configure the Railway service with:
+
+```text
+LOCAL_UI_ENABLED=true
+LOCAL_UI_PORT=3001
+```
+
+Then run:
+
+```sh
+pnpm dev:ui
+```
+
+Open `http://127.0.0.1:3001`. The command installs an `annie-production` SSH alias and forwards only local `127.0.0.1:3001` to the production process's loopback listener. It never starts an assistant runtime, opens local SQLite, polls Sendblue, processes jobs, or contacts a provider. `Ctrl-C` closes only the tunnel.
+
+The UI shows the safe label, provider, status, and capabilities for every live connection. It can open the existing public Google OAuth flow in a new tab and edit the canonical production `MEMORY.md`. A save uses the revision loaded with the editor. If Annie updates memory first, the UI preserves both documents and requires an explicit reload instead of overwriting either version.
+
+The listener itself is fixed to container loopback, Railway publishes only the public application port, and the browser reaches it through authenticated Railway SSH. Exact Host and Origin checks, CSRF, no CORS, and restrictive response headers still apply.
 
 `DAILY_BRIEF_ENABLED` defaults to `false`. Set it to `true` to exercise the live schedule at 08:00 America/Los_Angeles. The scheduler creates the next durable job immediately, but the worker does not claim that job before its scheduled time. Enabling this option with real Sendblue credentials sends an iMessage.
 
 ## Connect provider accounts
 
-Ask Annie in ordinary language to:
+Use **Add Google account** in the local UI for a new Google account. To reconnect a specific account, connect Notion, or list accounts in iMessage, ask Annie in ordinary language to:
 
 - connect or reconnect a Google account for Gmail, Calendar, Drive, Contacts, and Tasks;
 - connect or reconnect a Notion workspace;

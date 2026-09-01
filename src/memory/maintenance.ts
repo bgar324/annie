@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { createPatch } from "diff";
 import { z } from "zod";
@@ -71,8 +70,8 @@ export class MemoryMaintenanceService {
   }
 
   async recoverInterrupted(): Promise<number> {
-    const currentMemory = await this.#documents.load();
-    const currentDigest = digest(currentMemory);
+    const current = await this.#documents.loadSnapshot();
+    const currentDigest = current.revision;
     const rows = this.#db
       .prepare<[], InterruptedMaintenanceRow>(`
         SELECT agent_runs.id, agent_runs.trace_id, agent_runs.memory_before_digest,
@@ -115,8 +114,9 @@ export class MemoryMaintenanceService {
     finalResponse: string;
     toolOutcomes: readonly unknown[];
   }): Promise<MemoryMaintenanceResult> {
-    const before = await this.#documents.load();
-    const beforeDigest = digest(before);
+    const beforeSnapshot = await this.#documents.loadSnapshot();
+    const before = beforeSnapshot.content;
+    const beforeDigest = beforeSnapshot.revision;
     const deadlineAtMs = this.#claim(input.runId, beforeDigest);
     if (deadlineAtMs === undefined) {
       let status = this.#status(input.runId);
@@ -196,7 +196,7 @@ export class MemoryMaintenanceService {
       }
 
       const replacement = this.#documents.prepareReplacement(instruction.memory);
-      const afterDigest = digest(replacement.content);
+      const afterDigest = replacement.revision;
       const changed = afterDigest !== beforeDigest;
       const diff = changed ? createPatch("MEMORY.md", before, replacement.content) : "";
       if (!changed) {
@@ -223,7 +223,24 @@ export class MemoryMaintenanceService {
       replacementJournaled = true;
       signal.throwIfAborted();
       replacementStarted = true;
-      await this.#documents.replace(replacement.content);
+      const replacementResult = await this.#documents.replaceIfRevision(
+        beforeDigest,
+        replacement,
+        signal,
+      );
+      if (replacementResult.kind === "conflict") {
+        this.#fail({
+          runId: input.runId,
+          traceId: input.traceId,
+          status: "failed",
+          beforeDigest,
+          afterDigest: replacementResult.snapshot.revision,
+          usage,
+          error: new Error("The memory document changed during maintenance"),
+          outcome: "memory_changed",
+        });
+        return { status: "failed", memory: replacementResult.snapshot.content };
+      }
       this.#finish({
         runId: input.runId,
         traceId: input.traceId,
@@ -233,7 +250,7 @@ export class MemoryMaintenanceService {
         diff,
         usage,
       });
-      return { status: "updated", memory: replacement.content };
+      return { status: "updated", memory: replacementResult.snapshot.content };
     } catch (error) {
       const deadlineExceeded = signal.aborted;
       if (replacementJournaled && !replacementStarted) {
@@ -461,6 +478,7 @@ export class MemoryMaintenanceService {
     status: "invalid" | "failed";
     outcome?: string;
     beforeDigest: string;
+    afterDigest?: string;
     usage: ModelUsage | null;
     error: unknown;
   }): void {
@@ -469,19 +487,19 @@ export class MemoryMaintenanceService {
         .prepare<{
           id: string;
           status: "invalid" | "failed";
-          before_digest: string;
+          after_digest: string;
           now_ms: number;
         }>(`
           UPDATE agent_runs
           SET memory_maintenance_status = @status,
-              memory_after_digest = @before_digest,
+              memory_after_digest = @after_digest,
               updated_at_ms = @now_ms
           WHERE id = @id AND memory_maintenance_status = 'attempting'
         `)
         .run({
           id: input.runId,
           status: input.status,
-          before_digest: input.beforeDigest,
+          after_digest: input.afterDigest ?? input.beforeDigest,
           now_ms: Date.now(),
         });
       this.#db
@@ -495,7 +513,7 @@ export class MemoryMaintenanceService {
         runId: input.runId,
         data: {
           beforeDigest: input.beforeDigest,
-          afterDigest: input.beforeDigest,
+          afterDigest: input.afterDigest ?? input.beforeDigest,
           usage: input.usage,
           error: input.error instanceof Error ? input.error.message : "Unknown memory failure",
         },
@@ -553,6 +571,3 @@ function boundToolOutcomes(outcomes: readonly unknown[]): unknown {
   return { truncated: true, count: outcomes.length };
 }
 
-function digest(content: string): string {
-  return createHash("sha256").update(content).digest("hex");
-}

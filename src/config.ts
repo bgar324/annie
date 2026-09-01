@@ -73,6 +73,11 @@ const runtimeEnvSchema = storageEnvSchema.extend({
   PROVIDER_REQUEST_TIMEOUT_MS: positiveInteger(30_000, 120_000),
 });
 
+const localUiEnvSchema = z.object({
+  LOCAL_UI_ENABLED: booleanFlag,
+  LOCAL_UI_PORT: positiveInteger(3001, 65_535),
+});
+
 export interface StorageConfig {
   nodeEnv: z.infer<typeof nodeEnvSchema>;
   dataDir: string;
@@ -81,6 +86,13 @@ export interface StorageConfig {
   traceDir: string;
   traceRetentionDays: number;
   traceMaxBytes: number;
+}
+
+export interface LocalUiConfig {
+  readonly host: "127.0.0.1";
+  readonly port: number;
+  readonly authority: `127.0.0.1:${number}`;
+  readonly origin: `http://127.0.0.1:${number}`;
 }
 
 export interface RuntimeConfig extends StorageConfig {
@@ -244,6 +256,26 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
       parsed.GOOGLE_CLIENT_SECRET,
       parsed.CREDENTIAL_ENCRYPTION_KEY,
     ],
+  };
+}
+
+export function loadLocalUiConfig(
+  config: Pick<RuntimeConfig, "port">,
+  env: NodeJS.ProcessEnv = process.env,
+): LocalUiConfig | undefined {
+  const parsed = localUiEnvSchema.parse(env);
+  if (!parsed.LOCAL_UI_ENABLED) {
+    return undefined;
+  }
+  const port = parsed.LOCAL_UI_PORT;
+  if (port === config.port) {
+    throw new Error("LOCAL_UI_PORT must differ from PORT");
+  }
+  return {
+    host: "127.0.0.1",
+    port,
+    authority: `127.0.0.1:${port}`,
+    origin: `http://127.0.0.1:${port}`,
   };
 }
 
