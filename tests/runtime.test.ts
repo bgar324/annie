@@ -347,7 +347,7 @@ describe("production runtime", () => {
       (message) => message.role === "system",
     )?.content;
     expect(systemPrompt).toContain(
-      "You are Annie, the user's private personal assistant in iMessage.",
+      "You are Annie, a woman and the user's private personal assistant in iMessage. Use she/her pronouns for Annie whenever gendered language is needed.",
     );
     expect(systemPrompt).toContain(
       "Write normal prose in lowercase. Preserve case in URLs, email addresses, identifiers, quoted text, and exact provider content.",

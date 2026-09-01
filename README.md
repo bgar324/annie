@@ -1,6 +1,6 @@
 # Annie
 
-Annie is a single-user personal assistant that lives in iMessage. It receives messages through a Sendblue Free Sandbox line and runs a bounded TypeScript agent loop with eight narrow provider tools plus two account-connection controls.
+Annie is a single-user personal assistant that lives in iMessage. She receives messages through a Sendblue Free Sandbox line and runs a bounded TypeScript agent loop with eight narrow provider tools. Two separate inbound controls outside that registry list and connect accounts.
 
 This is deliberately not a general-purpose bot framework. It is built around one trusted sender, one assistant line, durable local state, and conservative provider-write semantics.
 
