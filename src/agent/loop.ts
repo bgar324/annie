@@ -119,7 +119,7 @@ export class AgentLoop {
         }
         const last = messages.at(-1);
         if (last?.role === "assistant" && (last.toolCalls?.length ?? 0) === 0) {
-          const response = last.content.trim();
+          const response = normalizeFinalResponse(last.content);
           if (response.length === 0) {
             return this.#bounded(run, "empty_model_response");
           }
@@ -392,6 +392,10 @@ function pendingToolCalls(messages: readonly ModelMessage[]): readonly ModelTool
     }
   }
   return [];
+}
+
+function normalizeFinalResponse(content: string): string {
+  return content.trim().replace(/^[\t ]*-[\t ]*›[ \t]*/gmu, "› ");
 }
 
 function answeredToolCalls(messages: readonly ModelMessage[]): ReadonlySet<string> {

@@ -538,6 +538,45 @@ describe("durable bounded agent loop", () => {
     });
   });
 
+  it("removes a redundant hyphen before final reply arrows", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(
+      harness.database,
+      harness.traces,
+      "Show recent work",
+    );
+    const model = scriptedModel([
+      {
+        id: "response_final",
+        content: "📁 recent work:\n-\n› existing item\n- › first item\n  -  › second item",
+        providerState: null,
+        toolCalls: [],
+        finishReason: "stop",
+        usage: emptyUsage,
+      },
+    ]);
+    const normalized =
+      "📁 recent work:\n-\n› existing item\n› first item\n› second item";
+    const loop = createAgentLoop(
+      harness.runs,
+      harness.writes,
+      model,
+      new ToolRegistry([]),
+    );
+
+    const result = await loop.execute({
+      source: { kind: "inbound", inboundId },
+      traceId,
+      initialMessages: [{ role: "user", content: "Show recent work" }],
+    });
+
+    expect(result).toMatchObject({
+      outcome: "completed",
+      response: normalized,
+    });
+    expect(harness.runs.getRequired(result.run.id).finalResponse).toBe(normalized);
+  });
+
   it("resumes a committed tool result without executing the provider operation again", async () => {
     const harness = agentHarness();
     const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Resume");

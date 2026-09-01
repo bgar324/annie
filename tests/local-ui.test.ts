@@ -99,7 +99,7 @@ describe("loopback local UI", () => {
     expect(response.statusCode).toBe(200);
     expect(response.body).toContain("&lt;Personal &amp; Work&gt;");
     expect(response.body).toContain("Degraded");
-    expect(response.body).toContain("Calendar read · Gmail read");
+    expect(response.body).toContain("Calendar · Gmail");
     expect(response.body).not.toContain("<Personal & Work>");
     for (const sentinel of [
       connection.id,
@@ -195,7 +195,7 @@ describe("loopback local UI", () => {
     });
 
     expect(root.body).toContain(
-      '<button class="button button-primary" type="submit">Add Google account</button>',
+      '<button class="button button-secondary" type="submit">Add Google account</button>',
     );
     expect(root.headers["content-security-policy"]).toContain(
       "form-action 'self' https://assistant.example.com https://accounts.google.com",
@@ -269,7 +269,7 @@ describe("loopback local UI", () => {
     expect(response.statusCode).toBe(409);
     expect(response.body).toContain("Newer edit");
     expect(response.body).toContain("Unsaved browser draft");
-    expect(response.body).toContain("Reload the editor");
+    expect(response.body).toContain('<a class="button button-primary" href="/">Reload</a>');
     expect(response.body).not.toContain('action="/memory"');
     await expect(harness.memory.load()).resolves.toBe("# Memory\n\n- Newer edit\n");
   });
@@ -315,7 +315,7 @@ describe("loopback local UI", () => {
     expect(response.body).toContain("exceeds the configured byte limit");
     expect(response.body).toContain("keep-this-draft");
     expect(response.body).toContain(
-      '<button class="button button-primary" type="submit">Save memory</button>',
+      '<button class="button button-primary" type="submit">Save</button>',
     );
     await expect(harness.memory.loadSnapshot()).resolves.toEqual(before);
   });
