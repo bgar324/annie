@@ -355,7 +355,7 @@ function existingOrNewRefreshToken(
     }
   }
   throw new Error(
-    "Google did not return a refresh token for the new read-only grant; remove Ben's old Google access and connect again",
+    "Google did not return a refresh token for the new read-only grant; remove Willow's old Google access and connect again",
   );
 }
 
@@ -370,8 +370,8 @@ class GoogleScopeError extends Error {
   constructor(reason: GoogleScopeError["reason"]) {
     super(
       reason === "outside_read_only_bundle"
-        ? "Google returned permissions outside Ben's fixed read-only Workspace bundle"
-        : "Google did not grant every permission in Ben's read-only Workspace bundle",
+        ? "Google returned permissions outside Willow's fixed read-only Workspace bundle"
+        : "Google did not grant every permission in Willow's read-only Workspace bundle",
     );
     this.name = "GoogleScopeError";
     this.reason = reason;
@@ -442,7 +442,7 @@ function callbackErrorPage(
       error.reason === "outside_read_only_bundle"
         ? "Google permissions are not read-only"
         : "Google permissions are incomplete",
-      "Remove Ben from your Google Account connections, then request a new Google connection link and grant every requested permission.",
+      "Remove Willow from your Google Account connections, then request a new Google connection link and grant every requested permission.",
     );
   }
   if (error instanceof OAuthIdentityMismatchError) {

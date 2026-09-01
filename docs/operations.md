@@ -50,9 +50,9 @@ If the OAuth app has an **External** user type and a **Testing** publishing stat
 
 Connect accounts from iMessage:
 
-1. Remove any earlier Ben grant from the Google Account connections page if it included Gmail write access.
-2. Ask Ben in ordinary language to connect Google once for each Google account. Choose a different account in each browser flow and grant every requested permission.
-3. Ask Ben to connect Notion once for each Notion workspace. Notion does not need a static API key or integration token.
+1. Remove any earlier Willow grant from the Google Account connections page if it included Gmail write access.
+2. Ask Willow in ordinary language to connect Google once for each Google account. Choose a different account in each browser flow and grant every requested permission.
+3. Ask Willow to connect Notion once for each Notion workspace. Notion does not need a static API key or integration token.
 4. Ask which accounts are connected to list their safe labels, health states, and semantic capabilities.
 
 When multiple accounts grant the same capability, include the exact safe label in the request. If you request all accounts, the agent calls each healthy account separately. It never chooses one account silently.
