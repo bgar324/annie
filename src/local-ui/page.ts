@@ -169,7 +169,7 @@ function documentShell(title: string, body: string): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(title)}</title>
 <style>
-:root{color-scheme:light;--bg:#f5f5f3;--surface:#fff;--surface-subtle:#fafaf8;--ink:#20201e;--muted:#6c6c67;--line:#deded9;--line-strong:#c8c8c1;--accent:#1859d1;--accent-hover:#1249ad;--success:#217a4b;--warning:#986515;--danger:#b03a32;--focus:#0b63ce;font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+:root{color-scheme:light;--bg:#f6f6f7;--surface:#fff;--surface-subtle:#fafafa;--ink:#20201e;--muted:#6c6c67;--line:#deded9;--line-strong:#c8c8c1;--accent:#5e6ad2;--accent-hover:#4f5bc4;--success:#217a4b;--warning:#986515;--danger:#b03a32;--focus:#5e6ad2;--radius-surface:16px;--radius-control:12px;font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 *{box-sizing:border-box}
 body{margin:0;min-height:100dvh;background:var(--bg);color:var(--ink)}
 code,pre,textarea{font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace}
@@ -181,7 +181,7 @@ h2{font-size:1rem;line-height:1.3}
 .topbar>div>p,.memory-footer p,.account-action p,.empty-state p{color:var(--muted);margin-bottom:0}
 .service-status{display:flex;align-items:center;gap:.45rem;margin:0;color:var(--muted);font-size:.8rem}
 .service-status span{width:.45rem;height:.45rem;border-radius:50%;background:var(--success)}
-.workspace{display:grid;grid-template-columns:20.5rem minmax(0,1fr);height:min(50rem,calc(100dvh - 6.25rem));min-height:36rem;overflow:hidden;background:var(--surface);border:1px solid var(--line);border-radius:10px;box-shadow:0 1px 2px rgba(28,28,24,.04);margin-bottom:2rem}
+.workspace{display:grid;grid-template-columns:20.5rem minmax(0,1fr);height:min(50rem,calc(100dvh - 6.25rem));min-height:36rem;overflow:hidden;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-surface);box-shadow:0 1px 2px rgba(28,28,24,.04),0 12px 32px rgba(28,28,24,.035);margin-bottom:2rem}
 .workspace>section{min-width:0;padding:1.25rem}
 .accounts{display:flex;min-height:0;flex-direction:column;background:var(--surface-subtle)}
 .memory{display:flex;min-height:0;flex-direction:column;border-left:1px solid var(--line)}
@@ -205,28 +205,28 @@ h2{font-size:1rem;line-height:1.3}
 .memory-heading{flex:0 0 auto}
 .byte-count{margin:0;color:var(--muted);white-space:nowrap;font-size:.76rem}
 .memory-form{display:flex;min-height:0;flex:1;flex-direction:column}
-textarea{display:block;width:100%;min-height:0;flex:1;resize:none;border:1px solid var(--line-strong);border-radius:6px;background:#fff;color:var(--ink);font-size:14px;line-height:1.55;padding:.9rem;tab-size:2}
+textarea{display:block;width:100%;min-height:0;flex:1;resize:none;border:1px solid var(--line-strong);border-radius:var(--radius-control);background:#fff;color:var(--ink);font-size:14px;line-height:1.55;padding:.9rem;tab-size:2}
 textarea:hover{border-color:#aaa9a1}
-textarea:focus{border-color:var(--focus);outline:2px solid rgba(11,99,206,.18);outline-offset:1px}
+textarea:focus{border-color:var(--focus);outline:3px solid rgba(94,106,210,.18);outline-offset:1px}
 textarea:disabled{background:#f0f0ed;color:var(--muted)}
 .memory-footer{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-top:.85rem}
 .memory-footer p{font-size:.75rem}
-.button{display:inline-flex;align-items:center;justify-content:center;min-height:44px;border:1px solid transparent;border-radius:6px;padding:.6rem .95rem;font:inherit;font-weight:650;line-height:1;text-decoration:none;white-space:nowrap;cursor:pointer}
-.button-primary{background:var(--accent);color:#fff}
+.button{display:inline-flex;align-items:center;justify-content:center;min-height:44px;border:1px solid transparent;border-radius:var(--radius-control);padding:.6rem .95rem;font:inherit;font-weight:650;line-height:1;text-decoration:none;white-space:nowrap;cursor:pointer}
+.button-primary{background:var(--accent);box-shadow:0 1px 2px rgba(24,24,28,.16);color:#fff}
 .button-primary:hover{background:var(--accent-hover)}
 .button-secondary{background:#fff;border-color:var(--line-strong);color:var(--ink)}
 .button-secondary:hover{background:#f2f2ef}
 .button:disabled{background:#e2e2de;border-color:#d5d5cf;color:#777772;cursor:not-allowed}
 .button:focus-visible,a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
-.notice{border:1px solid var(--line);border-left:3px solid var(--accent);background:var(--surface);padding:.75rem .9rem;margin-bottom:.75rem;border-radius:6px}
+.notice{border:1px solid var(--line);border-left:3px solid var(--accent);background:var(--surface);padding:.75rem .9rem;margin-bottom:.75rem;border-radius:var(--radius-control)}
 .notice[data-kind="success"]{border-left-color:var(--success)}
 .notice[data-kind="error"]{border-left-color:var(--danger)}
-.conflict,.error-page{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:1.25rem;margin-bottom:2rem}
+.conflict,.error-page{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-surface);padding:1.25rem;margin-bottom:2rem}
 .conflict>p,.error-page>p{color:var(--muted)}
 .comparison{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin:1.25rem 0}
 .comparison section{min-width:0}
 .comparison h3{font-size:.85rem}
-pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:25rem;overflow:auto;background:var(--surface-subtle);border:1px solid var(--line);border-radius:6px;padding:.9rem;font-size:.8rem}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:25rem;overflow:auto;background:var(--surface-subtle);border:1px solid var(--line);border-radius:var(--radius-control);padding:.9rem;font-size:.8rem}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 @media(max-width:48rem){.topbar,.workspace,.notice,.conflict,.error-page{width:min(100% - 1.5rem,76rem)}.workspace{display:block;height:auto;min-height:0;overflow:visible}.accounts{display:block}.account-list{overflow:visible}.memory{border-left:0;border-top:1px solid var(--line)}.memory-form{display:block}.memory-footer{align-items:flex-start}.comparison{grid-template-columns:1fr}textarea{min-height:30rem;resize:vertical}}
 @media(max-width:32rem){.topbar,.workspace,.notice,.conflict,.error-page{width:min(100% - 1rem,76rem)}.topbar{padding:1rem .15rem .75rem}.workspace>section,.conflict,.error-page{padding:1rem}.memory-footer{flex-direction:column}.memory-footer .button,.account-action .button{width:100%}textarea{min-height:26rem;font-size:16px}}
