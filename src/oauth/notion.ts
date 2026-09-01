@@ -82,7 +82,7 @@ export function registerNotionOAuth(input: {
     reply.header("cache-control", "public, max-age=300");
     return reply.send({
       client_id: input.config.notion.clientMetadataUrl,
-      client_name: "Willow",
+      client_name: "Annie",
       client_uri: input.config.publicBaseUrl,
       redirect_uris: [input.config.notion.callbackUrl],
       grant_types: ["authorization_code", "refresh_token"],
@@ -368,7 +368,7 @@ async function exchangeNotionCode(input: {
     headers: {
       accept: "application/json",
       "content-type": "application/x-www-form-urlencoded",
-      "user-agent": "willow/0.1.0",
+      "user-agent": "annie/0.1.0",
     },
     body,
   });

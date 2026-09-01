@@ -347,7 +347,7 @@ describe("production runtime", () => {
       (message) => message.role === "system",
     )?.content;
     expect(systemPrompt).toContain(
-      "You are Willow, the user's private personal assistant in iMessage.",
+      "You are Annie, the user's private personal assistant in iMessage.",
     );
     expect(systemPrompt).toContain(
       "Write normal prose in lowercase. Preserve case in URLs, email addresses, identifiers, quoted text, and exact provider content.",
@@ -1490,7 +1490,7 @@ describe("production runtime", () => {
     ).toBe("tool_not_allowed");
   });
 
-  it("lets Willow answer from an authoritative empty connection-tool result", async () => {
+  it("lets Annie answer from an authoritative empty connection-tool result", async () => {
     const model = new FakeModel();
     model.responses.push(
       {
@@ -1555,7 +1555,7 @@ describe("production runtime", () => {
     ).toBe("you don't have any connected accounts yet.");
   });
 
-  it("returns only safe authoritative connection fields for Willow to describe", async () => {
+  it("returns only safe authoritative connection fields for Annie to describe", async () => {
     const model = new FakeModel();
     model.responses.push(
       {

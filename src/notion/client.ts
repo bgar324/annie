@@ -226,7 +226,7 @@ export async function connectNotionClient(input: {
       maxRetries: 0,
     },
   });
-  const client = new Client({ name: "willow", version: "0.1.0" });
+  const client = new Client({ name: "annie", version: "0.1.0" });
   await client.connect(new CompatibleTransport(streamable));
   return client;
 }

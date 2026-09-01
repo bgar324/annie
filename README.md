@@ -1,10 +1,10 @@
-# Willow
+# Annie
 
-Willow is a single-user personal assistant that lives in iMessage. It receives messages through a Sendblue Free Sandbox line, runs a bounded TypeScript agent loop, and exposes eight narrow tools for Gmail, Google Workspace, Notion, and account connections.
+Annie is a single-user personal assistant that lives in iMessage. It receives messages through a Sendblue Free Sandbox line, runs a bounded TypeScript agent loop, and exposes eight narrow tools for Gmail, Google Workspace, Notion, and account connections.
 
 This is deliberately not a general-purpose bot framework. It is built around one trusted sender, one assistant line, durable local state, and conservative provider-write semantics.
 
-## What Willow can do
+## What Annie can do
 
 - Read Gmail, calendars, Drive, contacts, and tasks from connected Google accounts.
 - Search and fetch content from connected Notion workspaces.
@@ -14,7 +14,7 @@ This is deliberately not a general-purpose bot framework. It is built around one
 - Maintain one bounded `MEMORY.md` document for durable user preferences.
 - Render every run as a redacted, replayable trace.
 
-Willow cannot delete, archive, move, or invoke arbitrary provider methods.
+Annie cannot delete, archive, move, or invoke arbitrary provider methods.
 
 ## Safety model
 
@@ -71,8 +71,8 @@ Notion uses the hosted MCP service and CIMD. It does not require a static Notion
 ## Quick start
 
 ```sh
-git clone https://github.com/bgar324/willow.git
-cd willow
+git clone https://github.com/bgar324/annie.git
+cd annie
 pnpm install --frozen-lockfile
 cp .env.example .env
 openssl rand -base64 32
@@ -86,7 +86,7 @@ Start the development process:
 pnpm dev
 ```
 
-The Sendblue sandbox requires one setup message before Willow can reply: verify `USER_PHONE_NUMBER` as a contact, then text `SENDBLUE_FROM_NUMBER` from that number once.
+The Sendblue sandbox requires one setup message before Annie can reply: verify `USER_PHONE_NUMBER` as a contact, then text `SENDBLUE_FROM_NUMBER` from that number once.
 
 For OAuth setup and the first end-to-end message, follow [Local development](docs/local-development.md).
 

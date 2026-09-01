@@ -28,7 +28,7 @@ The process opens SQLite and `MEMORY.md` under `DATA_DIR`, listens on port 3000 
 
 ## Connect provider accounts
 
-Ask Willow in ordinary language to:
+Ask Annie in ordinary language to:
 
 - connect or reconnect a Google account for Gmail, Calendar, Drive, Contacts, and Tasks;
 - connect or reconnect a Notion workspace;
