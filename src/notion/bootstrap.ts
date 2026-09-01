@@ -3,7 +3,7 @@ import type { ProviderFetch } from "../providers/fetch.js";
 import { connectNotionClient, listEveryNotionTool } from "./client.js";
 
 const accessStatusSchema = z.object({
-  status: z.enum(["available", "available_with_limit", "upgrade_required", "not_enabled"]),
+  status: z.string().min(1),
   upgrade_url: z.string().url().optional(),
 });
 
@@ -30,6 +30,10 @@ export interface NotionBootstrapIdentity {
   self: NotionSelf;
   advertisedTools: ReadonlySet<string>;
 }
+export function parseNotionSelf(value: unknown): NotionSelf {
+  return selfSchema.parse(value).self;
+}
+
 
 export async function fetchNotionBootstrap(input: {
   mcpUrl: string;
@@ -51,7 +55,7 @@ export async function fetchNotionBootstrap(input: {
       throw new Error("Notion notion-fetch self did not return a text content block");
     }
     return {
-      self: selfSchema.parse(JSON.parse(block.text)).self,
+      self: parseNotionSelf(JSON.parse(block.text)),
       advertisedTools,
     };
   } finally {

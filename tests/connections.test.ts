@@ -22,6 +22,7 @@ import {
 import { newTraceId } from "../src/core/ids.js";
 import { MessageEgressService } from "../src/messages/egress.js";
 import type { DeliveryResource, MessageSender } from "../src/messages/types.js";
+import { parseNotionSelf } from "../src/notion/bootstrap.js";
 import { notionCapabilities } from "../src/oauth/notion.js";
 import { OAuthAttemptStore } from "../src/oauth/attempts.js";
 import { ConnectLinkError, ConnectLinkService } from "../src/oauth/links.js";
@@ -360,6 +361,23 @@ describe("provider capability truth", () => {
       // notion-update-page is deliberately absent from the complete advertised set.
     ]);
     expect(notionCapabilities(access, advertised)).toEqual(["notion.search", "notion.fetch"]);
+  });
+
+  it("ignores unrelated Notion access statuses when deriving exact capabilities", () => {
+    const self = parseNotionSelf({
+      self: {
+        workspace: { id: "workspace_1", name: "Test workspace" },
+        user: { id: "user_1", name: "Test user", type: "person" },
+        current_tool_access: {
+          search: { status: "available" },
+          future_tool: { status: "provider_defined" },
+        },
+      },
+    });
+
+    expect(notionCapabilities(self.current_tool_access, new Set(["notion-search"]))).toEqual([
+      "notion.search",
+    ]);
   });
 
   it("derives semantic Google capabilities from exact read-only grants", () => {
