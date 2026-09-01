@@ -368,6 +368,12 @@ describe("production runtime", () => {
     expect(systemPrompt).not.toContain("`connect google`");
     expect(systemPrompt).toContain("call connections.list and answer only from its result");
     expect(systemPrompt).toContain("call connections.connect for Google or Notion");
+    expect(systemPrompt).toContain(
+      "A connection link exists only after a successful connections.connect tool result in this run.",
+    );
+    expect(systemPrompt).toContain(
+      "does not explicitly name Google or Notion, ask which provider",
+    );
     expect(systemPrompt).not.toContain("Connected account status");
     expect(systemPrompt).toContain(
       "When multiple exist, never choose one arbitrarily",
