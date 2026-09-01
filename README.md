@@ -1,6 +1,6 @@
 # Annie
 
-Annie is a single-user personal assistant that lives in iMessage. It receives messages through a Sendblue Free Sandbox line, runs a bounded TypeScript agent loop, and exposes eight narrow tools for Gmail, Google Workspace, Notion, and account connections.
+Annie is a single-user personal assistant that lives in iMessage. It receives messages through a Sendblue Free Sandbox line and runs a bounded TypeScript agent loop with eight narrow provider tools plus two account-connection controls.
 
 This is deliberately not a general-purpose bot framework. It is built around one trusted sender, one assistant line, durable local state, and conservative provider-write semantics.
 
@@ -8,13 +8,13 @@ This is deliberately not a general-purpose bot framework. It is built around one
 
 - Read Gmail, calendars, Drive, contacts, and tasks from connected Google accounts.
 - Search and fetch content from connected Notion workspaces.
-- Create Gmail drafts, send an explicit draft, create one Notion page, or narrowly update a Notion page when the current request authorizes the write.
+- Create one Notion page or narrowly update a Notion page when the current request authorizes the write.
 - Connect multiple Google accounts and a Notion workspace through signed OAuth links.
 - Send an optional read-only morning brief at 08:00 America/Los_Angeles.
 - Maintain one bounded `MEMORY.md` document for durable user preferences.
 - Render every run as a redacted, replayable trace.
 
-Annie cannot delete, archive, move, or invoke arbitrary provider methods.
+Gmail is read-only. Annie cannot delete, archive, move, or invoke arbitrary provider methods.
 
 ## Safety model
 
@@ -28,7 +28,7 @@ The service controls real messaging and productivity accounts, so its safety rul
 - Every provider mutation gets a durable write intent before dispatch.
 - An ambiguous provider write is never retried automatically.
 - Provider credentials, wire payloads, account IDs, and SDK clients never enter the model context.
-- The production registry stays fixed at eight tools.
+- The production provider registry stays fixed at eight tools; two separate controls list and connect accounts.
 
 See [Architecture](docs/architecture.md) for the complete invariants and crash semantics.
 
