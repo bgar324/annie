@@ -159,7 +159,7 @@ export async function createRuntime(
       connections,
       clients:
         overrides.notionClients ??
-        new HostedNotionClientProvider(config, refresh, traces, connections),
+        new HostedNotionClientProvider(config, refresh, traces),
       runs,
       writes,
     });

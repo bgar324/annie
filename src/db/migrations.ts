@@ -669,6 +669,30 @@ const MIGRATIONS: readonly Migration[] = [
       WHERE provider = 'google';
     `,
   },
+  {
+    version: 7,
+    sql: `
+      UPDATE connections
+      SET provider_state_json = json_remove(
+            provider_state_json,
+            '$.notionToolSchemaHashes'
+          ),
+          updated_at_ms = CAST(strftime('%s', 'now') AS INTEGER) * 1000
+      WHERE provider = 'notion'
+        AND json_type(provider_state_json, '$.notionToolSchemaHashes') IS NOT NULL;
+
+      UPDATE connections
+      SET status = 'healthy',
+          health_generation = health_generation + 1,
+          retry_at_ms = NULL,
+          last_error_code = NULL,
+          last_error_summary = NULL,
+          updated_at_ms = CAST(strftime('%s', 'now') AS INTEGER) * 1000
+      WHERE provider = 'notion'
+        AND status = 'reconnect_required'
+        AND last_error_code IN ('schema_drift', 'tool_unavailable');
+    `,
+  },
 ];
 
 export function runMigrations(

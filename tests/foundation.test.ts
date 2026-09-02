@@ -620,6 +620,94 @@ describe("SQLite foundation", () => {
     }
   });
 
+  it("restores only Notion connections tripped by the removed schema guard", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    runMigrations(db, 6);
+    db.exec(`
+      INSERT INTO connections(
+        id, provider, provider_account_id, safe_label, normalized_safe_label,
+        status, credential_generation, health_generation, checked_at_ms,
+        last_success_at_ms, retry_at_ms, last_error_code, last_error_summary,
+        safe_metadata_json, provider_state_json, created_at_ms, updated_at_ms
+      ) VALUES
+        (
+          'notion_schema', 'notion', 'workspace_schema', 'Schema', 'schema',
+          'reconnect_required', 1, 2, 1, 1, NULL, 'schema_drift', 'old guard',
+          '{}', '{"notionToolSchemaHashes":{"notion-search":"old"},"tokenEndpoint":"https://mcp.notion.test/token"}', 1, 1
+        ),
+        (
+          'notion_tool', 'notion', 'workspace_tool', 'Tool', 'tool',
+          'reconnect_required', 1, 4, 1, 1, NULL, 'tool_unavailable', 'old guard',
+          '{}', '{"notionToolSchemaHashes":{"notion-fetch":"old"},"tokenEndpoint":"https://mcp.notion.test/token"}', 1, 1
+        ),
+        (
+          'notion_auth', 'notion', 'workspace_auth', 'Auth', 'auth',
+          'reconnect_required', 1, 6, 1, 1, NULL, 'invalid_grant', 'revoked',
+          '{}', '{"notionToolSchemaHashes":{"notion-fetch":"old"},"tokenEndpoint":"https://mcp.notion.test/token"}', 1, 1
+        ),
+        (
+          'google_schema', 'google', 'google_sub', 'Google', 'google',
+          'reconnect_required', 1, 8, 1, 1, NULL, 'schema_drift', 'unrelated',
+          '{}', '{"notionToolSchemaHashes":{"notion-search":"old"}}', 1, 1
+        );
+    `);
+
+    try {
+      runMigrations(db);
+
+      expect(
+        db.prepare<[], {
+          id: string;
+          status: string;
+          health_generation: number;
+          last_error_code: string | null;
+          last_error_summary: string | null;
+          provider_state_json: string;
+        }>(`
+          SELECT id, status, health_generation, last_error_code,
+                 last_error_summary, provider_state_json
+          FROM connections ORDER BY id
+        `).all(),
+      ).toEqual([
+        {
+          id: "google_schema",
+          status: "reconnect_required",
+          health_generation: 8,
+          last_error_code: "schema_drift",
+          last_error_summary: "unrelated",
+          provider_state_json: '{"notionToolSchemaHashes":{"notion-search":"old"}}',
+        },
+        {
+          id: "notion_auth",
+          status: "reconnect_required",
+          health_generation: 6,
+          last_error_code: "invalid_grant",
+          last_error_summary: "revoked",
+          provider_state_json: '{"tokenEndpoint":"https://mcp.notion.test/token"}',
+        },
+        {
+          id: "notion_schema",
+          status: "healthy",
+          health_generation: 3,
+          last_error_code: null,
+          last_error_summary: null,
+          provider_state_json: '{"tokenEndpoint":"https://mcp.notion.test/token"}',
+        },
+        {
+          id: "notion_tool",
+          status: "healthy",
+          health_generation: 5,
+          last_error_code: null,
+          last_error_summary: null,
+          provider_state_json: '{"tokenEndpoint":"https://mcp.notion.test/token"}',
+        },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
 });
 
 describe("trace projection", () => {

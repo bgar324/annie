@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -8,11 +7,9 @@ import type {
 } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { canonicalJson } from "../core/json.js";
 import type { RuntimeConfig } from "../config.js";
 import { ModelSafeError } from "../core/errors.js";
 import type { RefreshCoordinator } from "../connections/refresh.js";
-import type { ConnectionStore } from "../connections/store.js";
 import type { ConnectionId, TraceId } from "../core/ids.js";
 import type { NotionCredential } from "../oauth/notion.js";
 import { createTracedProviderFetch, type ProviderFetch } from "../providers/fetch.js";
@@ -37,12 +34,6 @@ export type NotionUpstreamTool =
   | "notion-fetch"
   | "notion-create-pages"
   | "notion-update-page";
-const allowedNotionToolNames = [
-  "notion-search",
-  "notion-fetch",
-  "notion-create-pages",
-  "notion-update-page",
-] as const satisfies readonly NotionUpstreamTool[];
 
 const allowedNotionTools: Record<NotionUpstreamTool, "read" | "write"> = {
   "notion-search": "read",
@@ -152,18 +143,11 @@ export class HostedNotionClientProvider implements NotionClientProvider {
   readonly #config: RuntimeConfig;
   readonly #refresh: RefreshCoordinator;
   readonly #traces: TraceStore;
-  readonly #connections: ConnectionStore;
 
-  constructor(
-    config: RuntimeConfig,
-    refresh: RefreshCoordinator,
-    traces: TraceStore,
-    connections: ConnectionStore,
-  ) {
+  constructor(config: RuntimeConfig, refresh: RefreshCoordinator, traces: TraceStore) {
     this.#config = config;
     this.#refresh = refresh;
     this.#traces = traces;
-    this.#connections = connections;
   }
 
   async withSession<T>(
@@ -192,12 +176,6 @@ export class HostedNotionClientProvider implements NotionClientProvider {
     });
     try {
       const tools = await listEveryNotionTool(client);
-      reconcileNotionToolSchemaHashes({
-        connections: this.#connections,
-        connectionId,
-        traceId,
-        tools,
-      });
       return await operation(
         new NotionMcpSession({ client, tools, traceId, connectionId, traces: this.#traces }),
       );
@@ -249,76 +227,6 @@ export async function listEveryNotionTool(
     cursor = page.nextCursor;
   }
   throw new NotionMcpError("tool_list_too_large", "Notion returned more than 100 tool-list pages");
-}
-
-export function reconcileNotionToolSchemaHashes(input: {
-  connections: ConnectionStore;
-  connectionId: ConnectionId;
-  traceId: TraceId;
-  tools: ReadonlyMap<string, NotionToolDescriptor>;
-}): void {
-  const connection = input.connections.getRequired(input.connectionId);
-  const liveHashes: Record<NotionUpstreamTool, string> = {
-    "notion-search": "",
-    "notion-fetch": "",
-    "notion-create-pages": "",
-    "notion-update-page": "",
-  };
-  for (const name of allowedNotionToolNames) {
-    const descriptor = input.tools.get(name);
-    if (descriptor === undefined) {
-      requireNotionReconnect(input, connection.credentialGeneration, "tool_unavailable");
-      throw new NotionMcpError(
-        "tool_unavailable",
-        `The workspace no longer advertises ${name}; reconnect it before use`,
-      );
-    }
-    liveHashes[name] = createHash("sha256")
-      .update(canonicalJson(descriptor.inputSchema))
-      .digest("hex");
-  }
-
-  const pinned = connection.providerState.notionToolSchemaHashes;
-  if (pinned === undefined) {
-    const updated = input.connections.markHealthy({
-      connectionId: connection.id,
-      credentialGeneration: connection.credentialGeneration,
-      traceId: input.traceId,
-      providerState: { ...connection.providerState, notionToolSchemaHashes: liveHashes },
-    });
-    if (!updated) {
-      throw new NotionMcpError(
-        "schema_drift",
-        "The Notion connection changed while its tool schemas were being pinned",
-      );
-    }
-    return;
-  }
-  if (canonicalJson(pinned) !== canonicalJson(liveHashes)) {
-    requireNotionReconnect(input, connection.credentialGeneration, "schema_drift");
-    throw new NotionMcpError(
-      "schema_drift",
-      "Notion changed an allowlisted tool schema; reconnect the workspace before use",
-    );
-  }
-}
-
-function requireNotionReconnect(
-  input: {
-    connections: ConnectionStore;
-    connectionId: ConnectionId;
-    traceId: TraceId;
-  },
-  credentialGeneration: number,
-  code: "tool_unavailable" | "schema_drift",
-): void {
-  input.connections.markReconnectRequired({
-    connectionId: input.connectionId,
-    credentialGeneration,
-    traceId: input.traceId,
-    errorCode: code,
-    errorSummary: "Notion's allowlisted tool contract changed; reconnect the workspace",
-  });
 }
 
 type NotionMcpErrorCode =

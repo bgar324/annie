@@ -79,7 +79,7 @@ Create one OAuth client per connection. Key accounts by verified OIDC `sub`, not
 
 ### Notion
 
-Use hosted Streamable HTTP and CIMD. Intersect the four exact upstream names with all `listTools()` pages and `current_tool_access`. Force `query_type: "internal"`. Wrap create as one page. Fail write calls closed when a live schema hash changes.
+Use hosted Streamable HTTP and CIMD. Intersect the four exact upstream names with all `listTools()` pages and `current_tool_access`. Force `query_type: "internal"`. Wrap create as one page. Validate each call against its live input schema, and reject an incompatible write before preparing its write intent or dispatching it. Schema changes and tool availability failures do not change connection health or require reconnection.
 
 ## Tests
 

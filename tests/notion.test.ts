@@ -17,7 +17,6 @@ import {
 import {
   NotionMcpError,
   NotionMcpSession,
-  reconcileNotionToolSchemaHashes,
   type NotionClientProvider,
   type NotionSession,
   type NotionToolDescriptor,
@@ -301,7 +300,7 @@ describe("Notion writes", () => {
 });
 
 describe("Notion MCP boundary", () => {
-  it("validates live schemas and emits semantic call-boundary traces", async () => {
+  it("live-validates calls without treating compatible additions as unhealthy", async () => {
     const harness = notionHarness();
     const connection = addNotionConnection(harness, "workspace_session", "Session");
     const traceId = newTraceId();
@@ -320,6 +319,7 @@ describe("Notion MCP boundary", () => {
             properties: {
               query: { type: "string" },
               query_type: { const: "internal" },
+              optional_filter: { type: "string" },
             },
             required: ["query", "query_type"],
             additionalProperties: false,
@@ -344,57 +344,16 @@ describe("Notion MCP boundary", () => {
       name: "notion-search",
       arguments: { query: "x", query_type: "internal" },
     });
+    expect(harness.connections.getRequired(connection.id)).toMatchObject({
+      status: "healthy",
+      providerState: {},
+    });
     const events = harness.traces.list(traceId);
     expect(events.map((event) => [event.component, event.event])).toEqual([
       ["notion_mcp", "tool_attempted"],
       ["notion_mcp", "tool_completed"],
     ]);
     expect(JSON.stringify(events)).not.toContain("query_type");
-  });
-
-  it("pins every allowlisted schema and requires reconnect on compatible drift", () => {
-    const harness = notionHarness();
-    const connection = addNotionConnection(harness, "workspace_schema", "Schema");
-    const tools = new Map<string, NotionToolDescriptor>(
-      [
-        "notion-search",
-        "notion-fetch",
-        "notion-create-pages",
-        "notion-update-page",
-      ].map((name) => [name, { name, inputSchema: { type: "object" } }]),
-    );
-
-    reconcileNotionToolSchemaHashes({
-      connections: harness.connections,
-      connectionId: connection.id,
-      traceId: newTraceId(),
-      tools,
-    });
-    expect(
-      harness.connections.getRequired(connection.id).providerState.notionToolSchemaHashes,
-    ).toEqual({
-      "notion-search": expect.stringMatching(/^[0-9a-f]{64}$/u),
-      "notion-fetch": expect.stringMatching(/^[0-9a-f]{64}$/u),
-      "notion-create-pages": expect.stringMatching(/^[0-9a-f]{64}$/u),
-      "notion-update-page": expect.stringMatching(/^[0-9a-f]{64}$/u),
-    });
-
-    tools.set("notion-search", {
-      name: "notion-search",
-      inputSchema: {
-        type: "object",
-        properties: { optional_filter: { type: "string" } },
-      },
-    });
-    expect(() =>
-      reconcileNotionToolSchemaHashes({
-        connections: harness.connections,
-        connectionId: connection.id,
-        traceId: newTraceId(),
-        tools,
-      }),
-    ).toThrowError(expect.objectContaining({ code: "schema_drift" }));
-    expect(harness.connections.getRequired(connection.id).status).toBe("reconnect_required");
   });
 
   it("registers exactly four narrow assistant tools and no destructive operation", () => {

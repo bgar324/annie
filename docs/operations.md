@@ -72,6 +72,8 @@ Migration 6 marks every existing Google connection `reconnect_required`, removes
 
 Google refresh tokens expire after seven days when an External app remains in Testing with non-identity scopes. Reconnect each Google account every seven days until the app moves to production. See [Refresh token expiration](https://developers.google.com/identity/protocols/oauth2#expiration).
 
+Migration 7 removes the retired Notion schema fingerprints and restores connections that the old schema guard marked `reconnect_required` with `schema_drift` or `tool_unavailable`. It leaves authorization failures unchanged.
+
 ## Run the daily brief
 
 Set `DAILY_BRIEF_ENABLED=true` to schedule one brief at 08:00 America/Los_Angeles.
