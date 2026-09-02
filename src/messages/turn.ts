@@ -20,6 +20,8 @@ import type { TraceStore } from "../tracing/store.js";
 import type { MessageEgressService } from "./egress.js";
 import type { FailureNotificationService } from "./failure.js";
 
+const explicitConnectToolCallId = "explicit_connection_request";
+
 interface InboundTurnRow {
   id: InboundId;
   text: string | null;
@@ -97,12 +99,34 @@ export class InboundTurnService {
         if (completed.phase !== "completed" || completed.finalResponse === null) {
           throw new Error(`Done inbound ${inbound.id} has no completed response`);
         }
-        const connectProvider = this.#connectProviderForRun(completed.id);
-        if (connectProvider !== undefined) {
+        const connectionRequest = this.#connectionRequestForRun(completed.id);
+        if (connectionRequest !== undefined) {
+          if (
+            completed.modelRequests === 0 &&
+            connectionRequest.toolCallId === explicitConnectToolCallId
+          ) {
+            const authorizedProvider = explicitConnectRequestProvider(userMessage);
+            const action = explicitConnectAction(connectionRequest.provider);
+            if (
+              authorizedProvider !== connectionRequest.provider ||
+              completed.finalResponse !== action.response
+            ) {
+              throw new Error(
+                `Explicit connection run ${completed.id} completed with inconsistent state`,
+              );
+            }
+            this.#runs.appendInfrastructureToolTurn({
+              runId: completed.id,
+              authorizationMessage: userMessage,
+              call: action.call,
+              result: action.result,
+              completion: action.response,
+            });
+          }
           this.#fulfillConnectTool(
             inbound,
             completed.id,
-            connectProvider,
+            connectionRequest.provider,
             completed.finalResponse,
           );
           return;
@@ -161,9 +185,14 @@ export class InboundTurnService {
         });
         return;
       }
-      const connectProvider = this.#connectProviderForRun(result.run.id);
-      if (connectProvider !== undefined) {
-        this.#fulfillConnectTool(inbound, result.run.id, connectProvider, result.response);
+      const connectionRequest = this.#connectionRequestForRun(result.run.id);
+      if (connectionRequest !== undefined) {
+        this.#fulfillConnectTool(
+          inbound,
+          result.run.id,
+          connectionRequest.provider,
+          result.response,
+        );
         return;
       }
       await this.#finishCompletedTurn(
@@ -274,17 +303,18 @@ export class InboundTurnService {
     });
     this.#runs.bindJob(run.id, job.id, job.leaseToken);
     this.#runs.appendInitialMessages(run.id, initialMessages);
-    const call = {
-      id: "explicit_connection_request",
-      name: "connections.connect",
-      argumentsJson: JSON.stringify({ provider }),
-    };
-    const result = {
-      provider,
-      connectionLinkWillBeAppended: true,
-    };
-    const response = `here's your new ${provider} connection link:`;
+    const { call, result, response } = explicitConnectAction(provider);
     if (run.phase === "completed") {
+      const completedRequest = this.#connectionRequestForRun(run.id);
+      if (
+        run.modelRequests !== 0 ||
+        run.finalResponse !== response ||
+        completedRequest === undefined ||
+        completedRequest.provider !== provider ||
+        completedRequest.toolCallId !== call.id
+      ) {
+        throw new Error(`Explicit connection run ${run.id} completed with inconsistent state`);
+      }
       this.#runs.appendInfrastructureToolTurn({
         runId: run.id,
         authorizationMessage,
@@ -292,11 +322,7 @@ export class InboundTurnService {
         result,
         completion: response,
       });
-      const completedProvider = this.#connectProviderForRun(run.id);
-      if (run.finalResponse !== response || completedProvider !== provider) {
-        throw new Error(`Explicit connection run ${run.id} completed with inconsistent state`);
-      }
-      this.#fulfillConnectTool(inbound, run.id, completedProvider, response);
+      this.#fulfillConnectTool(inbound, run.id, provider, response);
       return;
     }
     if (run.phase !== "running") {
@@ -353,10 +379,12 @@ export class InboundTurnService {
       : "connections.connect is allowed only in the first model response";
   }
 
-  #connectProviderForRun(runId: RunId): ConnectionProvider | undefined {
+  #connectionRequestForRun(
+    runId: RunId,
+  ): { provider: ConnectionProvider; toolCallId: string } | undefined {
     const rows = this.#db
-      .prepare<{ run_id: string }, { arguments_json: string }>(`
-        SELECT arguments_json FROM tool_executions
+      .prepare<{ run_id: string }, { arguments_json: string; tool_call_id: string }>(`
+        SELECT arguments_json, tool_call_id FROM tool_executions
         WHERE run_id = @run_id
           AND tool_name = 'connections.connect'
           AND status = 'succeeded'
@@ -368,7 +396,10 @@ export class InboundTurnService {
     }
     return rows[0] === undefined
       ? undefined
-      : parseConnectToolArguments(rows[0].arguments_json).provider;
+      : {
+          provider: parseConnectToolArguments(rows[0].arguments_json).provider,
+          toolCallId: rows[0].tool_call_id,
+        };
   }
 
   #hasConnectToolCall(runId: RunId): boolean {
@@ -451,6 +482,21 @@ export class InboundTurnService {
       audience: { kind: "inbound" },
     });
   }
+}
+
+function explicitConnectAction(provider: ConnectionProvider) {
+  return {
+    call: {
+      id: explicitConnectToolCallId,
+      name: "connections.connect",
+      argumentsJson: JSON.stringify({ provider }),
+    },
+    result: {
+      provider,
+      connectionLinkWillBeAppended: true,
+    },
+    response: `here's your new ${provider} connection link:`,
+  };
 }
 
 function inboundPayload(value: unknown): { inboundId: InboundId } {

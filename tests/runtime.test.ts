@@ -1481,7 +1481,7 @@ describe("production runtime", () => {
         content: "Send me a new Google reconnect link",
       });
     item.runtime.database.db
-      .prepare("UPDATE inbound_messages SET state = 'processing'")
+      .prepare("UPDATE inbound_messages SET state = 'done'")
       .run();
     item.runtime.database.db
       .prepare<{ now_ms: number }>(`
