@@ -1514,7 +1514,7 @@ describe("production runtime", () => {
     ).toBe(true);
   });
 
-  it("lets the model resolve a natural Google connection request and fulfills it once", async () => {
+  it("keeps a model-origin connection run unchanged when its call ID collides", async () => {
     const model = new FakeModel();
     model.responses.push(
       {
@@ -1523,7 +1523,7 @@ describe("production runtime", () => {
         providerState: null,
         toolCalls: [
           {
-            id: "connect_google",
+            id: "explicit_connection_request",
             name: "connections.connect",
             argumentsJson: '{"provider":"google"}',
           },
@@ -1556,7 +1556,7 @@ describe("production runtime", () => {
     expect(model.requests[1]?.messages.at(-2)).toEqual({
       role: "tool",
       content: '{"connectionLinkWillBeAppended":true,"provider":"google"}',
-      toolCallId: "connect_google",
+      toolCallId: "explicit_connection_request",
     });
     expect(model.requests[1]?.messages.at(-1)).toEqual({
       role: "system",
@@ -1588,16 +1588,29 @@ describe("production runtime", () => {
       item.runtime.database.db
         .prepare<
           [],
-          { executions: number; links: number; recovery_messages: number }
+          {
+            executions: number;
+            links: number;
+            recovery_messages: number;
+            failure_messages: number;
+          }
         >(`
           SELECT
             (SELECT COUNT(*) FROM tool_executions
              WHERE tool_name = 'connections.connect' AND status = 'succeeded') AS executions,
             (SELECT COUNT(*) FROM oauth_link_tokens WHERE purpose = 'connect') AS links,
-            (SELECT COUNT(*) FROM egress_messages WHERE purpose = 'recovery') AS recovery_messages
+            (SELECT COUNT(*) FROM egress_messages
+             WHERE purpose = 'recovery') AS recovery_messages,
+            (SELECT COUNT(*) FROM egress_messages
+             WHERE purpose = 'failure') AS failure_messages
         `)
         .get(),
-    ).toEqual({ executions: 1, links: 1, recovery_messages: 1 });
+    ).toEqual({
+      executions: 1,
+      links: 1,
+      recovery_messages: 1,
+      failure_messages: 0,
+    });
     expect(model.requests).toHaveLength(2);
   });
 
