@@ -15,7 +15,6 @@ import {
   type TraceId,
 } from "../src/core/ids.js";
 import {
-  NotionMcpError,
   NotionMcpSession,
   type NotionClientProvider,
   type NotionSession,
@@ -238,25 +237,59 @@ describe("Notion writes", () => {
     expect(writeStates(harness)).toEqual(["succeeded", "succeeded", "succeeded"]);
   });
 
-  it("fails closed on upstream schema drift before creating a write intent", async () => {
+  it("rejects an incompatible write before intent or MCP dispatch without changing health", async () => {
     const harness = notionHarness();
-    addNotionConnection(harness, "workspace_drift", "Drifted");
-    const fixture = sessionFixture(async () => {
-      throw new Error("The call must not be dispatched");
+    const connection = addNotionConnection(harness, "workspace_drift", "Drifted");
+    const context = toolContext(harness, "notion.create_page", "write");
+    const client = new Client({ name: "fixture", version: "1.0.0" });
+    const call = vi.spyOn(client, "callTool").mockResolvedValue({
+      content: [{ type: "text", text: "must not be returned" }],
     });
-    fixture.validate.mockImplementation(() => {
-      throw new NotionMcpError("schema_drift", "fixture drift");
+    const session = new NotionMcpSession({
+      client,
+      tools: new Map<string, NotionToolDescriptor>([
+        [
+          "notion-create-pages",
+          {
+            name: "notion-create-pages",
+            inputSchema: {
+              type: "object",
+              properties: {
+                pages: { type: "array" },
+                new_required_guard: { type: "string" },
+              },
+              required: ["pages", "new_required_guard"],
+              additionalProperties: false,
+            },
+          },
+        ],
+      ]),
+      traceId: context.traceId,
+      connectionId: connection.id,
+      traces: harness.traces,
     });
-    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const service = notionService(harness, fixedSessionProvider(session));
+    const healthBefore = harness.connections.getRequired(connection.id);
 
     await expect(
       service.createPage(
         { properties: { title: "Do not create" } },
-        toolContext(harness, "notion.create_page", "write"),
+        context,
       ),
     ).rejects.toMatchObject({ code: "schema_drift" });
-    expect(fixture.call).not.toHaveBeenCalled();
+
+    expect(call).not.toHaveBeenCalled();
     expect(writeStates(harness)).toEqual([]);
+    expect(harness.connections.getRequired(connection.id)).toMatchObject({
+      status: "healthy",
+      healthGeneration: healthBefore.healthGeneration,
+      lastErrorCode: null,
+    });
+    expect(
+      harness.traces
+        .list(context.traceId)
+        .filter((event) => event.component === "notion_mcp"),
+    ).toEqual([]);
   });
 
   it("marks a lost write response ambiguous and never repeats it", async () => {
@@ -300,60 +333,119 @@ describe("Notion writes", () => {
 });
 
 describe("Notion MCP boundary", () => {
-  it("live-validates calls without treating compatible additions as unhealthy", async () => {
+  it("accepts an additive optional read field and keeps the connection healthy", async () => {
     const harness = notionHarness();
     const connection = addNotionConnection(harness, "workspace_session", "Session");
-    const traceId = newTraceId();
+    const context = toolContext(harness, "notion.search", "read");
     const client = new Client({ name: "fixture", version: "1.0.0" });
     const call = vi.spyOn(client, "callTool").mockResolvedValue({
-      content: [{ type: "text", text: "ok" }],
+      structuredContent: { results: [] },
+      content: [],
     });
-    const tools = new Map<string, NotionToolDescriptor>([
-      [
-        "notion-search",
-        {
-          name: "notion-search",
-          inputSchema: {
-            $schema: "https://json-schema.org/draft/2020-12/schema",
-            type: "object",
-            properties: {
-              query: { type: "string" },
-              query_type: { const: "internal" },
-              optional_filter: { type: "string" },
-            },
-            required: ["query", "query_type"],
-            additionalProperties: false,
-          },
-        },
-      ],
-    ]);
     const session = new NotionMcpSession({
       client,
-      tools,
-      traceId,
+      tools: new Map<string, NotionToolDescriptor>([
+        [
+          "notion-search",
+          {
+            name: "notion-search",
+            inputSchema: {
+              $schema: "https://json-schema.org/draft/2020-12/schema",
+              type: "object",
+              properties: {
+                query: { type: "string" },
+                query_type: { const: "internal" },
+                page_size: { type: "integer" },
+                optional_filter: { type: "string" },
+              },
+              required: ["query", "query_type"],
+              additionalProperties: false,
+            },
+          },
+        ],
+      ]),
+      traceId: context.traceId,
       connectionId: connection.id,
       traces: harness.traces,
     });
+    const service = notionService(harness, fixedSessionProvider(session));
+    const healthBefore = harness.connections.getRequired(connection.id);
 
-    expect(() => session.validate("notion-search", { query: "x" })).toThrowError(
-      expect.objectContaining({ code: "schema_drift" }),
-    );
-    await session.call("notion-search", { query: "x", query_type: "internal" });
+    await expect(service.search({ query: "x", pageSize: 1 }, context)).resolves.toEqual({
+      workspace: { label: "Session" },
+      result: { results: [] },
+    });
 
     expect(call).toHaveBeenCalledWith({
       name: "notion-search",
-      arguments: { query: "x", query_type: "internal" },
+      arguments: { query: "x", query_type: "internal", page_size: 1 },
     });
     expect(harness.connections.getRequired(connection.id)).toMatchObject({
       status: "healthy",
-      providerState: {},
+      healthGeneration: healthBefore.healthGeneration,
+      lastErrorCode: null,
     });
-    const events = harness.traces.list(traceId);
-    expect(events.map((event) => [event.component, event.event])).toEqual([
-      ["notion_mcp", "tool_attempted"],
-      ["notion_mcp", "tool_completed"],
-    ]);
-    expect(JSON.stringify(events)).not.toContain("query_type");
+    expect(
+      harness.traces
+        .list(context.traceId)
+        .filter((event) => event.component === "notion_mcp")
+        .map((event) => event.event),
+    ).toEqual(["tool_attempted", "tool_completed"]);
+  });
+
+  it("fails only an incompatible read call and keeps the connection healthy", async () => {
+    const harness = notionHarness();
+    const connection = addNotionConnection(harness, "workspace_incompatible", "Incompatible");
+    const context = toolContext(harness, "notion.search", "read");
+    const client = new Client({ name: "fixture", version: "1.0.0" });
+    const call = vi.spyOn(client, "callTool").mockResolvedValue({
+      structuredContent: { results: [] },
+      content: [],
+    });
+    const session = new NotionMcpSession({
+      client,
+      tools: new Map<string, NotionToolDescriptor>([
+        [
+          "notion-search",
+          {
+            name: "notion-search",
+            inputSchema: {
+              type: "object",
+              properties: {
+                query: { type: "string" },
+                query_type: { const: "internal" },
+                page_size: { type: "integer" },
+                new_required_filter: { type: "string" },
+              },
+              required: ["query", "query_type", "new_required_filter"],
+              additionalProperties: false,
+            },
+          },
+        ],
+      ]),
+      traceId: context.traceId,
+      connectionId: connection.id,
+      traces: harness.traces,
+    });
+    const service = notionService(harness, fixedSessionProvider(session));
+    const healthBefore = harness.connections.getRequired(connection.id);
+
+    await expect(service.search({ query: "x", pageSize: 1 }, context)).rejects.toMatchObject({
+      code: "schema_drift",
+    });
+
+    expect(call).not.toHaveBeenCalled();
+    expect(writeStates(harness)).toEqual([]);
+    expect(harness.connections.getRequired(connection.id)).toMatchObject({
+      status: "healthy",
+      healthGeneration: healthBefore.healthGeneration,
+      lastErrorCode: null,
+    });
+    expect(
+      harness.traces
+        .list(context.traceId)
+        .filter((event) => event.component === "notion_mcp"),
+    ).toEqual([]);
   });
 
   it("registers exactly four narrow assistant tools and no destructive operation", () => {
