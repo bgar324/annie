@@ -397,6 +397,9 @@ describe("production runtime", () => {
     );
     expect(systemPrompt).toContain("Never fan out a provider write.");
     expect(systemPrompt).toContain("Merge multi-account read results into one answer.");
+    expect(systemPrompt).toContain(
+      "Deduplicate the same underlying item when it appears through more than one account. Keep distinct items even when their titles match.",
+    );
     expect(systemPrompt).not.toContain(
       "For non-calendar requests, ask for an exact safe label",
     );

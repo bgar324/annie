@@ -57,7 +57,7 @@ Use **Add Google account** in the local UI for a new Google account. To reconnec
 - connect or reconnect a Notion workspace;
 - list connected accounts, safe labels, and capabilities.
 
-Repeat the connection request for each account or workspace. Normal read requests search every healthy capable account and merge the results. Use an exact safe label only to test or request one account.
+Repeat the connection request for each account or workspace. Normal read requests search every healthy capable account, deduplicate the same underlying items, and merge the results. Use an exact safe label only to test or request one account.
 
 ## Send a message through the loop
 

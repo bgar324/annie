@@ -141,7 +141,7 @@ Each provider tool call selects one connection in one of two ways:
 
 The adapter rejects zero matches as connection-required and multiple unlabeled matches as ambiguous. This is a per-call safety boundary, not a user-facing account picker.
 
-For an unscoped read, the inbound agent first calls `connections.list`. It then calls the required read tool once for each healthy capable account with its exact safe label. The agent merges the results and omits account details unless they disambiguate a result or explain a source failure. An explicit safe label scopes a read.
+For an unscoped read, the inbound agent first calls `connections.list`. It then calls the required read tool once for each healthy capable account with its exact safe label. The agent merges the results and deduplicates the same underlying item across accounts. It keeps distinct items that happen to share a title. The answer omits account details unless they disambiguate a result or explain a source failure. An explicit safe label scopes a read.
 
 Writes never fan out. The agent asks for a target only when neither the request nor a preceding read establishes one. One connection's refresh or health transition never changes another connection.
 
