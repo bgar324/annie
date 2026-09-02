@@ -378,13 +378,27 @@ describe("production runtime", () => {
     );
     expect(systemPrompt).not.toContain("Connected account status");
     expect(systemPrompt).toContain(
-      "When multiple exist, never choose one arbitrarily",
+      "Treat every healthy capable account as one logical source for read requests.",
     );
     expect(systemPrompt).toContain(
-      "A calendar request with no exact account label covers every healthy Google account with calendar access.",
+      "Never ask the user which account to search merely because multiple accounts are connected.",
     );
     expect(systemPrompt).toContain(
-      "Merge their events into one chronological agenda",
+      "Choose the relevant provider or providers yourself from the request.",
+    );
+    expect(systemPrompt).toContain(
+      "Do not make the user identify a read source that the tools can discover.",
+    );
+    expect(systemPrompt).toContain(
+      "If the user names an exact safe account label, scope the read to it.",
+    );
+    expect(systemPrompt).toContain(
+      "For a resource handle returned by a search, use the safe account label from that result.",
+    );
+    expect(systemPrompt).toContain("Never fan out a provider write.");
+    expect(systemPrompt).toContain("Merge multi-account read results into one answer.");
+    expect(systemPrompt).not.toContain(
+      "For non-calendar requests, ask for an exact safe label",
     );
     expect(systemPrompt?.endsWith(assistantResponseFormatReminder)).toBe(true);
     const providerToolNames = [
@@ -403,6 +417,29 @@ describe("production runtime", () => {
       "connections.list",
       "connections.connect",
     ]);
+    const gmailSearchTool = model.requests[0]?.tools.find((tool) => tool.name === "gmail.search");
+    expect(gmailSearchTool?.description).toContain("automatic multi-account reads");
+    expect(gmailSearchTool?.description).not.toContain("Specify account");
+    const googleSearchTool = model.requests[0]?.tools.find((tool) => tool.name === "google.search");
+    expect(googleSearchTool?.description).toContain("automatic multi-account reads");
+    const notionSearchTool = model.requests[0]?.tools.find((tool) => tool.name === "notion.search");
+    expect(notionSearchTool?.description).toContain("automatic multi-account reads");
+    const gmailReadThreadTool = model.requests[0]?.tools.find(
+      (tool) => tool.name === "gmail.read_thread",
+    );
+    expect(gmailReadThreadTool?.description).toContain(
+      "source account returned by gmail.search",
+    );
+    const googleReadTool = model.requests[0]?.tools.find((tool) => tool.name === "google.read");
+    expect(googleReadTool?.description).toContain("source account returned by google.search");
+    const notionFetchTool = model.requests[0]?.tools.find((tool) => tool.name === "notion.fetch");
+    expect(notionFetchTool?.description).toContain(
+      "source workspace returned by notion.search",
+    );
+    const connectionListTool = model.requests[0]?.tools.find(
+      (tool) => tool.name === "connections.list",
+    );
+    expect(connectionListTool?.description).toContain("automatic multi-account reads");
     expect(readFileSync(join(item.directory, "MEMORY.md"), "utf8")).toContain(
       "User prefers concise replies",
     );

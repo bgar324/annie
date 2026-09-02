@@ -58,7 +58,7 @@ export class GmailToolService {
       {
         definition: {
           name: "gmail.search",
-          description: "Search one connected Gmail account. Specify account when more than one account is connected.",
+          description: "Search one connected Gmail account. For automatic multi-account reads, call once per exact safe label returned by connections.list.",
           parameters: {
             type: "object",
             properties: {
@@ -77,7 +77,7 @@ export class GmailToolService {
       {
         definition: {
           name: "gmail.read_thread",
-          description: "Read a bounded, normalized Gmail thread from one connected account.",
+          description: "Read a bounded, normalized Gmail thread from the source account returned by gmail.search.",
           parameters: {
             type: "object",
             properties: {

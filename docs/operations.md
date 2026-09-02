@@ -66,7 +66,7 @@ Connect accounts from iMessage:
 3. Ask Annie to connect Notion once for each Notion workspace. Notion does not need a static API key or integration token.
 4. Ask which accounts are connected to list their safe labels, health states, and semantic capabilities.
 
-When multiple accounts grant the same capability, include the exact safe label in the request. If you request all accounts, the agent calls each healthy account separately. It never chooses one account silently.
+Normal read requests need no account label. Annie searches every healthy capable account separately and merges the results. Include an exact safe label only to scope a read to one account. Writes stay within one account and require a clear target.
 
 Migration 6 marks every existing Google connection `reconnect_required`, removes its old capabilities, and queues one signed reconnect link. The callback rejects a grant that includes a write scope or omits any scope in the fixed bundle.
 

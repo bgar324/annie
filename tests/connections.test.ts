@@ -110,7 +110,7 @@ describe("multi-account connection store", () => {
     expect(encrypted.every((row) => !row.ciphertext.includes(Buffer.from("refresh-account")))).toBe(true);
 
     expect(() => harness.router.select({ capabilities: ["gmail.read"] })).toThrow(
-      ConnectionRoutingError,
+      "Multiple healthy google connections grant gmail.read. This tool call requires one exact safe label: Work, Work (2)",
     );
     expect(
       harness.router.select({ capabilities: ["gmail.read"], account: "work (2)" }).id,

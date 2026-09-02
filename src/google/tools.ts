@@ -166,7 +166,7 @@ export class GoogleWorkspaceToolService {
       {
         definition: {
           name: "google.search",
-          description: "Run one bounded read-only search batch against Calendar, Drive, Contacts, or Tasks in one connected Google account. Each product may appear once.",
+          description: "Run one bounded read-only search batch against Calendar, Drive, Contacts, or Tasks in one connected Google account. For automatic multi-account reads, call once per exact safe label returned by connections.list. Each product may appear once.",
           parameters: searchJsonSchema,
         },
         operationClass: "read",
@@ -176,7 +176,7 @@ export class GoogleWorkspaceToolService {
       {
         definition: {
           name: "google.read",
-          description: "Read one Drive file, Google contact, or Google task from one connected account using a resource handle returned by google.search.",
+          description: "Read one Drive file, Google contact, or Google task from the source account returned by google.search.",
           parameters: readJsonSchema,
         },
         operationClass: "read",

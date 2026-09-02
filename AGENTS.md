@@ -13,6 +13,7 @@ This service controls real Google Workspace, Notion, and iMessage accounts. Pres
 - Never retry or replay an ambiguous provider write.
 - Never expose provider SDK clients, wire payloads, tokens, connection IDs, or provider account IDs to the model.
 - Select an account only by one exact safe label or one unambiguous healthy capable connection.
+- Treat healthy capable accounts as one logical source for unscoped reads. Enumerate exact safe labels, call each account separately, and merge the results. Never ask the user to choose an account only because several are connected. Keep writes single-account and ask only when the target cannot be inferred safely.
 - Change only the affected connection's health.
 - Keep `MEMORY.md` as the only canonical long-term memory file.
 - Keep the production registry at exactly eight tools. Do not expose destructive or catch-all provider methods.
@@ -95,7 +96,7 @@ Required regression cases include:
 - persisted jobs after restart;
 - daily brief 08:00 scheduling across DST, restart, stale-job recovery, and exhausted leases;
 - daily brief six-tool read-only enforcement, per-account product coverage, and stale or disabled egress cancellation;
-- one-account selection and multi-account ambiguity;
+- exact per-call account selection and automatic multi-account read coverage;
 - reconnect identity mismatch;
 - expired and completed signed links;
 - refresh generation races;

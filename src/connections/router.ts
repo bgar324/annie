@@ -72,7 +72,7 @@ export class ConnectionRouter {
     if (healthy.length > 1) {
       throw new ConnectionRoutingError({
         code: "connection_ambiguous",
-        message: `Choose a ${provider} account for ${capabilitySummary}: ${healthy
+        message: `Multiple healthy ${provider} connections grant ${capabilitySummary}. This tool call requires one exact safe label: ${healthy
           .map((connection) => connection.safeLabel)
           .join(", ")}`,
         labels: healthy.map((connection) => connection.safeLabel),

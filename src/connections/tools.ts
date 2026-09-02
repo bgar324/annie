@@ -40,7 +40,7 @@ export function connectionTools(connections: ConnectionStore): readonly Register
       definition: {
         name: "connections.list",
         description:
-          "List the accounts connected to Annie right now, including each safe label, provider, health status, and capabilities. Use this as the authoritative source for connection questions.",
+          "List the accounts connected to Annie right now, including each safe label, provider, health status, and capabilities. Use this as the authoritative source for connection questions and to discover exact safe labels before automatic multi-account reads.",
         parameters: {
           type: "object",
           properties: {},

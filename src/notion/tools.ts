@@ -169,7 +169,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.search",
-          description: "Search internal content in one connected Notion workspace.",
+          description: "Search internal content in one connected Notion workspace. For automatic multi-account reads, call once per exact safe label returned by connections.list.",
           parameters: {
             type: "object",
             properties: {
@@ -188,7 +188,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.fetch",
-          description: "Fetch a Notion page, database, data source, view, or block by ID or URL.",
+          description: "Fetch a Notion page, database, data source, view, or block from the source workspace returned by notion.search.",
           parameters: {
             type: "object",
             properties: {

@@ -134,12 +134,16 @@ Notion uses one hosted Streamable HTTP MCP session per selected workspace operat
 
 Credentials are encrypted at rest with AES-256-GCM under `CREDENTIAL_ENCRYPTION_KEY`. Safe metadata and semantic capabilities are stored separately from ciphertext. One Google connection can grant `gmail.read`, `calendar.read`, `drive.read`, `contacts.read`, and `tasks.read`. Google connections are keyed by verified OIDC subject. Notion connections are keyed by the authenticated workspace identity.
 
-A tool can select a connection in two ways:
+Each provider tool call selects one connection in one of two ways:
 
 1. An exact safe label names one healthy, capable connection.
 2. No label is supplied and exactly one healthy, capable connection exists.
 
-Zero matches fail with a connection-required result. More than one match fails as ambiguous and asks for an exact safe label. One connection's refresh or health transition never changes another connection.
+The adapter rejects zero matches as connection-required and multiple unlabeled matches as ambiguous. This is a per-call safety boundary, not a user-facing account picker.
+
+For an unscoped read, the inbound agent first calls `connections.list`. It then calls the required read tool once for each healthy capable account with its exact safe label. The agent merges the results and omits account details unless they disambiguate a result or explain a source failure. An explicit safe label scopes a read.
+
+Writes never fan out. The agent asks for a target only when neither the request nor a preceding read establishes one. One connection's refresh or health transition never changes another connection.
 
 Google and Notion token refreshes use credential generations and refresh leases. A stale refresh result cannot overwrite newer credentials. A crash after refresh dispatch is treated as ambiguous because the provider may have rotated the refresh token; that connection requires browser reconnection instead of an automatic retry.
 
