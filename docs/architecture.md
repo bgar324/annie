@@ -110,7 +110,7 @@ Internal tool names use dots. The OpenAI-compatible adapter alone converts dots 
 
 Only the six provider reads explicitly registered as `parallel_read` execute concurrently, up to the four-call response limit. Unmarked reads, both connection-control tools, and writes remain serial by default. Parallel results are persisted back to the transcript in model call order, and individual failures remain isolated.
 
-The production model is `deepseek-v4-flash` through DeepSeek's OpenAI-compatible chat-completions endpoint. The adapter enables thinking mode and uses high reasoning effort. One DeepSeek response may use up to 90 seconds. The 120-second whole-run deadline still bounds all model and tool work. The adapter replays each assistant wire message unchanged, so DeepSeek `reasoning_content` survives tool rounds. Direct deployed-model checks found that disabling thinking reduced latency but missed an explicit future-brief preference during memory maintenance. High reasoning remains the correctness-preserving default.
+The production model is `deepseek-v4-flash` through DeepSeek's OpenAI-compatible chat-completions endpoint with high reasoning effort. Each assistant wire message is replayed unchanged so DeepSeek `reasoning_content` survives tool rounds. Direct deployed-model checks found that disabling thinking reduced latency but missed an explicit future-brief preference during memory maintenance, so high reasoning remains the correctness-preserving default. One DeepSeek response may use up to 90 seconds, still bounded by the 120-second whole-run deadline.
 
 ## Production tools
 

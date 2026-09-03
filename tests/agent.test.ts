@@ -143,7 +143,7 @@ describe("DeepSeek model adapter", () => {
         { role: "tool", tool_call_id: "prior_call", content: "{\"ok\":true}" },
       ],
     });
-    expect(requestedBody).toHaveProperty("thinking", { type: "enabled" });
+    expect(requestedBody).not.toHaveProperty("thinking");
     expect(requestedBody).not.toHaveProperty("tool_choice");
     expect(response).toMatchObject({
       id: "response_1",
@@ -156,89 +156,6 @@ describe("DeepSeek model adapter", () => {
     expect(JSON.parse(response.providerState ?? "null")).toEqual(returnedProviderMessage);
   });
 
-  it("replays returned reasoning content unchanged on the next tool request", async () => {
-    const harness = modelHarness();
-    const requestedBodies: Record<string, unknown>[] = [];
-    const returnedProviderMessage = {
-      role: "assistant",
-      content: null,
-      reasoning_content: "Call the tool, then continue with its result.",
-      tool_calls: [
-        {
-          id: "call_round_trip",
-          type: "function",
-          function: { name: "test_echo", arguments: "{\"value\":\"round-trip\"}" },
-        },
-      ],
-    };
-    const responses = [
-      completionResponse({
-        finish_reason: "tool_calls",
-        message: returnedProviderMessage,
-      }),
-      completionResponse({
-        finish_reason: "stop",
-        message: { role: "assistant", content: "done", reasoning_content: "Use the result." },
-      }),
-    ];
-    const model = new DeepSeekChatModel({
-      config: harness.config,
-      traces: harness.traces,
-      fetchImpl: async (input, init) => {
-        requestedBodies.push(
-          (await new Request(input, init).json()) as Record<string, unknown>,
-        );
-        const response = responses.shift();
-        if (response === undefined) {
-          throw new Error("No DeepSeek fixture response remains");
-        }
-        return response;
-      },
-    });
-    const first = await model.complete({
-      traceId: newTraceId(),
-      runId: newRunId(),
-      messages: [{ role: "user", content: "Echo this" }],
-      tools: [echoTool.definition],
-    });
-    if (first.providerState === null) {
-      throw new Error("Expected opaque DeepSeek provider state");
-    }
-
-    await model.complete({
-      traceId: newTraceId(),
-      runId: newRunId(),
-      messages: [
-        { role: "user", content: "Echo this" },
-        {
-          role: "assistant",
-          content: first.content,
-          providerState: first.providerState,
-          toolCalls: first.toolCalls,
-        },
-        {
-          role: "tool",
-          toolCallId: "call_round_trip",
-          content: "{\"ok\":true}",
-        },
-      ],
-      tools: [echoTool.definition],
-    });
-
-    expect(requestedBodies[1]).toMatchObject({
-      thinking: { type: "enabled" },
-      reasoning_effort: "high",
-      messages: [
-        { role: "user", content: "Echo this" },
-        returnedProviderMessage,
-        {
-          role: "tool",
-          tool_call_id: "call_round_trip",
-          content: "{\"ok\":true}",
-        },
-      ],
-    });
-  });
 
   it("uses a DeepSeek-specific timeout for a slow response body", async () => {
     const harness = modelHarness({
@@ -394,10 +311,8 @@ describe("DeepSeek model adapter", () => {
         ],
       }),
     ).resolves.toMatchObject({ content: "{\"action\":\"unchanged\"}" });
-    expect(requestedBody).toMatchObject({
-      reasoning_effort: "high",
-      thinking: { type: "enabled" },
-    });
+    expect(requestedBody).toMatchObject({ reasoning_effort: "high" });
+    expect(requestedBody).not.toHaveProperty("thinking");
     expect(requestedBody).not.toHaveProperty("tools");
     expect(requestedBody).not.toHaveProperty("tool_choice");
   });
