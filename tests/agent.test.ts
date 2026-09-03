@@ -156,11 +156,94 @@ describe("DeepSeek model adapter", () => {
     expect(JSON.parse(response.providerState ?? "null")).toEqual(returnedProviderMessage);
   });
 
+  it("replays returned reasoning content unchanged on the next tool request", async () => {
+    const harness = modelHarness();
+    const requestedBodies: Record<string, unknown>[] = [];
+    const returnedProviderMessage = {
+      role: "assistant",
+      content: null,
+      reasoning_content: "Call the tool, then continue with its result.",
+      tool_calls: [
+        {
+          id: "call_round_trip",
+          type: "function",
+          function: { name: "test_echo", arguments: "{\"value\":\"round-trip\"}" },
+        },
+      ],
+    };
+    const responses = [
+      completionResponse({
+        finish_reason: "tool_calls",
+        message: returnedProviderMessage,
+      }),
+      completionResponse({
+        finish_reason: "stop",
+        message: { role: "assistant", content: "done", reasoning_content: "Use the result." },
+      }),
+    ];
+    const model = new DeepSeekChatModel({
+      config: harness.config,
+      traces: harness.traces,
+      fetchImpl: async (input, init) => {
+        requestedBodies.push(
+          (await new Request(input, init).json()) as Record<string, unknown>,
+        );
+        const response = responses.shift();
+        if (response === undefined) {
+          throw new Error("No DeepSeek fixture response remains");
+        }
+        return response;
+      },
+    });
+    const first = await model.complete({
+      traceId: newTraceId(),
+      runId: newRunId(),
+      messages: [{ role: "user", content: "Echo this" }],
+      tools: [echoTool.definition],
+    });
+    if (first.providerState === null) {
+      throw new Error("Expected opaque DeepSeek provider state");
+    }
+
+    await model.complete({
+      traceId: newTraceId(),
+      runId: newRunId(),
+      messages: [
+        { role: "user", content: "Echo this" },
+        {
+          role: "assistant",
+          content: first.content,
+          providerState: first.providerState,
+          toolCalls: first.toolCalls,
+        },
+        {
+          role: "tool",
+          toolCallId: "call_round_trip",
+          content: "{\"ok\":true}",
+        },
+      ],
+      tools: [echoTool.definition],
+    });
+
+    expect(requestedBodies[1]).toMatchObject({
+      reasoning_effort: "high",
+      messages: [
+        { role: "user", content: "Echo this" },
+        returnedProviderMessage,
+        {
+          role: "tool",
+          tool_call_id: "call_round_trip",
+          content: "{\"ok\":true}",
+        },
+      ],
+    });
+    expect(requestedBodies[1]).not.toHaveProperty("thinking");
+  });
 
   it("uses a DeepSeek-specific timeout for a slow response body", async () => {
     const harness = modelHarness({
-      PROVIDER_REQUEST_TIMEOUT_MS: "20",
-      DEEPSEEK_REQUEST_TIMEOUT_MS: "100",
+      PROVIDER_REQUEST_TIMEOUT_MS: "30",
+      DEEPSEEK_REQUEST_TIMEOUT_MS: "90",
     });
     const payload = new TextEncoder().encode(
       JSON.stringify({
@@ -175,6 +258,7 @@ describe("DeepSeek model adapter", () => {
       }),
     );
     const model = new DeepSeekChatModel({
+      // Scale the production 30s < response body < 90s relation to milliseconds.
       // Native AbortSignal.timeout and response-body cancellation require the platform clock.
       config: harness.config,
       traces: harness.traces,

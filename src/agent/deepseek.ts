@@ -300,8 +300,7 @@ function toDeepSeekToolName(name: string): string {
 }
 
 function providerRequestMetadata(response: Response): { providerRequestId?: string } {
-  const providerRequestId =
-    response.headers.get("x-request-id") ?? response.headers.get("x-goog-request-id");
+  const providerRequestId = response.headers.get("x-request-id");
   return providerRequestId === null ? {} : { providerRequestId };
 }
 
