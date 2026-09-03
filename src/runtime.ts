@@ -11,7 +11,7 @@ import { ConnectionRecoveryService } from "./connections/recovery.js";
 import { ConnectionRouter } from "./connections/router.js";
 import { ConnectionStore } from "./connections/store.js";
 import { connectionTools } from "./connections/tools.js";
-import { asEgressId } from "./core/ids.js";
+import { asEgressId, asRunId } from "./core/ids.js";
 import { openDatabase, type DatabaseHandle } from "./db/database.js";
 import type { GmailClientProvider } from "./gmail/client.js";
 import { GoogleGmailClientProvider } from "./gmail/client.js";
@@ -51,6 +51,9 @@ import { createTraceRedactor } from "./tracing/redaction.js";
 import { TraceRetentionService } from "./tracing/retention.js";
 import { TraceStore } from "./tracing/store.js";
 import { WriteStore } from "./writes/store.js";
+
+const memoryMaintenanceBudgetMs = 45_000;
+const memoryMaintenanceLeaseMarginMs = 5_000;
 
 export interface AssistantModel extends ChatModel, MemoryMaintenanceModel {}
 
@@ -201,7 +204,6 @@ export async function createRuntime(
       agent,
       runs,
       memory,
-      maintenance,
       connections,
       egress,
       failures,
@@ -219,7 +221,7 @@ export async function createRuntime(
         config.limits.recentMessageLimit,
       ),
       memory,
-      maintenance,
+      connections,
       recovery,
       egress,
       failures,
@@ -228,6 +230,21 @@ export async function createRuntime(
     const handlers: JobHandlers = {
       inbound: (job, context) => turn.handle(job, context),
       daily_brief: (job, context) => dailyBrief.handle(job, context),
+      memory_maintenance: async (job, context) => {
+        const runId = memoryMaintenancePayload(job.payload);
+        if (job.runId !== runId || job.subjectId !== runId) {
+          throw new Error("Memory maintenance job identity is inconsistent");
+        }
+        context.assertLease();
+        await maintenance.maintainRun({
+          runId,
+          deadlineAtMs: Math.min(
+            Date.now() + memoryMaintenanceBudgetMs,
+            job.leaseExpiresAtMs - memoryMaintenanceLeaseMarginMs,
+          ),
+        });
+        context.assertLease();
+      },
       egress_send: async (job, context) => {
         const payload = egressPayload(job.payload);
         context.assertLease();
@@ -393,6 +410,19 @@ function egressPayload(value: unknown): {
     egressId,
     sendPolicy: { kind: "daily_brief", expiresAtMs: sendPolicy.expiresAtMs },
   };
+}
+
+function memoryMaintenancePayload(value: unknown): ReturnType<typeof asRunId> {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    !("runId" in value) ||
+    typeof value.runId !== "string"
+  ) {
+    throw new Error("Memory maintenance job payload is invalid");
+  }
+  return asRunId(value.runId);
 }
 
 function assertProductionTools(tools: ToolRegistry): void {

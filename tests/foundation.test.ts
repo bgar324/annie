@@ -707,6 +707,89 @@ describe("SQLite foundation", () => {
       db.close();
     }
   });
+  it("preserves queued run children while adding durable memory jobs", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    runMigrations(db, 7);
+    db.exec(`
+      INSERT INTO jobs(
+        id, chat_id, type, subject_id, payload_json, status, attempts,
+        available_at_ms, lease_token, lease_expires_at_ms, trace_id, run_id,
+        inbound_sequence, last_error, created_at_ms, updated_at_ms
+      ) VALUES (
+        'job_daily_v7', '+15550000002', 'daily_brief', '2026-06-03',
+        '{"localDate":"2026-06-03","scheduledForMs":1}', 'succeeded', 1,
+        1, NULL, NULL, 'trace_daily_v7', 'run_daily_v7', NULL, NULL, 1, 1
+      );
+      INSERT INTO agent_runs(
+        id, inbound_id, scheduled_job_id, trace_id, phase, model_requests,
+        maintenance_requests, tool_calls, provider_writes, deadline_at_ms,
+        transcript_bytes, memory_maintenance_status, memory_before_digest,
+        memory_after_digest, ambiguous_write_id, final_response, failure_code,
+        created_at_ms, updated_at_ms
+      ) VALUES (
+        'run_daily_v7', NULL, 'job_daily_v7', 'trace_daily_v7', 'completed',
+        1, 0, 0, 0, 1000, 12, 'pending', NULL, NULL, NULL, 'brief', NULL, 1, 1
+      );
+      INSERT INTO agent_messages(
+        run_id, sequence, role, content, reasoning_content, tool_calls_json,
+        tool_call_id, provider_response_id, finish_reason, usage_json,
+        byte_count, created_at_ms
+      ) VALUES (
+        'run_daily_v7', 1, 'user', 'daily request', NULL, NULL, NULL, NULL,
+        NULL, NULL, 12, 1
+      );
+    `);
+
+    try {
+      runMigrations(db);
+
+      expect(
+        db.prepare<[], {
+          type: string;
+          scheduled_job_id: string;
+          content: string;
+        }>(`
+          SELECT jobs.type, agent_runs.scheduled_job_id, agent_messages.content
+          FROM agent_runs
+          JOIN jobs ON jobs.id = agent_runs.scheduled_job_id
+          JOIN agent_messages ON agent_messages.run_id = agent_runs.id
+          WHERE agent_runs.id = 'run_daily_v7'
+        `).get(),
+      ).toEqual({
+        type: "daily_brief",
+        scheduled_job_id: "job_daily_v7",
+        content: "daily request",
+      });
+      db.exec(`
+        INSERT INTO jobs(
+          id, chat_id, type, subject_id, payload_json, status, attempts,
+          available_at_ms, lease_token, lease_expires_at_ms, trace_id, run_id,
+          inbound_sequence, last_error, created_at_ms, updated_at_ms
+        ) VALUES (
+          'job_memory_v8', '+15550000002', 'memory_maintenance', 'run_daily_v7',
+          '{"runId":"run_daily_v7"}', 'pending', 0, 1, NULL, NULL,
+          'trace_daily_v7', 'run_daily_v7', NULL, NULL, 1, 1
+        );
+      `);
+      expect(
+        () =>
+          db.prepare(`
+            INSERT INTO jobs(
+              id, chat_id, type, subject_id, payload_json, status, attempts,
+              available_at_ms, trace_id, created_at_ms, updated_at_ms
+            ) VALUES (
+              'job_invalid_v8', '+15550000002', 'arbitrary_work', 'invalid',
+              '{}', 'pending', 0, 1, 'trace_invalid_v8', 1, 1
+            )
+          `).run(),
+      ).toThrow(/CHECK constraint failed/u);
+      expect(db.pragma("foreign_key_check")).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
 
 });
 

@@ -42,6 +42,13 @@ export function asInboundId(value: string): InboundId {
   return value as InboundId;
 }
 
+export function asRunId(value: string): RunId {
+  if (!/^run_[a-f0-9]{32}$/u.test(value)) {
+    throw new Error(`Invalid run ID: ${value}`);
+  }
+  return value as RunId;
+}
+
 export function asEgressId(value: string): EgressId {
   if (!/^eg_[a-f0-9]{32}$/u.test(value)) {
     throw new Error(`Invalid egress ID: ${value}`);

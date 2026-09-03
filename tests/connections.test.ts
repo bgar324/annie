@@ -581,7 +581,7 @@ describe("automatic credential refresh and recovery", () => {
     expect(harness.connections.getRequired(connection.id).status).toBe("healthy");
   });
 
-  it("keeps a dispatched refresh fenced past the former lease boundary", async () => {
+  it("single-flights refreshes per process while preserving cross-process fencing", async () => {
     const harness = connectionHarness();
     const config = testRuntimeConfig(harness.database, {
       PROVIDER_REQUEST_TIMEOUT_MS: "100",
@@ -629,17 +629,31 @@ describe("automatic credential refresh and recovery", () => {
 
     const firstRefresh = refresh.credentials(connection.id, newTraceId(), now);
     await requestStarted.promise;
+    const secondRefresh = refresh.credentials(
+      connection.id,
+      newTraceId(),
+      now + config.limits.providerRequestTimeoutMs * 2 + 1,
+    );
+    const otherProcess = new RefreshCoordinator({
+      db: harness.database.handle.db,
+      config,
+      connections: harness.connections,
+      traces: harness.traces,
+      fetchImpl: async () => {
+        throw new Error("A fenced refresh must not dispatch");
+      },
+      sleep: async () => undefined,
+    });
     await expect(
-      refresh.credentials(
-        connection.id,
-        newTraceId(),
-        now + config.limits.providerRequestTimeoutMs * 2 + 1,
-      ),
+      otherProcess.credentials(connection.id, newTraceId(), now),
     ).rejects.toBeInstanceOf(RefreshBusyError);
     expect(requests).toBe(1);
 
     releaseResponse.resolve();
-    await expect(firstRefresh).resolves.toMatchObject({ accessToken: "new-access" });
+    await expect(Promise.all([firstRefresh, secondRefresh])).resolves.toEqual([
+      expect.objectContaining({ accessToken: "new-access" }),
+      expect.objectContaining({ accessToken: "new-access" }),
+    ]);
     expect(requests).toBe(1);
     expect(harness.connections.getRequired(connection.id).status).toBe("healthy");
   });

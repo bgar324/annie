@@ -37,8 +37,13 @@ interface MaintenanceRow {
   memory_maintenance_status: MemoryMaintenanceStatus;
 }
 
-interface MaintenanceClaimRow {
-  deadline_at_ms: number;
+interface MaintenanceContextRow {
+  trace_id: TraceId;
+  phase: string;
+  memory_maintenance_status: MemoryMaintenanceStatus;
+  final_response: string | null;
+  inbound_text: string | null;
+  first_user_message: string | null;
 }
 
 interface InterruptedMaintenanceRow {
@@ -107,22 +112,31 @@ export class MemoryMaintenanceService {
     return rows.length;
   }
 
-  async maintain(input: {
+  async maintainRun(input: {
     runId: RunId;
-    traceId: TraceId;
-    userMessage: string;
-    finalResponse: string;
-    toolOutcomes: readonly unknown[];
+    deadlineAtMs: number;
   }): Promise<MemoryMaintenanceResult> {
+    const context = this.#context(input.runId);
     const beforeSnapshot = await this.#documents.loadSnapshot();
     const before = beforeSnapshot.content;
     const beforeDigest = beforeSnapshot.revision;
-    const deadlineAtMs = this.#claim(input.runId, beforeDigest);
-    if (deadlineAtMs === undefined) {
-      let status = this.#status(input.runId);
-      if (status === "pending" && this.#failExpiredPending(input, beforeDigest)) {
-        status = "failed";
-      }
+    if (context.memory_maintenance_status !== "pending") {
+      return {
+        status:
+          context.memory_maintenance_status === "updated" ||
+          context.memory_maintenance_status === "unchanged" ||
+          context.memory_maintenance_status === "invalid"
+            ? context.memory_maintenance_status
+            : "failed",
+        memory: before,
+      };
+    }
+    const userMessage = context.inbound_text ?? context.first_user_message;
+    if (context.phase !== "completed" || context.final_response === null || userMessage === null) {
+      throw new Error(`Completed memory context is unavailable for run ${input.runId}`);
+    }
+    if (!this.#claim(input.runId, beforeDigest)) {
+      const status = this.#status(input.runId);
       return {
         status:
           status === "updated" || status === "unchanged" || status === "invalid"
@@ -131,15 +145,15 @@ export class MemoryMaintenanceService {
         memory: before,
       };
     }
-    const remainingMs = deadlineAtMs - Date.now();
+    const remainingMs = input.deadlineAtMs - Date.now();
     if (remainingMs <= 0) {
       this.#fail({
         runId: input.runId,
-        traceId: input.traceId,
+        traceId: context.trace_id,
         status: "failed",
         beforeDigest,
         usage: null,
-        error: new Error("The run deadline elapsed before memory maintenance"),
+        error: new Error("The job deadline elapsed before memory maintenance"),
         outcome: "deadline_exceeded",
       });
       return { status: "failed", memory: before };
@@ -151,7 +165,7 @@ export class MemoryMaintenanceService {
     let replacementStarted = false;
     try {
       const response = await this.#model.maintainMemory({
-        traceId: input.traceId,
+        traceId: context.trace_id,
         runId: input.runId,
         signal,
         messages: [
@@ -171,9 +185,9 @@ export class MemoryMaintenanceService {
             role: "user",
             content: canonicalJson({
               currentMemory: before,
-              userMessage: input.userMessage,
-              finalResponse: input.finalResponse,
-              toolOutcomes: boundToolOutcomes(input.toolOutcomes),
+              userMessage,
+              finalResponse: context.final_response,
+              toolOutcomes: boundToolOutcomes(this.#toolOutcomes(input.runId)),
             }),
           },
         ],
@@ -185,7 +199,7 @@ export class MemoryMaintenanceService {
         signal.throwIfAborted();
         this.#finish({
           runId: input.runId,
-          traceId: input.traceId,
+          traceId: context.trace_id,
           status: "unchanged",
           beforeDigest,
           afterDigest: beforeDigest,
@@ -203,7 +217,7 @@ export class MemoryMaintenanceService {
         signal.throwIfAborted();
         this.#finish({
           runId: input.runId,
-          traceId: input.traceId,
+          traceId: context.trace_id,
           status: "unchanged",
           beforeDigest,
           afterDigest,
@@ -231,7 +245,7 @@ export class MemoryMaintenanceService {
       if (replacementResult.kind === "conflict") {
         this.#fail({
           runId: input.runId,
-          traceId: input.traceId,
+          traceId: context.trace_id,
           status: "failed",
           beforeDigest,
           afterDigest: replacementResult.snapshot.revision,
@@ -243,7 +257,7 @@ export class MemoryMaintenanceService {
       }
       this.#finish({
         runId: input.runId,
-        traceId: input.traceId,
+        traceId: context.trace_id,
         status: "updated",
         beforeDigest,
         afterDigest,
@@ -256,12 +270,12 @@ export class MemoryMaintenanceService {
       if (replacementJournaled && !replacementStarted) {
         this.#fail({
           runId: input.runId,
-          traceId: input.traceId,
+          traceId: context.trace_id,
           status: "failed",
           beforeDigest,
           usage,
           error: deadlineExceeded
-            ? new Error("The run deadline elapsed during memory maintenance")
+            ? new Error("The job deadline elapsed during memory maintenance")
             : error,
           ...(deadlineExceeded ? { outcome: "deadline_exceeded" } : {}),
         });
@@ -297,12 +311,12 @@ export class MemoryMaintenanceService {
           error instanceof MemoryValidationError);
       this.#fail({
         runId: input.runId,
-        traceId: input.traceId,
+        traceId: context.trace_id,
         status: invalid ? "invalid" : "failed",
         beforeDigest,
         usage,
         error: deadlineExceeded
-          ? new Error("The run deadline elapsed during memory maintenance")
+          ? new Error("The job deadline elapsed during memory maintenance")
           : error,
         ...(deadlineExceeded ? { outcome: "deadline_exceeded" } : {}),
       });
@@ -310,12 +324,9 @@ export class MemoryMaintenanceService {
     }
   }
 
-  #claim(runId: RunId, beforeDigest: string): number | undefined {
-    const row = this.#db
-      .prepare<
-        { id: string; before_digest: string; now_ms: number },
-        MaintenanceClaimRow
-      >(`
+  #claim(runId: RunId, beforeDigest: string): boolean {
+    const result = this.#db
+      .prepare<{ id: string; before_digest: string; now_ms: number }>(`
         UPDATE agent_runs
         SET memory_maintenance_status = 'attempting',
             maintenance_requests = maintenance_requests + 1,
@@ -323,13 +334,50 @@ export class MemoryMaintenanceService {
             updated_at_ms = @now_ms
         WHERE id = @id AND phase = 'completed'
           AND memory_maintenance_status = 'pending'
-          AND deadline_at_ms > @now_ms
-        RETURNING deadline_at_ms
       `)
-      .get({ id: runId, before_digest: beforeDigest, now_ms: Date.now() });
-    return row?.deadline_at_ms;
+      .run({ id: runId, before_digest: beforeDigest, now_ms: Date.now() });
+    return result.changes === 1;
   }
 
+  #context(runId: RunId): MaintenanceContextRow {
+    const row = this.#db
+      .prepare<{ id: string }, MaintenanceContextRow>(`
+        SELECT
+          agent_runs.trace_id,
+          agent_runs.phase,
+          agent_runs.memory_maintenance_status,
+          agent_runs.final_response,
+          inbound_messages.text AS inbound_text,
+          (
+            SELECT agent_messages.content
+            FROM agent_messages
+            WHERE agent_messages.run_id = agent_runs.id
+              AND agent_messages.role = 'user'
+            ORDER BY agent_messages.sequence
+            LIMIT 1
+          ) AS first_user_message
+        FROM agent_runs
+        LEFT JOIN inbound_messages ON inbound_messages.id = agent_runs.inbound_id
+        WHERE agent_runs.id = @id
+      `)
+      .get({ id: runId });
+    if (row === undefined) {
+      throw new Error(`Unknown agent run: ${runId}`);
+    }
+    return row;
+  }
+
+  #toolOutcomes(runId: RunId): readonly unknown[] {
+    return this.#db
+      .prepare<{ run_id: string }, { content: string }>(`
+        SELECT content
+        FROM agent_messages
+        WHERE run_id = @run_id AND role = 'tool'
+        ORDER BY sequence
+      `)
+      .all({ run_id: runId })
+      .map((row) => JSON.parse(row.content) as unknown);
+  }
 
   #prepareReplacement(input: {
     runId: RunId;
@@ -367,45 +415,6 @@ export class MemoryMaintenanceService {
     if (result.changes !== 1) {
       throw new Error("Memory maintenance lost its durable claim before replacement");
     }
-  }
-  #failExpiredPending(
-    input: { runId: RunId; traceId: TraceId },
-    beforeDigest: string,
-  ): boolean {
-    const now = Date.now();
-    const transaction = this.#db.transaction(() => {
-      const result = this.#db
-        .prepare<{ id: string; before_digest: string; now_ms: number }>(`
-          UPDATE agent_runs
-          SET memory_maintenance_status = 'failed',
-              memory_before_digest = @before_digest,
-              memory_after_digest = @before_digest,
-              updated_at_ms = @now_ms
-          WHERE id = @id AND phase = 'completed'
-            AND memory_maintenance_status = 'pending'
-            AND deadline_at_ms <= @now_ms
-        `)
-        .run({ id: input.runId, before_digest: beforeDigest, now_ms: now });
-      if (result.changes !== 1) {
-        return false;
-      }
-      this.#traces.appendInTransaction({
-        traceId: input.traceId,
-        component: "memory",
-        event: "failed",
-        outcome: "deadline_exceeded",
-        runId: input.runId,
-        data: {
-          beforeDigest,
-          afterDigest: beforeDigest,
-          usage: null,
-          error: "The run deadline elapsed before memory maintenance",
-        },
-        occurredAtMs: now,
-      });
-      return true;
-    });
-    return transaction.immediate();
   }
 
   #status(runId: RunId): MemoryMaintenanceStatus {

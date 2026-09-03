@@ -9,6 +9,7 @@ import {
   AgentRunStore,
   type AgentRunRecord,
   type AgentRunSource,
+  type ToolExecutionRecord,
 } from "./store.js";
 import { ToolRegistry, ToolRegistryError } from "./tools.js";
 import type { WriteStore } from "../writes/store.js";
@@ -196,11 +197,28 @@ export class AgentLoop {
     signal: AbortSignal,
   ): Promise<void> {
     const answered = answeredToolCalls(messages);
-    for (const call of calls) {
-      this.#assertWithinDeadline(run, signal);
-      if (answered.has(call.id)) {
-        continue;
+    const pending = calls.filter((call) => !answered.has(call.id));
+    const parallel =
+      pending.length > 1 &&
+      pending.every((call) => this.#tools.canRunInParallel(call.name));
+    if (parallel) {
+      for (const call of pending) {
+        if (allowedToolNames !== undefined && !allowedToolNames.has(call.name)) {
+          throw new AgentLimitError(
+            "tool_not_allowed",
+            `Tool ${call.name} is not allowed for this agent run`,
+          );
+        }
+        const toolCallRejection = toolCallGuard?.(call);
+        if (toolCallRejection !== undefined) {
+          throw new AgentLimitError("tool_not_allowed", toolCallRejection);
+        }
       }
+      await this.#executeReadBatch(run, pending, replay, jobLease, signal);
+      return;
+    }
+    for (const call of pending) {
+      this.#assertWithinDeadline(run, signal);
       if (allowedToolNames !== undefined && !allowedToolNames.has(call.name)) {
         throw new AgentLimitError(
           "tool_not_allowed",
@@ -352,6 +370,133 @@ export class AgentLoop {
         this.#runs.finishTool(execution.id, "failed", normalized);
         this.#runs.appendToolMessage(run.id, call.id, canonicalJson(normalized));
       }
+    }
+  }
+
+  async #executeReadBatch(
+    run: AgentRunRecord,
+    calls: readonly ModelToolCall[],
+    replay: boolean,
+    jobLease: { jobId: string; leaseToken: string } | undefined,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const prepared: { call: ModelToolCall; execution: ToolExecutionRecord }[] = [];
+    let preparationError: AgentLimitError | undefined;
+    for (const call of calls) {
+      try {
+        this.#assertWithinDeadline(run, signal);
+        prepared.push({
+          call,
+          execution: this.#runs.prepareTool({
+            runId: run.id,
+            call,
+            operationClass: "read",
+            maximumToolCalls: this.#limits.maxToolCalls,
+          }),
+        });
+      } catch (error) {
+        if (error instanceof AgentLimitError) {
+          preparationError = error;
+          break;
+        }
+        throw error;
+      }
+    }
+
+    const settlements = await Promise.allSettled(
+      prepared.map(({ call, execution }) =>
+        this.#settleReadTool(run, call, execution, replay, jobLease, signal),
+      ),
+    );
+    let firstFailure: { reason: unknown } | undefined;
+    let deadlineReached = false;
+    for (const [index, settlement] of settlements.entries()) {
+      if (settlement.status === "rejected") {
+        firstFailure ??= { reason: settlement.reason };
+        continue;
+      }
+      const item = prepared[index]!;
+      this.#runs.appendToolMessage(run.id, item.call.id, settlement.value.content);
+      deadlineReached ||= settlement.value.deadlineReached;
+    }
+    if (firstFailure !== undefined) {
+      throw firstFailure.reason;
+    }
+    if (deadlineReached) {
+      throw new AgentLimitError("run_deadline", "The agent run deadline was reached");
+    }
+    if (preparationError !== undefined) {
+      throw preparationError;
+    }
+  }
+
+  async #settleReadTool(
+    run: AgentRunRecord,
+    call: ModelToolCall,
+    execution: ToolExecutionRecord,
+    replay: boolean,
+    jobLease: { jobId: string; leaseToken: string } | undefined,
+    signal: AbortSignal,
+  ): Promise<{ content: string; deadlineReached: boolean }> {
+    if (
+      execution.status === "succeeded" ||
+      execution.status === "failed" ||
+      execution.status === "ambiguous" ||
+      execution.status === "not_executed"
+    ) {
+      return { content: boundedToolResult(execution.result), deadlineReached: false };
+    }
+    if (execution.status === "validated") {
+      this.#runs.markToolRunning(execution.id);
+    }
+    try {
+      const result = await this.#tools.execute({
+        name: call.name,
+        argumentsJson: call.argumentsJson,
+        context: {
+          runId: run.id,
+          traceId: run.traceId,
+          toolExecutionId: execution.id,
+          connectionId: execution.connectionId,
+          replay,
+          ...(jobLease === undefined ? {} : { jobLease }),
+          signal,
+        },
+      });
+      const normalized = result === undefined ? null : result;
+      const afterHandler = this.#runs.getToolRequired(execution.id);
+      const finished =
+        afterHandler.status === "validated" || afterHandler.status === "running"
+          ? this.#runs.finishTool(execution.id, "succeeded", normalized)
+          : afterHandler;
+      return {
+        content: boundedToolResult(finished.result ?? normalized),
+        deadlineReached: false,
+      };
+    } catch (error) {
+      const afterFailure = this.#runs.getToolRequired(execution.id);
+      if (
+        afterFailure.status === "succeeded" ||
+        afterFailure.status === "failed" ||
+        afterFailure.status === "ambiguous" ||
+        afterFailure.status === "not_executed"
+      ) {
+        return {
+          content: boundedToolResult(afterFailure.result),
+          deadlineReached: false,
+        };
+      }
+      if (signal.aborted) {
+        const result = {
+          ok: false,
+          error: { code: "run_deadline", message: "The agent run deadline was reached" },
+        };
+        this.#runs.finishTool(execution.id, "failed", result);
+        return { content: canonicalJson(result), deadlineReached: true };
+      }
+      const result = safeToolError(error);
+      this.#runs.finishTool(execution.id, "failed", result);
+      return { content: canonicalJson(result), deadlineReached: false };
     }
   }
 

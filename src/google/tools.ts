@@ -166,10 +166,11 @@ export class GoogleWorkspaceToolService {
       {
         definition: {
           name: "google.search",
-          description: "Run one bounded read-only search batch against Calendar, Drive, Contacts, or Tasks in one connected Google account. For automatic multi-account reads, call once per exact safe label returned by connections.list. Each product may appear once.",
+          description: "Run one bounded read-only search batch against Calendar, Drive, Contacts, or Tasks in one connected Google account. For automatic multi-account reads, call once per exact safe label in connected account status. Each product may appear once.",
           parameters: searchJsonSchema,
         },
         operationClass: "read",
+        batchMode: "parallel_read",
         execute: async (argumentsValue, context) =>
           this.search(searchArgumentsSchema.parse(argumentsValue), context),
       },
@@ -180,6 +181,7 @@ export class GoogleWorkspaceToolService {
           parameters: readJsonSchema,
         },
         operationClass: "read",
+        batchMode: "parallel_read",
         execute: async (argumentsValue, context) =>
           this.read(readArgumentsSchema.parse(argumentsValue), context),
       },

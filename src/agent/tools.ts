@@ -17,6 +17,7 @@ export interface ToolExecutionContext {
 export interface RegisteredTool {
   definition: ModelToolDefinition;
   operationClass: ToolOperationClass;
+  batchMode?: "parallel_read" | "serial";
   execute(argumentsValue: Record<string, unknown>, context: ToolExecutionContext): Promise<unknown>;
 }
 
@@ -67,6 +68,11 @@ export class ToolRegistry {
 
   operationClass(name: string): ToolOperationClass {
     return this.#required(name).tool.operationClass;
+  }
+
+  canRunInParallel(name: string): boolean {
+    const tool = this.#required(name).tool;
+    return tool.operationClass === "read" && tool.batchMode === "parallel_read";
   }
 
   async execute(input: {

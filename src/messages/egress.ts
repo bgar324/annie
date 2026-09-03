@@ -85,6 +85,7 @@ export class MessageEgressService {
     text: string;
     runId?: string;
     replyToGuid?: string;
+    inboundSequence?: number;
     sendPolicy?: EgressSendPolicy;
   }): EgressId {
     const transaction = this.#db.transaction(() => {
@@ -117,7 +118,24 @@ export class MessageEgressService {
         traceId: input.traceId,
         capacityExempt: true,
         ...(input.runId === undefined ? {} : { runId: input.runId }),
+        ...(input.inboundSequence === undefined
+          ? {}
+          : { inboundSequence: input.inboundSequence }),
       });
+      if (input.runId !== undefined) {
+        this.#queue.enqueueInTransaction({
+          chatId: input.recipient,
+          subjectId: input.runId,
+          type: "memory_maintenance",
+          payload: { runId: input.runId },
+          traceId: input.traceId,
+          runId: input.runId,
+          capacityExempt: true,
+          ...(input.inboundSequence === undefined
+            ? {}
+            : { inboundSequence: input.inboundSequence }),
+        });
+      }
       return egressId;
     });
     return transaction.immediate();

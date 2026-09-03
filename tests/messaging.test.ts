@@ -2,7 +2,13 @@ import { getEventListeners } from "node:events";
 import { rmSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadRuntimeConfig, type RuntimeConfig } from "../src/config.js";
-import { newTraceId, type EgressId, type TraceId, type WriteIntentId } from "../src/core/ids.js";
+import {
+  newRunId,
+  newTraceId,
+  type EgressId,
+  type TraceId,
+  type WriteIntentId,
+} from "../src/core/ids.js";
 import { openDatabase } from "../src/db/database.js";
 import { SendblueGateway } from "../src/messages/client.js";
 import { MessageEgressService } from "../src/messages/egress.js";
@@ -990,6 +996,153 @@ describe("durable queue leases", () => {
     }
   });
 
+  it("claims reply egress before an older pending inbound job", () => {
+    const database = createTestDatabase();
+    try {
+      const traces = new TraceStore(database.handle.db, createTraceRedactor([]));
+      const queue = new QueueStore({
+        db: database.handle.db,
+        traces,
+        leaseMs: 1_000,
+        maxPending: 8,
+      });
+      const now = Date.now();
+      queue.enqueue({
+        chatId: trustedSender,
+        type: "inbound",
+        subjectId: "in_waiting",
+        payload: {},
+        traceId: newTraceId(),
+        availableAtMs: now - 1_000,
+        inboundSequence: 2,
+      });
+      queue.enqueue({
+        chatId: trustedSender,
+        type: "egress_send",
+        subjectId: "egress_ready",
+        payload: {},
+        traceId: newTraceId(),
+        availableAtMs: now,
+      });
+
+      expect(queue.claim(now)?.subjectId).toBe("egress_ready");
+    } finally {
+      database.cleanup();
+    }
+  });
+
+  it("recovers the oldest expired lease before pending reply egress", () => {
+    const database = createTestDatabase();
+    try {
+      const traces = new TraceStore(database.handle.db, createTraceRedactor([]));
+      const queue = new QueueStore({
+        db: database.handle.db,
+        traces,
+        leaseMs: 100,
+        maxPending: 8,
+      });
+      const now = Date.now();
+      queue.enqueue({
+        chatId: "chat_expired",
+        type: "inbound",
+        subjectId: "expired_inbound",
+        payload: {},
+        traceId: newTraceId(),
+        availableAtMs: now,
+        inboundSequence: 1,
+      });
+      expect(queue.claim(now)?.subjectId).toBe("expired_inbound");
+      queue.enqueue({
+        chatId: "chat_other",
+        type: "egress_send",
+        subjectId: "pending_egress",
+        payload: {},
+        traceId: newTraceId(),
+        availableAtMs: now,
+      });
+
+      expect(queue.claim(now + 101)?.subjectId).toBe("expired_inbound");
+    } finally {
+      database.cleanup();
+    }
+  });
+  it("keeps durable memory behind retried reply egress and ahead of the next inbound", () => {
+    const database = createTestDatabase();
+    const now = Date.now();
+    const redactor = createTraceRedactor([]);
+    const traces = new TraceStore(database.handle.db, redactor);
+    const queue = new QueueStore({
+      db: database.handle.db,
+      traces,
+      leaseMs: 100,
+      maxPending: 8,
+    });
+    const traceId = newTraceId();
+    const runId = newRunId();
+    queue.enqueue({
+      chatId: trustedSender,
+      type: "egress_send",
+      subjectId: "reply_first",
+      payload: { egressId: "reply_first" },
+      traceId,
+      runId,
+      inboundSequence: 1,
+      availableAtMs: now,
+    });
+    queue.enqueue({
+      chatId: trustedSender,
+      type: "memory_maintenance",
+      subjectId: runId,
+      payload: { runId },
+      traceId,
+      runId,
+      inboundSequence: 1,
+      availableAtMs: now,
+    });
+    queue.enqueue({
+      chatId: trustedSender,
+      type: "inbound",
+      subjectId: "inbound_second",
+      payload: { inboundId: "inbound_second" },
+      traceId: newTraceId(),
+      inboundSequence: 2,
+      availableAtMs: now,
+    });
+
+    const firstReplyClaim = requiredJob(queue.claim(now));
+    expect(firstReplyClaim.type).toBe("egress_send");
+    queue.requeue(firstReplyClaim, now + 1_000, "retry");
+    expect(queue.claim(now + 1)).toBeUndefined();
+    database.handle.close();
+
+    const reopened = openDatabase(database.config);
+    try {
+      const restartedQueue = new QueueStore({
+        db: reopened.db,
+        traces: new TraceStore(reopened.db, redactor),
+        leaseMs: 100,
+        maxPending: 8,
+      });
+      expect(restartedQueue.claim(now + 999)).toBeUndefined();
+      const retriedReply = requiredJob(restartedQueue.claim(now + 1_000));
+      expect(retriedReply.type).toBe("egress_send");
+      restartedQueue.block(retriedReply, "terminal reply outcome");
+
+      const memory = requiredJob(restartedQueue.claim(now + 1_001));
+      expect(memory).toMatchObject({
+        type: "memory_maintenance",
+        runId,
+        inboundSequence: 1,
+      });
+      restartedQueue.complete(memory);
+      expect(restartedQueue.claim(now + 1_002)?.type).toBe("inbound");
+    } finally {
+      reopened.close();
+      rmSync(database.directory, { recursive: true, force: true });
+    }
+  });
+
+
   it("removes each idle-poll abort listener after its timer fires", async () => {
     vi.useFakeTimers();
     const database = createTestDatabase();
@@ -1006,6 +1159,7 @@ describe("durable queue leases", () => {
         handlers: {
           inbound: async () => undefined,
           daily_brief: async () => undefined,
+          memory_maintenance: async () => undefined,
           egress_send: async () => undefined,
           egress_reconcile: async () => undefined,
         },

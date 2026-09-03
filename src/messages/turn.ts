@@ -6,14 +6,14 @@ import type { AgentRunRecord, AgentRunStore } from "../agent/store.js";
 import { buildAssistantSystemPrompt } from "../agent/prompt.js";
 import type { RuntimeConfig } from "../config.js";
 import type { ConnectionRecoveryService } from "../connections/recovery.js";
+import type { ConnectionStore } from "../connections/store.js";
 import {
   explicitConnectRequestProvider,
   parseConnectToolArguments,
 } from "../connections/tools.js";
-import type { ConnectionProvider } from "../connections/types.js";
+import { toSafeConnectionView, type ConnectionProvider } from "../connections/types.js";
 import { asInboundId, type InboundId, type RunId, type TraceId } from "../core/ids.js";
 import type { MemoryDocumentStore } from "../memory/document.js";
-import type { MemoryMaintenanceService } from "../memory/maintenance.js";
 import type { ClaimedJob } from "../queue/store.js";
 import type { JobContext } from "../queue/worker.js";
 import type { TraceStore } from "../tracing/store.js";
@@ -28,6 +28,7 @@ interface InboundTurnRow {
   guid: string;
   state: "waiting_transcription" | "ready" | "processing" | "done" | "rejected" | "blocked";
   trace_id: TraceId;
+  sequence: number;
 }
 
 export class InboundTurnService {
@@ -37,7 +38,7 @@ export class InboundTurnService {
   readonly #runs: AgentRunStore;
   readonly #history: ConversationHistoryStore;
   readonly #memory: MemoryDocumentStore;
-  readonly #maintenance: MemoryMaintenanceService;
+  readonly #connections: ConnectionStore;
   readonly #recovery: ConnectionRecoveryService;
   readonly #egress: MessageEgressService;
   readonly #failures: FailureNotificationService;
@@ -50,7 +51,7 @@ export class InboundTurnService {
     runs: AgentRunStore;
     history: ConversationHistoryStore;
     memory: MemoryDocumentStore;
-    maintenance: MemoryMaintenanceService;
+    connections: ConnectionStore;
     recovery: ConnectionRecoveryService;
     egress: MessageEgressService;
     failures: FailureNotificationService;
@@ -62,7 +63,7 @@ export class InboundTurnService {
     this.#runs = input.runs;
     this.#history = input.history;
     this.#memory = input.memory;
-    this.#maintenance = input.maintenance;
+    this.#connections = input.connections;
     this.#recovery = input.recovery;
     this.#egress = input.egress;
     this.#failures = input.failures;
@@ -131,12 +132,10 @@ export class InboundTurnService {
           );
           return;
         }
-        await this.#finishCompletedTurn(
+        this.#finishCompletedTurn(
           inbound,
-          userMessage,
           completed.id,
           completed.finalResponse,
-          context,
         );
         return;
       }
@@ -195,12 +194,10 @@ export class InboundTurnService {
         );
         return;
       }
-      await this.#finishCompletedTurn(
+      this.#finishCompletedTurn(
         inbound,
-        userMessage,
         result.run.id,
         result.response,
-        context,
       );
     } catch (error) {
       context.assertLease();
@@ -227,27 +224,18 @@ export class InboundTurnService {
     }
   }
 
-  async #finishCompletedTurn(
+  #finishCompletedTurn(
     inbound: InboundTurnRow,
-    userMessage: string,
     runId: RunId,
     finalResponse: string,
-    context: JobContext,
-  ): Promise<void> {
-    await this.#maintenance.maintain({
-      runId,
-      traceId: inbound.trace_id,
-      userMessage,
-      finalResponse,
-      toolOutcomes: this.#toolOutcomes(runId),
-    });
-    context.assertLease();
+  ): void {
     this.#egress.planReply({
       traceId: inbound.trace_id,
       recipient: this.#config.userPhoneNumber,
       runId,
       replyToGuid: inbound.guid,
       text: finalResponse,
+      inboundSequence: inbound.sequence,
     });
   }
 
@@ -447,7 +435,8 @@ export class InboundTurnService {
   #getInbound(inboundId: InboundId): InboundTurnRow {
     const row = this.#db
       .prepare<{ id: string }, InboundTurnRow>(`
-        SELECT id, text, guid, state, trace_id FROM inbound_messages WHERE id = @id
+        SELECT id, text, guid, state, trace_id, sequence
+        FROM inbound_messages WHERE id = @id
       `)
       .get({ id: inboundId });
     if (row === undefined) {
@@ -465,21 +454,13 @@ export class InboundTurnService {
     return row === undefined ? undefined : this.#runs.getRequired(row.id);
   }
 
-  #toolOutcomes(runId: string): readonly unknown[] {
-    return this.#db
-      .prepare<{ run_id: string }, { result_json: string | null }>(`
-        SELECT result_json FROM tool_executions
-        WHERE run_id = @run_id
-        ORDER BY created_at_ms, id
-      `)
-      .all({ run_id: runId })
-      .map((row) => (row.result_json === null ? null : (JSON.parse(row.result_json) as unknown)));
-  }
-
   #systemPrompt(memory: string): string {
     return buildAssistantSystemPrompt({
       memory,
-      audience: { kind: "inbound" },
+      audience: {
+        kind: "inbound",
+        connections: this.#connections.list().map(toSafeConnectionView),
+      },
     });
   }
 }

@@ -693,6 +693,108 @@ const MIGRATIONS: readonly Migration[] = [
         AND last_error_code IN ('schema_drift', 'tool_unavailable');
     `,
   },
+  {
+    version: 8,
+    rebuildsForeignKeys: true,
+    sql: `
+      CREATE TABLE jobs_v8 (
+        id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        type TEXT NOT NULL CHECK (type IN (
+          'inbound', 'voice_poll', 'egress_send', 'egress_reconcile',
+          'daily_brief', 'memory_maintenance'
+        )),
+        subject_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+        status TEXT NOT NULL CHECK (status IN (
+          'pending', 'running', 'succeeded', 'failed', 'blocked'
+        )),
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        available_at_ms INTEGER NOT NULL,
+        lease_token TEXT,
+        lease_expires_at_ms INTEGER,
+        trace_id TEXT NOT NULL,
+        run_id TEXT,
+        inbound_sequence INTEGER,
+        last_error TEXT,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        UNIQUE(type, subject_id),
+        CHECK (
+          (status = 'running' AND lease_token IS NOT NULL AND lease_expires_at_ms IS NOT NULL)
+          OR
+          (status <> 'running' AND lease_token IS NULL AND lease_expires_at_ms IS NULL)
+        )
+      ) STRICT;
+
+      INSERT INTO jobs_v8(
+        id, chat_id, type, subject_id, payload_json, status, attempts,
+        available_at_ms, lease_token, lease_expires_at_ms, trace_id, run_id,
+        inbound_sequence, last_error, created_at_ms, updated_at_ms
+      )
+      SELECT
+        id, chat_id, type, subject_id, payload_json, status, attempts,
+        available_at_ms, lease_token, lease_expires_at_ms, trace_id, run_id,
+        inbound_sequence, last_error, created_at_ms, updated_at_ms
+      FROM jobs;
+
+      CREATE TABLE agent_runs_v8 (
+        id TEXT PRIMARY KEY,
+        inbound_id TEXT UNIQUE REFERENCES inbound_messages(id),
+        scheduled_job_id TEXT UNIQUE REFERENCES jobs(id),
+        trace_id TEXT NOT NULL UNIQUE,
+        phase TEXT NOT NULL CHECK (phase IN (
+          'pending', 'running', 'finalizing', 'completed', 'failed', 'blocked'
+        )),
+        model_requests INTEGER NOT NULL DEFAULT 0 CHECK (model_requests >= 0),
+        maintenance_requests INTEGER NOT NULL DEFAULT 0 CHECK (maintenance_requests >= 0),
+        tool_calls INTEGER NOT NULL DEFAULT 0 CHECK (tool_calls >= 0),
+        provider_writes INTEGER NOT NULL DEFAULT 0 CHECK (provider_writes >= 0),
+        deadline_at_ms INTEGER NOT NULL,
+        transcript_bytes INTEGER NOT NULL DEFAULT 0 CHECK (transcript_bytes >= 0),
+        memory_maintenance_status TEXT NOT NULL CHECK (memory_maintenance_status IN (
+          'pending', 'attempting', 'unchanged', 'updated', 'invalid', 'failed'
+        )),
+        memory_before_digest TEXT,
+        memory_after_digest TEXT,
+        ambiguous_write_id TEXT,
+        final_response TEXT,
+        failure_code TEXT,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        CHECK (
+          (inbound_id IS NOT NULL AND scheduled_job_id IS NULL)
+          OR
+          (inbound_id IS NULL AND scheduled_job_id IS NOT NULL)
+        )
+      ) STRICT;
+
+      INSERT INTO agent_runs_v8(
+        id, inbound_id, scheduled_job_id, trace_id, phase, model_requests,
+        maintenance_requests, tool_calls, provider_writes, deadline_at_ms,
+        transcript_bytes, memory_maintenance_status, memory_before_digest,
+        memory_after_digest, ambiguous_write_id, final_response, failure_code,
+        created_at_ms, updated_at_ms
+      )
+      SELECT
+        id, inbound_id, scheduled_job_id, trace_id, phase, model_requests,
+        maintenance_requests, tool_calls, provider_writes, deadline_at_ms,
+        transcript_bytes, memory_maintenance_status, memory_before_digest,
+        memory_after_digest, ambiguous_write_id, final_response, failure_code,
+        created_at_ms, updated_at_ms
+      FROM agent_runs;
+
+      DROP TABLE agent_runs;
+      DROP TABLE jobs;
+      ALTER TABLE jobs_v8 RENAME TO jobs;
+      ALTER TABLE agent_runs_v8 RENAME TO agent_runs;
+
+      CREATE INDEX jobs_claim
+        ON jobs(status, available_at_ms, inbound_sequence, created_at_ms);
+      CREATE UNIQUE INDEX jobs_one_running_chat
+        ON jobs(chat_id) WHERE status = 'running';
+    `,
+  },
 ];
 
 export function runMigrations(

@@ -169,7 +169,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.search",
-          description: "Search internal content in one connected Notion workspace. For automatic multi-account reads, call once per exact safe label returned by connections.list.",
+          description: "Search internal content in one connected Notion workspace. For automatic multi-account reads, call once per exact safe label in connected account status.",
           parameters: {
             type: "object",
             properties: {
@@ -182,6 +182,7 @@ export class NotionToolService {
           },
         },
         operationClass: "read",
+        batchMode: "parallel_read",
         execute: async (argumentsValue, context) =>
           this.search(searchArgumentsSchema.parse(argumentsValue), context),
       },
@@ -200,6 +201,7 @@ export class NotionToolService {
           },
         },
         operationClass: "read",
+        batchMode: "parallel_read",
         execute: async (argumentsValue, context) =>
           this.fetch(fetchArgumentsSchema.parse(argumentsValue), context),
       },

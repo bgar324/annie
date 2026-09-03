@@ -103,11 +103,202 @@ describe("Gmail read tools", () => {
           labels: ["IMPORTANT", "INBOX"],
         },
       ],
+      messagesTruncated: false,
     });
     expect(selected).toEqual([personal.id]);
     expect(selected).not.toContain(work.id);
     expect(harness.runs.getToolRequired(context.toolExecutionId).connectionId).toBe(personal.id);
   });
+
+  it("fetches message metadata in bounded concurrent waves and preserves list order", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(
+      harness,
+      "sub_parallel",
+      "Parallel",
+      "parallel@example.test",
+    );
+    const ids = Array.from({ length: 7 }, (_, index) => `message_${index + 1}`);
+    let active = 0;
+    let maximumActive = 0;
+    const firstWaveStarted = Promise.withResolvers<void>();
+    let started = 0;
+    const api = stubGmailApi({
+      async listMessages() {
+        return response({
+          messages: ids.map((id) => ({ id, threadId: `thread_${id}` })),
+          resultSizeEstimate: ids.length,
+        });
+      },
+      async getMessage(input) {
+        active += 1;
+        started += 1;
+        maximumActive = Math.max(maximumActive, active);
+        if (started === 5) {
+          firstWaveStarted.resolve();
+        }
+        await firstWaveStarted.promise;
+        active -= 1;
+        return response({ id: input.messageId, snippet: input.messageId });
+      },
+    });
+    const service = gmailService(harness, fixedClient(connection.id, api));
+
+    const result = (await service.search(
+      { query: "is:unread", maxResults: ids.length },
+      toolContext(harness, "gmail.search"),
+    )) as { messages: readonly { id: string }[] };
+
+    expect(maximumActive).toBe(5);
+    expect(result.messages.map((message) => message.id)).toEqual(ids);
+  });
+
+  it("hydrates only top distinct threads within per-thread and total result bounds", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(
+      harness,
+      "sub_hydration",
+      "Hydration",
+      "hydration@example.test",
+    );
+    const threadReads: string[] = [];
+    const largeBody = Buffer.from("important detail ".repeat(10_000)).toString("base64url");
+    const api = stubGmailApi({
+      async listMessages() {
+        return response({
+          messages: [
+            { id: "message_1", threadId: "thread_1" },
+            { id: "message_2", threadId: "thread_1" },
+            { id: "message_3", threadId: "thread_2" },
+          ],
+          resultSizeEstimate: 3,
+        });
+      },
+      async getMessage(input) {
+        return response({
+          id: input.messageId,
+          threadId: input.messageId === "message_3" ? "thread_2" : "thread_1",
+          snippet: input.messageId,
+        });
+      },
+      async getThread(input) {
+        threadReads.push(input.threadId);
+        return response({
+          id: input.threadId,
+          messages: Array.from({ length: 10 }, (_, index) => ({
+            id: `${input.threadId}_message_${index}`,
+            threadId: input.threadId,
+            payload: { mimeType: "text/plain", body: { data: largeBody } },
+          })),
+        });
+      },
+    });
+    const service = gmailService(harness, fixedClient(connection.id, api));
+
+    const result = (await service.search(
+      { query: "from:alice launch", maxResults: 3, hydrateThreads: 2 },
+      toolContext(harness, "gmail.search"),
+    )) as {
+      messages: readonly unknown[];
+      hydration: {
+        requested: number;
+        truncated: boolean;
+        threads: readonly { threadId: string; thread: unknown }[];
+      };
+    };
+
+    expect(threadReads).toEqual(["thread_1", "thread_2"]);
+    expect(result.messages).toHaveLength(3);
+    expect(result.hydration).toMatchObject({ requested: 2, truncated: true });
+    expect(result.hydration.threads.map((item) => item.threadId)).toEqual([
+      "thread_1",
+      "thread_2",
+    ]);
+    for (const item of result.hydration.threads) {
+      expect(Buffer.byteLength(JSON.stringify(item.thread))).toBeLessThanOrEqual(8 * 1_024);
+    }
+    expect(Buffer.byteLength(JSON.stringify(result.hydration))).toBeLessThanOrEqual(24 * 1_024);
+    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(120 * 1_024);
+  });
+
+  it("keeps metadata when optional hydration fails", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(
+      harness,
+      "sub_hydration_failure",
+      "Hydration failure",
+      "hydration-failure@example.test",
+    );
+    const api = stubGmailApi({
+      async listMessages() {
+        return response({
+          messages: [{ id: "message_1", threadId: "thread_1" }],
+          resultSizeEstimate: 1,
+        });
+      },
+      async getMessage() {
+        return response({ id: "message_1", threadId: "thread_1", snippet: "metadata survives" });
+      },
+      async getThread() {
+        throw providerError(400);
+      },
+    });
+    const service = gmailService(harness, fixedClient(connection.id, api));
+
+    await expect(
+      service.search(
+        { query: "from:alice", maxResults: 1, hydrateThreads: 1 },
+        toolContext(harness, "gmail.search"),
+      ),
+    ).resolves.toMatchObject({
+      messages: [{ id: "message_1", snippet: "metadata survives" }],
+      hydration: { requested: 1, truncated: true, threads: [] },
+    });
+  });
+  it("does not downgrade a run abort into optional hydration loss", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(
+      harness,
+      "sub_hydration_abort",
+      "Hydration abort",
+      "hydration-abort@example.test",
+    );
+    const controller = new AbortController();
+    const api = stubGmailApi({
+      async listMessages() {
+        return response({
+          messages: [{ id: "message_1", threadId: "thread_1" }],
+          resultSizeEstimate: 1,
+        });
+      },
+      async getMessage() {
+        return response({ id: "message_1", threadId: "thread_1" });
+      },
+      async getThread() {
+        controller.abort();
+        controller.signal.throwIfAborted();
+        throw new Error("unreachable");
+      },
+    });
+    const service = gmailService(harness, fixedClient(connection.id, api));
+    const context = {
+      ...toolContext(harness, "gmail.search"),
+      signal: controller.signal,
+    };
+
+    await expect(
+      service.search(
+        { query: "from:alice", maxResults: 1, hydrateThreads: 1 },
+        context,
+      ),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(
+      harness.traces
+        .list(context.traceId)
+        .some((event) => event.component === "gmail" && event.event === "hydration_skipped"),
+    ).toBe(false);
+  });
+
 
   it("normalizes plain text, HTML fallback, and attachment metadata in a thread", async () => {
     const harness = gmailHarness();

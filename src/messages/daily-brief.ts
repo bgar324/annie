@@ -5,10 +5,9 @@ import { buildAssistantSystemPrompt } from "../agent/prompt.js";
 import type { AgentRunRecord, AgentRunStore } from "../agent/store.js";
 import type { RuntimeConfig } from "../config.js";
 import type { ConnectionStore } from "../connections/store.js";
-import type { ConnectionRecord } from "../connections/types.js";
+import { toSafeConnectionView, type ConnectionRecord } from "../connections/types.js";
 import { newTraceId, type ConnectionId, type JobId, type RunId, type TraceId } from "../core/ids.js";
 import type { MemoryDocumentStore } from "../memory/document.js";
-import type { MemoryMaintenanceService } from "../memory/maintenance.js";
 import {
   QueueCapacityError,
   type ClaimedJob,
@@ -100,7 +99,6 @@ export class DailyBriefService {
   readonly #agent: AgentLoop;
   readonly #runs: AgentRunStore;
   readonly #memory: MemoryDocumentStore;
-  readonly #maintenance: MemoryMaintenanceService;
   readonly #connections: ConnectionStore;
   readonly #egress: MessageEgressService;
   readonly #failures: FailureNotificationService;
@@ -115,7 +113,6 @@ export class DailyBriefService {
     agent: AgentLoop;
     runs: AgentRunStore;
     memory: MemoryDocumentStore;
-    maintenance: MemoryMaintenanceService;
     connections: ConnectionStore;
     egress: MessageEgressService;
     failures: FailureNotificationService;
@@ -128,7 +125,6 @@ export class DailyBriefService {
     this.#agent = input.agent;
     this.#runs = input.runs;
     this.#memory = input.memory;
-    this.#maintenance = input.maintenance;
     this.#connections = input.connections;
     this.#egress = input.egress;
     this.#failures = input.failures;
@@ -282,7 +278,8 @@ export class DailyBriefService {
       return;
     }
 
-    const sources = dailyBriefSources(this.#connections.list());
+    const connections = this.#connections.list();
+    const sources = dailyBriefSources(connections);
     if (sources.length === 0) {
       this.#traces.append({
         traceId: job.traceId,
@@ -328,7 +325,7 @@ export class DailyBriefService {
               memory,
               audience: {
                 kind: "daily_brief",
-                connections: this.#connections.list(),
+                connections: connections.map(toSafeConnectionView),
               },
             }),
           },
@@ -350,14 +347,6 @@ export class DailyBriefService {
         });
         return;
       }
-      await this.#maintenance.maintain({
-        runId: result.run.id,
-        traceId: job.traceId,
-        userMessage: request,
-        finalResponse: result.response,
-        toolOutcomes: this.#toolOutcomes(result.run.id),
-      });
-      context.assertLease();
       this.#egress.planReply({
         traceId: job.traceId,
         recipient: this.#config.userPhoneNumber,
@@ -517,17 +506,6 @@ export class DailyBriefService {
       `)
       .get({ scheduled_job_id: jobId });
     return row === undefined ? undefined : this.#runs.getRequired(row.id);
-  }
-
-  #toolOutcomes(runId: RunId): readonly unknown[] {
-    return this.#db
-      .prepare<{ run_id: string }, { result_json: string | null }>(`
-        SELECT result_json FROM tool_executions
-        WHERE run_id = @run_id
-        ORDER BY created_at_ms, id
-      `)
-      .all({ run_id: runId })
-      .map((row) => (row.result_json === null ? null : (JSON.parse(row.result_json) as unknown)));
   }
 
   #localDateTime(epochMs: number): LocalDateTime {

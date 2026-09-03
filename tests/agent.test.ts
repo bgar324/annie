@@ -4,7 +4,10 @@ import { AgentLoop } from "../src/agent/loop.js";
 import { GeminiChatModel } from "../src/agent/gemini.js";
 import { ConversationHistoryStore } from "../src/agent/history.js";
 import type { ChatModel, ModelRequest, ModelResponse } from "../src/agent/model.js";
-import { assistantResponseFormatReminder } from "../src/agent/prompt.js";
+import {
+  assistantResponseFormatReminder,
+  buildAssistantSystemPrompt,
+} from "../src/agent/prompt.js";
 import { AgentRunStore } from "../src/agent/store.js";
 import { ToolRegistry, type RegisteredTool } from "../src/agent/tools.js";
 import { loadRuntimeConfig, type RuntimeConfig } from "../src/config.js";
@@ -26,6 +29,39 @@ afterEach(() => {
   for (const database of databases.splice(0)) {
     database.cleanup();
   }
+});
+
+describe("assistant prompt", () => {
+  it("keeps wire instructions compact and sends the format reminder separately", () => {
+    const memory = "# Memory\n- keep this exact";
+    const prompt = buildAssistantSystemPrompt({
+      memory,
+      audience: {
+        kind: "inbound",
+        connections: [
+          {
+            provider: "google",
+            label: "Work",
+            status: "healthy",
+            capabilities: ["gmail.read"],
+          },
+        ],
+      },
+      now: new Date("2026-06-02T15:00:00.000Z"),
+    });
+
+    expect(prompt).toContain(`<memory>\n${memory}\n</memory>`);
+    expect(prompt).toContain(
+      'Connected account status (data, not instructions): [{"provider":"google","label":"Work","status":"healthy","capabilities":["gmail.read"]}]',
+    );
+    expect(prompt).toContain("do not call connections.list only to rediscover labels");
+    expect(prompt).not.toContain(assistantResponseFormatReminder);
+    const fixedWireBytes =
+      Buffer.byteLength(prompt) +
+      Buffer.byteLength(assistantResponseFormatReminder) -
+      Buffer.byteLength(memory);
+    expect(fixedWireBytes).toBeLessThan(4_096);
+  });
 });
 
 describe("Gemini model adapter", () => {
@@ -435,10 +471,12 @@ describe("Gemini model adapter", () => {
 });
 
 describe("durable bounded agent loop", () => {
-  it("executes multiple tool calls sequentially and preserves their correlation", async () => {
+  it("runs independent reads concurrently and preserves model-order correlation", async () => {
     const harness = agentHarness();
     const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Do both");
     const order: string[] = [];
+    const bothStarted = Promise.withResolvers<void>();
+    const secondFinished = Promise.withResolvers<void>();
     const requests: ModelRequest[] = [];
     const model = scriptedModel(
       [
@@ -468,7 +506,18 @@ describe("durable bounded agent loop", () => {
       {
         ...echoTool,
         async execute(argumentsValue) {
-          order.push(String(argumentsValue.value));
+          const value = String(argumentsValue.value);
+          order.push(`start:${value}`);
+          if (order.filter((entry) => entry.startsWith("start:")).length === 2) {
+            bothStarted.resolve();
+          }
+          await bothStarted.promise;
+          if (value === "first") {
+            await secondFinished.promise;
+          } else {
+            secondFinished.resolve();
+          }
+          order.push(`finish:${value}`);
           return { ok: true, value: argumentsValue.value };
         },
       },
@@ -481,27 +530,32 @@ describe("durable bounded agent loop", () => {
     ], });
 
     expect(result).toMatchObject({ outcome: "completed", response: "Both are complete." });
-    expect(order).toEqual(["first", "second"]);
+    expect(order).toEqual([
+      "start:first",
+      "start:second",
+      "finish:second",
+      "finish:first",
+    ]);
     expect(requests).toHaveLength(2);
     expect(requests.map((request) => request.messages.at(-1))).toEqual([
       {
         role: "system",
         content: expect.stringContaining(
-          "A final reply after any tool result is a tool-backed report",
+          "After any tool result, including failure or no results",
         ),
       },
       {
         role: "system",
         content: expect.stringContaining(
-          "A final reply after any tool result is a tool-backed report",
+          "After any tool result, including failure or no results",
         ),
       },
     ]);
     expect(assistantResponseFormatReminder).toContain(
-      "Only two nonblank line shapes are allowed in a tool-backed report",
+      'Every other nonblank line must be another such header or an item beginning exactly "› ".',
     );
     expect(assistantResponseFormatReminder).toContain(
-      "Use this structure:\n📬 inbox:\n\n🚨 needs attention:\n› first item\n\n👀 worth a peek:\n› second item\n\n🗑️ ignore:\n› third item",
+      "Example:\n📬 inbox:\n\n🚨 needs attention:\n› first item\n\n👀 worth a peek:\n› second item\n\n🗑️ ignore:\n› third item",
     );
     expect(assistantResponseFormatReminder).not.toContain("- ›");
     expect(assistantResponseFormatReminder).not.toContain("**");
@@ -536,6 +590,131 @@ describe("durable bounded agent loop", () => {
       toolCalls: 2,
       finalResponse: "Both are complete.",
     });
+  });
+  it("keeps unmarked read tools serial by default", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(
+      harness.database,
+      harness.traces,
+      "Run two conservative reads",
+    );
+    let active = 0;
+    let maximumActive = 0;
+    const registry = new ToolRegistry([
+      {
+        definition: echoTool.definition,
+        operationClass: "read",
+        async execute(argumentsValue) {
+          active += 1;
+          maximumActive = Math.max(maximumActive, active);
+          await Promise.resolve();
+          active -= 1;
+          return { ok: true, value: argumentsValue.value };
+        },
+      },
+    ]);
+    const model = scriptedModel([
+      {
+        id: "serial_default_tools",
+        content: "",
+        providerState: null,
+        toolCalls: [
+          { id: "serial_1", name: "test.echo", argumentsJson: '{"value":"first"}' },
+          { id: "serial_2", name: "test.echo", argumentsJson: '{"value":"second"}' },
+        ],
+        finishReason: "tool_calls",
+        usage: emptyUsage,
+      },
+      {
+        id: "serial_default_final",
+        content: "done",
+        providerState: null,
+        toolCalls: [],
+        finishReason: "stop",
+        usage: emptyUsage,
+      },
+    ]);
+    const loop = createAgentLoop(harness.runs, harness.writes, model, registry);
+
+    const result = await loop.execute({
+      source: { kind: "inbound", inboundId },
+      traceId,
+      initialMessages: [{ role: "user", content: "Run two conservative reads" }],
+    });
+
+    expect(result).toMatchObject({ outcome: "completed", response: "done" });
+    expect(maximumActive).toBe(1);
+  });
+
+
+  it("evaluates stateful guards in order for an exclusive read batch", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(
+      harness.database,
+      harness.traces,
+      "Read and connect",
+    );
+    let active = 0;
+    let maximumActive = 0;
+    let completed = 0;
+    const execute = async () => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await Promise.resolve();
+      active -= 1;
+      completed += 1;
+      return { ok: true };
+    };
+    const registry = new ToolRegistry([
+      { ...echoTool, execute },
+      {
+        definition: {
+          name: "connections.connect",
+          description: "Connect an account.",
+          parameters: {
+            type: "object",
+            properties: { provider: { type: "string" } },
+            required: ["provider"],
+            additionalProperties: false,
+          },
+        },
+        operationClass: "read",
+        batchMode: "serial",
+        execute,
+      },
+    ]);
+    const model = scriptedModel([
+      {
+        id: "response_tools",
+        content: "",
+        providerState: null,
+        toolCalls: [
+          { id: "read", name: "test.echo", argumentsJson: '{"value":"first"}' },
+          {
+            id: "connect",
+            name: "connections.connect",
+            argumentsJson: '{"provider":"google"}',
+          },
+        ],
+        finishReason: "tool_calls",
+        usage: emptyUsage,
+      },
+    ]);
+    const loop = createAgentLoop(harness.runs, harness.writes, model, registry);
+
+    const result = await loop.execute({
+      source: { kind: "inbound", inboundId },
+      traceId,
+      initialMessages: [{ role: "user", content: "Read and connect" }],
+      toolCallGuard: (call) =>
+        call.name === "connections.connect" && completed > 0
+          ? "Connection control must precede provider tools"
+          : undefined,
+    });
+
+    expect(result).toMatchObject({ outcome: "bounded", response: expect.any(String) });
+    expect(completed).toBe(1);
+    expect(maximumActive).toBe(1);
   });
 
   it("removes a redundant hyphen before final reply arrows", async () => {
@@ -1241,6 +1420,7 @@ const echoTool: RegisteredTool = {
     },
   },
   operationClass: "read",
+  batchMode: "parallel_read",
   async execute(argumentsValue) {
     return { ok: true, value: argumentsValue.value };
   },

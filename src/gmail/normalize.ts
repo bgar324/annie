@@ -1,10 +1,28 @@
 import { convert } from "html-to-text";
 import { z } from "zod";
-const maximumThreadBytes = 120 * 1_024;
-const maximumThreadBodyBytes = 96 * 1_024;
-const maximumThreadMessages = 50;
-const maximumThreadAttachments = 100;
+export interface GmailThreadBounds {
+  readonly maximumThreadBytes: number;
+  readonly maximumBodyBytes: number;
+  readonly maximumMessages: number;
+  readonly maximumAttachments: number;
+  readonly maximumMessageBodyBytes: number;
+}
 
+export const fullGmailThreadBounds: GmailThreadBounds = {
+  maximumThreadBytes: 120 * 1_024,
+  maximumBodyBytes: 96 * 1_024,
+  maximumMessages: 50,
+  maximumAttachments: 100,
+  maximumMessageBodyBytes: 32_768,
+};
+
+export const hydratedGmailThreadBounds: GmailThreadBounds = {
+  maximumThreadBytes: 8 * 1_024,
+  maximumBodyBytes: 6 * 1_024,
+  maximumMessages: 6,
+  maximumAttachments: 12,
+  maximumMessageBodyBytes: 2 * 1_024,
+};
 
 const headerSchema = z.object({ name: z.string(), value: z.string() }).loose();
 const partSchema: z.ZodType<GmailPart> = z.lazy(() =>
@@ -84,6 +102,13 @@ export interface NormalizedGmailThreadMessage extends NormalizedGmailMessage {
   }[];
 }
 
+export interface NormalizedGmailThread {
+  id: string;
+  historyId: string | null;
+  messages: readonly NormalizedGmailThreadMessage[];
+  messagesTruncated: boolean;
+}
+
 export function parseGmailMessageList(data: unknown): {
   messages: readonly { id: string; threadId: string | null }[];
   resultSizeEstimate: number | null;
@@ -117,34 +142,32 @@ export function normalizeGmailMetadata(data: unknown): NormalizedGmailMessage {
   };
 }
 
-export function normalizeGmailThread(data: unknown): {
-  id: string;
-  historyId: string | null;
-  messages: readonly NormalizedGmailThreadMessage[];
-  messagesTruncated: boolean;
-} {
+export function normalizeGmailThread(
+  data: unknown,
+  bounds: GmailThreadBounds = fullGmailThreadBounds,
+): NormalizedGmailThread {
   const thread = threadSchema.parse(data);
   const id = truncateUtf8(thread.id, 512).value;
   const historyId = thread.historyId === undefined ? null : truncateUtf8(thread.historyId, 512).value;
   const providerMessages = thread.messages ?? [];
   const messages: NormalizedGmailThreadMessage[] = [];
-  let remainingBodyBytes = maximumThreadBodyBytes;
-  let remainingAttachments = maximumThreadAttachments;
+  let remainingBodyBytes = bounds.maximumBodyBytes;
+  let remainingAttachments = bounds.maximumAttachments;
   let serializedBytes = Buffer.byteLength(JSON.stringify({
     id,
     historyId,
     messages: [],
     messagesTruncated: false,
   }));
-  for (const message of providerMessages.slice(0, maximumThreadMessages)) {
+  for (const message of providerMessages.slice(0, bounds.maximumMessages)) {
     const normalized = normalizeFullMessage(
       message,
-      Math.min(remainingBodyBytes, 32_768),
+      Math.min(remainingBodyBytes, bounds.maximumMessageBodyBytes),
       remainingAttachments,
     );
     const messageBytes = Buffer.byteLength(JSON.stringify(normalized));
     const separatorBytes = messages.length === 0 ? 0 : 1;
-    if (serializedBytes + separatorBytes + messageBytes > maximumThreadBytes) {
+    if (serializedBytes + separatorBytes + messageBytes > bounds.maximumThreadBytes) {
       break;
     }
     messages.push(normalized);
@@ -159,7 +182,6 @@ export function normalizeGmailThread(data: unknown): {
     messagesTruncated: providerMessages.length > messages.length,
   };
 }
-
 
 function normalizeFullMessage(
   message: z.infer<typeof messageSchema>,

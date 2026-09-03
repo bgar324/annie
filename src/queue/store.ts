@@ -3,7 +3,12 @@ import type Database from "better-sqlite3";
 import { newJobId, type JobId, type TraceId } from "../core/ids.js";
 import type { TraceStore } from "../tracing/store.js";
 
-export type JobType = "inbound" | "egress_send" | "egress_reconcile" | "daily_brief";
+export type JobType =
+  | "inbound"
+  | "egress_send"
+  | "egress_reconcile"
+  | "daily_brief"
+  | "memory_maintenance";
 const maximumEgressReconcileAttempts = 16;
 export type JobStatus = "pending" | "running" | "succeeded" | "failed" | "blocked";
 
@@ -205,6 +210,15 @@ export class QueueStore {
                       AND active.status = 'running'
                   )
                   AND (
+                    candidate.type <> 'memory_maintenance'
+                    OR NOT EXISTS (
+                      SELECT 1 FROM jobs AS reply
+                      WHERE reply.trace_id = candidate.trace_id
+                        AND reply.type = 'egress_send'
+                        AND reply.status IN ('pending', 'running')
+                    )
+                  )
+                  AND (
                     candidate.inbound_sequence IS NULL
                     OR NOT EXISTS (
                       SELECT 1 FROM jobs AS earlier
@@ -219,7 +233,14 @@ export class QueueStore {
               (candidate.status = 'running') DESC,
               CASE WHEN candidate.status = 'running'
                 THEN candidate.lease_expires_at_ms
-                ELSE candidate.available_at_ms
+              END,
+              CASE candidate.type
+                WHEN 'egress_send' THEN 0
+                WHEN 'memory_maintenance' THEN 1
+                ELSE 2
+              END,
+              CASE WHEN candidate.status = 'pending'
+                THEN candidate.available_at_ms
               END,
               candidate.inbound_sequence,
               candidate.created_at_ms

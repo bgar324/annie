@@ -164,20 +164,19 @@ describe("post-turn memory maintenance", () => {
       model,
       traces: harness.traces,
     });
+    harness.runs.appendToolMessage(
+      runId,
+      "tool_memory_fixture",
+      JSON.stringify({ tool: "gmail.search", ok: true }),
+    );
 
-    const first = await service.maintain({
+    const first = await service.maintainRun({
       runId,
-      traceId,
-      userMessage: "Remember that I like tea",
-      finalResponse: "I'll remember that.",
-      toolOutcomes: [{ tool: "gmail.search", ok: true }],
+      deadlineAtMs: Date.now() + 60_000,
     });
-    const second = await service.maintain({
+    const second = await service.maintainRun({
       runId,
-      traceId,
-      userMessage: "Remember that I like tea",
-      finalResponse: "I'll remember that.",
-      toolOutcomes: [],
+      deadlineAtMs: Date.now() + 60_000,
     });
 
     expect(first).toEqual({
@@ -187,6 +186,9 @@ describe("post-turn memory maintenance", () => {
     expect(second).toEqual(first);
     expect(requests).toHaveLength(1);
     expect(requests[0]?.messages[0]?.content).toContain("at most 16384 UTF-8 bytes");
+    expect(requests[0]?.messages[1]?.content).toContain("Remember that I like tea");
+    expect(requests[0]?.messages[1]?.content).toContain("Reply remains available");
+    expect(requests[0]?.messages[1]?.content).toContain("gmail.search");
     const run = harness.database.handle.db
       .prepare<{ id: string }, {
         maintenance_requests: number;
@@ -241,12 +243,9 @@ describe("post-turn memory maintenance", () => {
     });
 
     await expect(
-      service.maintain({
+      service.maintainRun({
         runId,
-        traceId,
-        userMessage: "Store too much",
-        finalResponse: "Done",
-        toolOutcomes: [],
+        deadlineAtMs: Date.now() + 60_000,
       }),
     ).resolves.toEqual({ status: "invalid", memory: "# Memory\n\n- Keep this\n" });
     expect(requests).toBe(1);
@@ -269,12 +268,9 @@ describe("post-turn memory maintenance", () => {
     });
 
     await expect(
-      service.maintain({
+      service.maintainRun({
         runId,
-        traceId,
-        userMessage: "Do not break reply",
-        finalResponse: "Reply remains available",
-        toolOutcomes: [],
+        deadlineAtMs: Date.now() + 60_000,
       }),
     ).resolves.toEqual({ status: "failed", memory: "# Memory\n" });
     expect(runMaintenanceStatus(harness.database, runId)).toBe("failed");
@@ -312,12 +308,9 @@ describe("post-turn memory maintenance", () => {
       },
     });
 
-    const maintaining = service.maintain({
+    const maintaining = service.maintainRun({
       runId,
-      traceId,
-      userMessage: "Remember the agent proposal",
-      finalResponse: "Reply remains available",
-      toolOutcomes: [],
+      deadlineAtMs: Date.now() + 60_000,
     });
     await started.promise;
     const current = await harness.documents.loadSnapshot();
@@ -345,14 +338,9 @@ describe("post-turn memory maintenance", () => {
     ).toBe(true);
   });
 
-  it("records a failed maintenance boundary when the run deadline already elapsed", async () => {
+  it("records a failed maintenance boundary when the job deadline already elapsed", async () => {
     const harness = await maintenanceHarness();
     const { runId, traceId } = completedRun(harness, "Reply now", 1);
-    harness.database.handle.db
-      .prepare<{ id: string; deadline_at_ms: number }>(
-        "UPDATE agent_runs SET deadline_at_ms = @deadline_at_ms WHERE id = @id",
-      )
-      .run({ id: runId, deadline_at_ms: Date.now() - 1 });
     let requests = 0;
     const service = new MemoryMaintenanceService({
       db: harness.database.handle.db,
@@ -367,12 +355,9 @@ describe("post-turn memory maintenance", () => {
     });
 
     await expect(
-      service.maintain({
+      service.maintainRun({
         runId,
-        traceId,
-        userMessage: "Reply now",
-        finalResponse: "Reply remains available",
-        toolOutcomes: [],
+        deadlineAtMs: Date.now() - 1,
       }),
     ).resolves.toEqual({ status: "failed", memory: "# Memory\n" });
     expect(requests).toBe(0);
@@ -409,12 +394,9 @@ describe("post-turn memory maintenance", () => {
     });
     try {
       await expect(
-        service.maintain({
+        service.maintainRun({
           runId,
-          traceId,
-          userMessage: "Reply before timeout",
-          finalResponse: "Reply remains durable",
-          toolOutcomes: [],
+          deadlineAtMs: Date.now() + 60_000,
         }),
       ).resolves.toEqual({ status: "failed", memory: "# Memory\n" });
       expect(timeout).toHaveBeenCalledOnce();
@@ -532,6 +514,10 @@ function completedRun(
 ): { runId: RunId; traceId: TraceId } {
   const { inboundId, traceId } = insertInbound(harness.database, harness.traces, userMessage, sequence);
   const run = harness.runs.startOrResume({ source: { kind: "inbound", inboundId }, traceId, deadlineAtMs: Date.now() + 60_000 });
+  harness.runs.appendInitialMessages(run.id, [
+    { role: "system", content: "memory fixture" },
+    { role: "user", content: userMessage },
+  ]);
   harness.runs.complete(run.id, "Reply remains available");
   return { runId: run.id, traceId };
 }

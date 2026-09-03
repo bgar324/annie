@@ -78,6 +78,7 @@ export class RefreshCoordinator {
   readonly #recovery: ConnectionRecoveryService | undefined;
   readonly #fetchImpl: ProviderFetch | undefined;
   readonly #sleep: (milliseconds: number) => Promise<void>;
+  readonly #inflight = new Map<ConnectionId, Promise<Record<string, unknown>>>();
 
   constructor(input: {
     db: Database.Database;
@@ -119,20 +120,43 @@ export class RefreshCoordinator {
     }
     signal?.throwIfAborted();
 
+    const existing = this.#inflight.get(connectionId);
+    if (existing !== undefined) {
+      const credentials = await existing;
+      signal?.throwIfAborted();
+      return credentials as T;
+    }
+    const pending = this.#refreshCredentials(connection, traceId, nowMs, signal);
+    this.#inflight.set(connectionId, pending);
+    try {
+      return (await pending) as T;
+    } finally {
+      if (this.#inflight.get(connectionId) === pending) {
+        this.#inflight.delete(connectionId);
+      }
+    }
+  }
+
+  async #refreshCredentials(
+    connection: ConnectionRecord,
+    traceId: TraceId,
+    nowMs: number,
+    signal: AbortSignal | undefined,
+  ): Promise<Record<string, unknown>> {
     const claim = this.#claim(connection, traceId, nowMs);
     if (claim.kind === "busy") {
       throw new RefreshBusyError();
     }
     if (claim.kind === "ambiguous") {
       this.#connections.markReconnectRequired({
-        connectionId,
+        connectionId: connection.id,
         credentialGeneration: connection.credentialGeneration,
         traceId,
         errorCode: "refresh_acceptance_unknown",
         errorSummary: "A prior token refresh may have rotated credentials before its response was saved",
       });
-      this.#recovery?.planReconnect(connectionId, traceId);
-      throw new RefreshRequiredError(connectionId, `${connection.safeLabel} requires reconnection`);
+      this.#recovery?.planReconnect(connection.id, traceId);
+      throw new RefreshRequiredError(connection.id, `${connection.safeLabel} requires reconnection`);
     }
 
     this.#markDispatched(connection, claim.leaseToken, traceId, nowMs);
@@ -155,10 +179,10 @@ export class RefreshCoordinator {
           expectedConnectionId: connection.id,
           expectedCredentialGeneration: connection.credentialGeneration,
         });
-        return this.#connections.loadCredentials<T>(updated.id);
+        return this.#connections.loadCredentials<Record<string, unknown>>(updated.id);
       } catch (error) {
         if (error instanceof StaleCredentialGenerationError) {
-          return this.#connections.loadCredentials<T>(connection.id);
+          return this.#connections.loadCredentials<Record<string, unknown>>(connection.id);
         }
         throw error;
       }
@@ -175,18 +199,21 @@ export class RefreshCoordinator {
             this.#clearLease(connection.id, claim.leaseToken);
           }
           this.#connections.markReconnectRequired({
-            connectionId,
+            connectionId: connection.id,
             credentialGeneration: connection.credentialGeneration,
             traceId,
             errorCode: error.code,
             errorSummary: error.message,
           });
-          this.#recovery?.planReconnect(connectionId, traceId);
-          throw new RefreshRequiredError(connectionId, `${connection.safeLabel} requires reconnection`);
+          this.#recovery?.planReconnect(connection.id, traceId);
+          throw new RefreshRequiredError(
+            connection.id,
+            `${connection.safeLabel} requires reconnection`,
+          );
         }
         this.#clearLease(connection.id, claim.leaseToken);
         this.#connections.markDegraded({
-          connectionId,
+          connectionId: connection.id,
           credentialGeneration: connection.credentialGeneration,
           traceId,
           retryAtMs: Date.now() + 60_000,

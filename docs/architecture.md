@@ -32,7 +32,7 @@ flowchart LR
   A --> GW[Workspace read adapter]
   A --> N[Notion MCP adapter]
   W --> E[Sendblue egress]
-  A --> MM[Memory maintenance]
+  W --> MM[Memory maintenance]
   MM --> F[MEMORY.md]
   D --> T[JSONL trace projector]
   H[Fastify boundary] --> D
@@ -44,7 +44,7 @@ When enabled, the authoritative process adds a second Fastify instance bound onl
 
 SQLite, `MEMORY.md`, and projected traces share the Railway volume. Production runs one replica because the queue, worker, and WAL database are one local durability unit.
 
-Startup performs configuration validation, SQLite migration and integrity checks, interrupted-write recovery, interrupted-memory recovery, pending trace projection, and trace retention. Startup does not contact Sendblue, Gemini, Google Workspace, or Notion. The receiver, the daily brief scheduler, and the worker start after every configured HTTP listener is bound.
+Startup performs configuration validation, SQLite migration and integrity checks, interrupted-write recovery, interrupted-memory recovery, pending trace projection, and trace retention. Startup does not contact Sendblue, the configured model endpoint, Google Workspace, or Notion. The receiver, the daily brief scheduler, and the worker start after every configured HTTP listener is bound.
 
 ## Inbound message flow
 
@@ -66,9 +66,9 @@ Sendblue does not transcribe inbound audio. A media-only message therefore arriv
 
 ## Durable queue
 
-The queue holds four job types: `inbound`, `daily_brief`, `egress_send`, and `egress_reconcile`. Jobs use lease tokens and lease expirations. A claim increments its attempt count and sets one random lease token. Heartbeats, completion, requeue, failure, and shutdown checks must present that token. An expired lease can be reclaimed; the stale owner cannot commit afterward.
+The queue holds five active job types: `inbound`, `daily_brief`, `egress_send`, `egress_reconcile`, and `memory_maintenance`. Jobs use lease tokens and lease expirations. A claim increments its attempt count and sets one random lease token. Heartbeats, completion, requeue, failure, and shutdown checks must present that token. An expired lease can be reclaimed; the stale owner cannot commit afterward.
 
-Only one job for a chat can run at once. Inbound sequence numbers preserve per-chat order. Internal egress jobs are capacity-exempt so a full user queue cannot prevent a committed result or failure notice from being sent.
+Only one job for a chat can run at once. Inbound sequence numbers preserve per-chat order. Pending reply egress takes priority, followed by its memory job and then ordinary work; expired running jobs remain ordered by lease expiration so recovery cannot starve. A memory job is ineligible while its same-trace reply job is pending or running. Reply and memory jobs inherit the inbound sequence, so the next inbound turn cannot overtake either boundary. Internal egress and memory jobs are capacity-exempt so a full user queue cannot strand a committed result.
 
 A process stop does not release a lease while its handler may still be running. On `SIGTERM`, the configured HTTP listeners begin draining; the receiver, the daily brief scheduler, and the worker observe one shared abort signal and stop after their in-flight sweep or handler returns. SQLite stays open unless every listener drains successfully. Pending traces then project and SQLite closes. If the platform kills the process first, the lease expires and the durable ingress cursor and queue let the next process resume without losing work.
 
@@ -76,7 +76,7 @@ A process stop does not release a lease while its handler may still be running. 
 
 The in-process scheduler reconciles SQLite once per minute. It creates one `daily_brief` job per Los Angeles calendar date with `available_at` set to 08:00 America/Los_Angeles. The unique `(type, subject)` key makes overlapping passes and restarts idempotent. A missing brief can catch up for two hours after 08:00; after that window, the scheduler creates the next day's job. Scheduling performs no provider request.
 
-A daily brief run points `agent_runs.scheduled_job_id` at the claimed job instead of fabricating an inbound message. It runs through the normal bounded agent loop, memory maintenance, egress write-intent, and delivery reconciliation paths.
+A daily brief run points `agent_runs.scheduled_job_id` at the claimed job instead of fabricating an inbound message. It runs through the normal bounded agent loop, durable reply planning, egress write-intent, post-send memory maintenance, and delivery reconciliation paths.
 
 The production registry remains exactly eight tools. For a daily brief, `AgentLoop` filters the model definitions to `gmail.search`, `gmail.read_thread`, `google.search`, `google.read`, `notion.search`, and `notion.fetch`. The request requires one Gmail search and one batched Calendar, Drive, and Tasks search for each capable Google account. It requires one search for each capable Notion workspace. Contacts remain available on demand but are not part of the daily brief. The completion guard checks each account and product facet by the bound connection and exact safe label. With no healthy source, the service sends connection instructions without calling the model.
 
@@ -102,10 +102,14 @@ Each run has a durable transcript and enforces these bounds:
 - sixteen tool calls total;
 - four tool calls in one model response;
 - two provider writes;
-- eight exponentially backed-off transport attempts for one Gemini request, still bounded by the whole-run deadline;
+- eight exponentially backed-off transport attempts for one model request, still bounded by the whole-run deadline;
 - 18,996 characters for the final iMessage response, matching the Sendblue content cap.
 
-Internal tool names use dots. The Gemini adapter alone converts dots to underscores on the wire and maps returned calls back to the internal names. It stores each assistant wire message as opaque provider state and replays it unchanged so Gemini thought signatures survive tool rounds; core code never interprets that state.
+Internal tool names use dots. The OpenAI-compatible adapter alone converts dots to underscores on the wire and maps returned calls back to the internal names. It stores each assistant wire message as opaque provider state and replays it unchanged so provider reasoning signatures survive tool rounds; core code never interprets that state.
+
+Only the six provider reads explicitly registered as `parallel_read` execute concurrently, up to the four-call response limit. Unmarked reads, both connection-control tools, and writes remain serial by default. Parallel results are persisted back to the transcript in model call order, and individual failures remain isolated.
+
+The repository retains its legacy `GEMINI_*` configuration contract and the `gemini-3.7-flash`/low fallback. At benchmark time, the deployed Railway environment overrode those settings with `deepseek-v4-flash` and high reasoning effort. This bundle does not rename secrets or change the fallback. Direct deployed-model benchmarks showed that disabling thinking reduced latency but missed an explicit future-brief preference during memory maintenance, so the deployment remains on high effort.
 
 ## Production tools
 
@@ -124,9 +128,9 @@ The production registry contains exactly these tools:
 
 There are no delete, archive, move, raw request, or catch-all tools. Daily brief runs use the same registry but can execute only the six read tools; a pre-execution policy rejects Contacts search and detail arguments before a provider call.
 
-`connections.list` and `connections.connect` are inbound control tools outside the eight-tool provider registry. `connections.list` reads current SQLite state when executed and returns only provider, safe label, health status, and capabilities. `connections.connect` accepts only `google` or `notion` and returns an opaque confirmation that infrastructure will append a link; it never returns a signed URL. Their calls and results use the normal durable agent transcript, and the model authors the final reply in the following round. Daily brief runs never receive either control tool.
+`connections.list` and `connections.connect` are inbound control tools outside the eight-tool provider registry. Each inbound prompt already contains one safe connection snapshot. `connections.list` reads current SQLite state when explicitly asked about connection status or when that snapshot may be stale; ordinary reads do not spend a model round rediscovering labels. `connections.connect` accepts only `google` or `notion` and returns an opaque confirmation that infrastructure will append a link; it never returns a signed URL. Their calls and results use the normal durable agent transcript, and the model authors the final reply in the following round. Daily brief runs never receive either control tool.
 
-Gmail is read-only. `google.search` accepts one account and a closed batch of unique product queries. `google.read` accepts only a Drive file ID, Contacts resource ID, or Tasks list-and-task ID. Calendar searches already return complete bounded event records, so Calendar has no detail-read branch. Drive content reads stream at most 64 KiB of text. Google Docs and Slides export as plain text. Google Sheets export as CSV from the first sheet and report that limitation. Unsupported binary, download-restricted, and client-side encrypted files return metadata without content.
+Gmail is read-only. A search fetches message metadata in order with at most five concurrent requests. A targeted search can hydrate zero to three top distinct threads in the same tool call, bounded to 8 KiB per thread, 24 KiB across hydration, and 120 KiB for the complete search result; a failed hydration preserves the metadata result. `google.search` accepts one account and a closed batch of unique product queries. `google.read` accepts only a Drive file ID, Contacts resource ID, or Tasks list-and-task ID. Calendar searches already return complete bounded event records, so Calendar has no detail-read branch. Drive content reads stream at most 64 KiB of text. Google Docs and Slides export as plain text. Google Sheets export as CSV from the first sheet and report that limitation. Unsupported binary, download-restricted, and client-side encrypted files return metadata without content.
 
 Notion uses one hosted Streamable HTTP MCP session per selected workspace operation. Every session reads all advertised tool pages. The adapter intersects those names with the four allowlisted upstream tools and the workspace's current access, then validates the exact call arguments against the selected tool's live input schema. An incompatible write fails before write-intent preparation or provider dispatch. Schema changes and missing tools fail only the affected call; they do not change connection health or require OAuth reconnection.
 
@@ -141,11 +145,11 @@ Each provider tool call selects one connection in one of two ways:
 
 The adapter rejects zero matches as connection-required and multiple unlabeled matches as ambiguous. This is a per-call safety boundary, not a user-facing account picker.
 
-For an unscoped read, the inbound agent first calls `connections.list`. It then calls the required read tool once for each healthy capable account with its exact safe label. The agent merges the results and deduplicates the same underlying item across accounts. It keeps distinct items that happen to share a title. The answer omits account details unless they disambiguate a result or explain a source failure. An explicit safe label scopes a read.
+For an unscoped read, the agent uses the safe connection snapshot already present in its prompt. It calls the required read tool once for each healthy capable account with its exact safe label, and those independent calls can run concurrently. The agent merges the results and deduplicates the same underlying item across accounts. It keeps distinct items that happen to share a title. The answer omits account details unless they disambiguate a result or explain a source failure. An explicit safe label scopes a read.
 
 Writes never fan out. The agent asks for a target only when neither the request nor a preceding read establishes one. One connection's refresh or health transition never changes another connection.
 
-Google and Notion token refreshes use credential generations and refresh leases. A stale refresh result cannot overwrite newer credentials. A crash after refresh dispatch is treated as ambiguous because the provider may have rotated the refresh token; that connection requires browser reconnection instead of an automatic retry.
+Google and Notion token refreshes use credential generations and refresh leases. Concurrent reads in one process join the same in-flight refresh for a connection. A stale refresh result cannot overwrite newer credentials. A crash after refresh dispatch is treated as ambiguous because the provider may have rotated the refresh token; that connection requires browser reconnection instead of an automatic retry.
 
 ## Signed browser connection flow
 
@@ -172,9 +176,9 @@ Sendblue reply sending uses the same rule. One `POST` send carries the reply, an
 
 `MEMORY.md` is the only canonical long-term memory. It starts with `# Memory`, is at most 16 KiB, and cannot contain configured secrets or signed connection URLs.
 
-After a successful agent answer, one thinking-disabled model request returns either `unchanged` or a complete replacement document. The service validates the replacement and writes it through a same-directory temporary file, file sync, atomic rename, and directory sync. It records before and after digests plus a unified diff in the trace. Memory maintenance finishes or fails closed before reply egress is prepared.
+After a successful agent answer, reply preparation writes the egress row, Sendblue write intent, `egress_send` job, and `memory_maintenance` job in one SQLite transaction. The worker attempts reply egress first. Memory remains ineligible while that reply job is pending or running, then runs after the reply reaches a terminal queue state; memory failure never retracts or repeats the reply.
 
-A completed run can resume this maintenance-and-reply boundary after a process stop. Maintenance and reply preparation are both durable and idempotent, so recovery does not generate a second model answer or a duplicate reply.
+The memory job reconstructs the user message, final response, and ordered tool outcomes from the durable run instead of carrying transient context in its payload. One configured-model request, bounded to 45 seconds and ending at least five seconds before the job lease, returns either `unchanged` or a complete replacement document. The service validates a replacement and writes it through a same-directory temporary file, file sync, atomic rename, and directory sync. It records before and after digests plus a unified diff in the trace. The job is idempotent by run ID, and startup resolves an interrupted prepared replacement before reclaiming queued work.
 
 ## Traces and replay
 

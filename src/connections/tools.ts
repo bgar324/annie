@@ -40,7 +40,7 @@ export function connectionTools(connections: ConnectionStore): readonly Register
       definition: {
         name: "connections.list",
         description:
-          "List the accounts connected to Annie right now, including each safe label, provider, health status, and capabilities. Use this as the authoritative source for connection questions and to discover exact safe labels before automatic multi-account reads.",
+          "List the accounts connected to Annie right now, including each safe label, provider, live health status, and capabilities. Use this authoritative live result for connection-status questions or when a provider tool reports that the prompt snapshot is stale; ordinary reads already receive a safe account snapshot.",
         parameters: {
           type: "object",
           properties: {},
@@ -49,6 +49,7 @@ export function connectionTools(connections: ConnectionStore): readonly Register
         },
       },
       operationClass: "read",
+      batchMode: "serial",
       execute: async () => ({
         connections: connections.list().map(toSafeConnectionView),
       }),
@@ -68,6 +69,7 @@ export function connectionTools(connections: ConnectionStore): readonly Register
         },
       },
       operationClass: "read",
+      batchMode: "serial",
       execute: async (argumentsValue) => {
         const { provider } = connectArgumentsSchema.parse(argumentsValue);
         return { provider, connectionLinkWillBeAppended: true };
