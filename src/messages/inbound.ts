@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { newInboundId, newTraceId, type TraceId } from "../core/ids.js";
 import type { QueueStore } from "../queue/store.js";
+import type { TraceEvictionService } from "../tracing/eviction.js";
 import type { TraceProjector } from "../tracing/jsonl.js";
 import type { TraceStore } from "../tracing/store.js";
 import type { InboundMessage } from "./types.js";
@@ -21,7 +22,8 @@ export class MessageIngressService {
   readonly #queue: QueueStore;
   readonly #traces: TraceStore;
   readonly #projector: TraceProjector;
-  readonly #lineNumber: string;
+  readonly #eviction: TraceEvictionService;
+  #lineNumber: string;
   readonly #trustedSender: string;
 
   constructor(input: {
@@ -29,6 +31,7 @@ export class MessageIngressService {
     queue: QueueStore;
     traces: TraceStore;
     projector: TraceProjector;
+    eviction: TraceEvictionService;
     lineNumber: string;
     trustedSender: string;
   }) {
@@ -36,6 +39,7 @@ export class MessageIngressService {
     this.#queue = input.queue;
     this.#traces = input.traces;
     this.#projector = input.projector;
+    this.#eviction = input.eviction;
     this.#lineNumber = input.lineNumber;
     this.#trustedSender = input.trustedSender;
   }
@@ -171,6 +175,12 @@ export class MessageIngressService {
     });
 
     const result = transaction.immediate();
+    if (result.kind === "duplicate") {
+      // The overlap window re-observes the newest message on every sweep, so
+      // duplicate observations are steady-state noise with nothing to debug.
+      this.#eviction.evictTrace(traceId);
+      return result;
+    }
     try {
       this.#projector.project(traceId);
     } catch {

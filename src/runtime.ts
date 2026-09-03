@@ -321,6 +321,7 @@ export async function createRuntime(
       queue,
       traces,
       projector,
+      eviction,
       lineNumber: config.sendblue.fromNumber,
       trustedSender: config.userPhoneNumber,
     });

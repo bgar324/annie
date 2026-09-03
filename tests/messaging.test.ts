@@ -241,7 +241,20 @@ describe("Sendblue inbound sweep", () => {
     expect(countRows(harness, "jobs")).toBe(1);
     expect(
       spooledEvents(harness, "ingress").filter((event) => event.event === "duplicate"),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
+    expect(spooledEvents(harness, "ingress").some((event) => event.event === "accepted")).toBe(
+      true,
+    );
+    const traceFiles = readdirSync(harness.config.traceDir).filter((name) =>
+      name.endsWith(".jsonl"),
+    );
+    const acceptedTraceId = harness.database.handle.db
+      .prepare<[], { trace_id: string }>("SELECT trace_id FROM inbound_messages")
+      .get()?.trace_id;
+    expect(traceFiles).toContain(`${acceptedTraceId}.jsonl`);
+    // Only the accepted turn and the rotating poll trace remain; the duplicate
+    // observation was evicted.
+    expect(traceFiles).toHaveLength(2);
   });
 
   it("catches up on a message the overlap window exposes after a restart", async () => {
@@ -1245,6 +1258,7 @@ function createMessagingHarness(options: { maxPending?: number } = {}): Messagin
     queue,
     traces,
     projector,
+    eviction,
     lineNumber: config.sendblue.fromNumber,
     trustedSender: config.userPhoneNumber,
   });
