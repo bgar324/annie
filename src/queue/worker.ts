@@ -1,3 +1,4 @@
+import type { TraceEvictionService } from "../tracing/eviction.js";
 import type { TraceProjector } from "../tracing/jsonl.js";
 import { LostLeaseError, QueueStore, type ClaimedJob, type JobType } from "./store.js";
 
@@ -31,6 +32,7 @@ export class DurableWorker {
   readonly #queue: QueueStore;
   readonly #handlers: JobHandlers;
   readonly #projector: TraceProjector;
+  readonly #eviction: TraceEvictionService | undefined;
   readonly #pollMs: number;
   readonly #heartbeatMs: number;
   readonly #log: (level: "debug" | "warn" | "error", message: string, data?: unknown) => void;
@@ -40,6 +42,7 @@ export class DurableWorker {
     queue: QueueStore;
     handlers: JobHandlers;
     projector: TraceProjector;
+    eviction?: TraceEvictionService;
     pollMs: number;
     leaseMs: number;
     log?: (level: "debug" | "warn" | "error", message: string, data?: unknown) => void;
@@ -47,6 +50,7 @@ export class DurableWorker {
     this.#queue = input.queue;
     this.#handlers = input.handlers;
     this.#projector = input.projector;
+    this.#eviction = input.eviction;
     this.#pollMs = input.pollMs;
     this.#heartbeatMs = Math.max(1_000, Math.floor(input.leaseMs / 3));
     this.#log = input.log ?? (() => undefined);
@@ -113,10 +117,22 @@ export class DurableWorker {
       }
     } finally {
       clearInterval(heartbeat);
-      try {
-        this.#projector.project(job.traceId);
-      } catch (error) {
-        this.#log("error", "Trace projection failed", { traceId: job.traceId, error });
+      // Evict after the queue row settles (its completion event is the last
+      // trace append) and skip projecting a trace that no longer exists.
+      let evicted = false;
+      if (this.#eviction !== undefined) {
+        try {
+          evicted = this.#eviction.maybeEvictSuccessfulTurn(job.traceId);
+        } catch (error) {
+          this.#log("error", "Trace eviction failed", { traceId: job.traceId, error });
+        }
+      }
+      if (!evicted) {
+        try {
+          this.#projector.project(job.traceId);
+        } catch (error) {
+          this.#log("error", "Trace projection failed", { traceId: job.traceId, error });
+        }
       }
     }
   }

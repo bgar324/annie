@@ -4,11 +4,12 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentRunStore } from "../src/agent/store.js";
 import { compactDatabase } from "../src/db/database.js";
+import { newInboundId, newTraceId, type TraceId } from "../src/core/ids.js";
 import { runCli, type CliIo } from "../src/cli.js";
-import { newInboundId, newTraceId } from "../src/core/ids.js";
 import { buildSafeReplay, renderSafeReplay } from "../src/replay.js";
 import { TraceProjector } from "../src/tracing/jsonl.js";
 import { createTraceRedactor } from "../src/tracing/redaction.js";
+import { TraceEvictionService } from "../src/tracing/eviction.js";
 import { TraceRetentionService, emergencyTrimTraceFiles } from "../src/tracing/retention.js";
 import { TraceStore } from "../src/tracing/store.js";
 import { createTestDatabase, type TestDatabase } from "./helpers.js";
@@ -314,7 +315,156 @@ describe("trace operations", () => {
     expect(sizeAfter).toBeLessThan(sizeBefore);
     expect(compactDatabase(database.handle.db, 65_536)).toBe(false);
   });
+
+  it("evicts only fully successful turns and keeps failures and in-flight work debuggable", () => {
+    const database = trackedDatabase();
+    const traces = new TraceStore(database.handle.db, createTraceRedactor([]));
+    const projector = new TraceProjector(database.handle.db, traces, database.config.traceDir);
+    const eviction = new TraceEvictionService({
+      db: database.handle.db,
+      traceDir: database.config.traceDir,
+    });
+    const completed = turnFixture(database, traces, projector, {});
+    const memoryPending = turnFixture(database, traces, projector, { memory: "pending" });
+    const runFailed = turnFixture(database, traces, projector, { phase: "failed", memory: "pending" });
+    const failureNoticed = turnFixture(database, traces, projector, { failureNotice: true });
+    const ambiguousWrite = turnFixture(database, traces, projector, { writeState: "ambiguous" });
+    const unconfirmedReply = turnFixture(database, traces, projector, { replyState: "sent" });
+    const runningMemoryJob = turnFixture(database, traces, projector, { runningMemoryJob: true });
+
+    expect(eviction.maybeEvictSuccessfulTurn(completed.traceId)).toBe(true);
+    expect(traceExists(database, completed.traceId)).toBe(false);
+    expect(existsSync(completed.filePath)).toBe(false);
+    for (const fixture of [memoryPending, runFailed, failureNoticed, ambiguousWrite, unconfirmedReply]) {
+      expect(eviction.maybeEvictSuccessfulTurn(fixture.traceId)).toBe(false);
+      expect(traceExists(database, fixture.traceId)).toBe(true);
+    }
+    expect(eviction.maybeEvictSuccessfulTurn(runningMemoryJob.traceId)).toBe(true);
+  });
+
+  it("sweeps every completed turn while leaving failures for the retention window", () => {
+    const database = trackedDatabase();
+    const traces = new TraceStore(database.handle.db, createTraceRedactor([]));
+    const projector = new TraceProjector(database.handle.db, traces, database.config.traceDir);
+    const eviction = new TraceEvictionService({
+      db: database.handle.db,
+      traceDir: database.config.traceDir,
+    });
+    const first = turnFixture(database, traces, projector, {});
+    const second = turnFixture(database, traces, projector, { memory: "unchanged" });
+    const failed = turnFixture(database, traces, projector, { phase: "failed", memory: "pending" });
+
+    expect(eviction.evictCompletedTurns()).toEqual(
+      expect.arrayContaining([first.traceId, second.traceId]),
+    );
+    expect(traceExists(database, first.traceId)).toBe(false);
+    expect(traceExists(database, second.traceId)).toBe(false);
+    expect(traceExists(database, failed.traceId)).toBe(true);
+  });
 });
+interface TurnFixture {
+  traceId: TraceId;
+  filePath: string;
+}
+
+function turnFixture(
+  database: TestDatabase,
+  traces: TraceStore,
+  projector: TraceProjector,
+  options: {
+    phase?: string;
+    memory?: string;
+    replyState?: string;
+    failureNotice?: boolean;
+    writeState?: string;
+    runningMemoryJob?: boolean;
+  },
+): TurnFixture {
+  const traceId = newTraceId();
+  traces.append({ traceId, component: "fixture", event: "completed", data: {} });
+  traces.markTerminal(traceId);
+  projector.project(traceId);
+  const now = Date.now();
+  const runId = `run_${traceId}`;
+  const replyId = `egress_${traceId}`;
+  const jobId = `job_${traceId}`;
+  database.handle.db
+    .prepare(`
+      INSERT INTO jobs(
+        id, chat_id, type, subject_id, payload_json, status, attempts,
+        available_at_ms, trace_id, run_id, created_at_ms, updated_at_ms
+      ) VALUES (
+        @job_id, '+15550000001', 'daily_brief', @run_id, '{}', 'succeeded', 1,
+        @now, @trace_id, @run_id, @now, @now
+      )
+    `)
+    .run({ job_id: jobId, run_id: runId, trace_id: traceId, now });
+  database.handle.db
+    .prepare(`
+      INSERT INTO agent_runs(
+        id, scheduled_job_id, trace_id, phase, deadline_at_ms, memory_maintenance_status,
+        created_at_ms, updated_at_ms
+      ) VALUES (@run_id, @job_id, @trace_id, @phase, @deadline, @memory, @now, @now)
+    `)
+    .run({
+      run_id: runId,
+      job_id: jobId,
+      trace_id: traceId,
+      phase: options.phase ?? "completed",
+      deadline: now + 60_000,
+      memory: options.memory ?? "updated",
+      now,
+    });
+  database.handle.db
+    .prepare(`
+      INSERT INTO egress_messages(
+        id, trace_id, recipient_handle, line_handle, body, purpose, state,
+        attempt_count, created_at_ms, updated_at_ms
+      ) VALUES (@id, @trace_id, '+15550000001', '+15550000002', 'ok', 'reply', @state, 1, @now, @now)
+    `)
+    .run({ id: replyId, trace_id: traceId, state: options.replyState ?? "delivered", now });
+  if (options.failureNotice === true) {
+    database.handle.db
+      .prepare(`
+        INSERT INTO egress_messages(
+          id, trace_id, recipient_handle, line_handle, body, purpose, state,
+          attempt_count, created_at_ms, updated_at_ms
+        ) VALUES (@id, @trace_id, '+15550000001', '+15550000002', 'failed', 'failure', 'delivered', 1, @now, @now)
+      `)
+      .run({ id: `notice_${traceId}`, trace_id: traceId, now });
+  }
+  if (options.writeState !== undefined) {
+    database.handle.db
+      .prepare(`
+        INSERT INTO write_intents(
+          id, run_id, egress_id, kind, state, request_fingerprint,
+          safe_summary_json, request_json, created_at_ms, updated_at_ms
+        ) VALUES (@id, @run_id, @egress_id, 'sendblue_send_message', @state, 'f', '{}', '{}', @now, @now)
+      `)
+      .run({
+        id: `write_${traceId}`,
+        run_id: runId,
+        egress_id: replyId,
+        state: options.writeState,
+        now,
+      });
+  }
+  if (options.runningMemoryJob === true) {
+    database.handle.db
+      .prepare(`
+        INSERT INTO jobs(
+          id, chat_id, type, subject_id, payload_json, status, attempts,
+          available_at_ms, lease_token, lease_expires_at_ms, trace_id, run_id,
+          created_at_ms, updated_at_ms
+        ) VALUES (
+          @id, '+15550000001', 'memory_maintenance', @run_id, '{}', 'running', 1,
+          @now, 'lease', @deadline, @trace_id, @run_id, @now, @now
+        )
+      `)
+      .run({ id: `memjob_${traceId}`, run_id: runId, trace_id: traceId, now, deadline: now + 60_000 });
+  }
+  return { traceId, filePath: join(database.config.traceDir, `${traceId}.jsonl`) };
+}
 
 function trackedDatabase(): TestDatabase {
   const database = createTestDatabase();

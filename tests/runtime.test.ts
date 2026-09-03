@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -477,12 +477,10 @@ describe("production runtime", () => {
         .prepare<{ trace_id: string }, { state: string }>(
           "SELECT state FROM trace_streams WHERE trace_id = @trace_id",
         )
-        .get({ trace_id: traceId })?.state,
-    ).toBe("exported");
-
-    item.runtime.projector.projectPending();
-    const traceText = readFileSync(join(item.directory, "traces", `${traceId}.jsonl`), "utf8");
-    expect(traceText).toContain('"event":"delivered"');
+        .get({ trace_id: traceId }),
+    ).toBeUndefined();
+    expect(item.runtime.traces.list(traceId)).toHaveLength(0);
+    expect(existsSync(join(item.directory, "traces", `${traceId}.jsonl`))).toBe(false);
   });
   it("projects deferred memory after an immediately delivered reply", async () => {
     const model = new FakeModel();
@@ -512,23 +510,10 @@ describe("production runtime", () => {
         .prepare<{ trace_id: string }, { state: string }>(
           "SELECT state FROM trace_streams WHERE trace_id = @trace_id",
         )
-        .get({ trace_id: traceId })?.state,
-    ).toBe("exported");
-    const projected = readFileSync(
-      join(item.directory, "traces", `${traceId}.jsonl`),
-      "utf8",
-    )
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as { component: string; event: string });
-    const delivered = projected.findIndex(
-      (event) => event.component === "egress" && event.event === "delivered",
-    );
-    const updated = projected.findIndex(
-      (event) => event.component === "memory" && event.event === "updated",
-    );
-    expect(delivered).toBeGreaterThan(-1);
-    expect(updated).toBeGreaterThan(delivered);
+        .get({ trace_id: traceId }),
+    ).toBeUndefined();
+    expect(existsSync(join(item.directory, "traces", `${traceId}.jsonl`))).toBe(false);
+    expect(egressState(item.runtime)).toBe("delivered");
   });
 
 
@@ -2389,7 +2374,9 @@ async function runNextJob(runtime: AssistantRuntime, nowMs: number): Promise<voi
   };
   await runtime.handlers[job.type](job, context);
   runtime.queue.complete(job);
-  runtime.projector.project(job.traceId);
+  if (!runtime.eviction.maybeEvictSuccessfulTurn(job.traceId)) {
+    runtime.projector.project(job.traceId);
+  }
 }
 
 function requiredJob(job: ClaimedJob | undefined): ClaimedJob {

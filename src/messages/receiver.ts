@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { newTraceId, type TraceId } from "../core/ids.js";
 import { QueueCapacityError } from "../queue/store.js";
+import type { TraceEvictionService } from "../tracing/eviction.js";
 import type { TraceProjector } from "../tracing/jsonl.js";
 import type { TraceEventInput, TraceStore } from "../tracing/store.js";
 import { MessageIngressService } from "./inbound.js";
@@ -26,6 +27,7 @@ export class SendblueReceiver {
   readonly #ingress: MessageIngressService;
   readonly #traces: TraceStore;
   readonly #projector: TraceProjector;
+  readonly #eviction: TraceEvictionService;
   #initialized = false;
   #wakeVersion = 0;
   #wakeWaiter: (() => void) | undefined;
@@ -39,12 +41,14 @@ export class SendblueReceiver {
     ingress: MessageIngressService;
     traces: TraceStore;
     projector: TraceProjector;
+    eviction: TraceEvictionService;
   }) {
     this.#db = input.db;
     this.#gateway = input.gateway;
     this.#ingress = input.ingress;
     this.#traces = input.traces;
     this.#projector = input.projector;
+    this.#eviction = input.eviction;
   }
 
   initialize(nowMs = Date.now()): void {
@@ -173,12 +177,15 @@ export class SendblueReceiver {
       outcome: "closed",
       data: {},
     });
-    this.#traces.markTerminal(traceId);
+    if (this.#eviction.evictUnlessEvents(traceId, ["sweep_failed"])) {
+      this.#pollTraceId = undefined;
+      this.#wakeWaiter?.();
+      return;
+    }
     this.#projectPollTrace();
     this.#pollTraceId = undefined;
     this.#wakeWaiter?.();
   }
-
   async #runSweeps(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       const observedWake = this.#wakeVersion;
@@ -278,7 +285,9 @@ export class SendblueReceiver {
         }
       }
       this.#traces.markTerminal(traceId);
-      this.#project(traceId);
+      if (!this.#eviction.evictUnlessEvents(traceId, ["stream_failed"])) {
+        this.#project(traceId);
+      }
       if (!signal.aborted && failures > 0) {
         await waitFor(Math.min(30_000, 1_000 * 2 ** Math.min(failures - 1, 5)), signal);
       }

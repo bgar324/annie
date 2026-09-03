@@ -47,6 +47,7 @@ import {
 } from "./queue/worker.js";
 import { CredentialVault } from "./security/vault.js";
 import { TraceProjector } from "./tracing/jsonl.js";
+import { TraceEvictionService } from "./tracing/eviction.js";
 import { createTraceRedactor } from "./tracing/redaction.js";
 import { TraceStore } from "./tracing/store.js";
 import { TraceRetentionService, emergencyTrimTraceFiles } from "./tracing/retention.js";
@@ -84,6 +85,7 @@ export interface AssistantRuntime {
   queue: QueueStore;
   traces: TraceStore;
   projector: TraceProjector;
+  eviction: TraceEvictionService;
   tools: ToolRegistry;
   localUi: LocalUiServices;
   isReady(): boolean;
@@ -106,6 +108,7 @@ export async function createRuntime(
   try {
     const traces = new TraceStore(database.db, createTraceRedactor(config.secretValues));
     const projector = new TraceProjector(database.db, traces, config.traceDir);
+    const eviction = new TraceEvictionService({ db: database.db, traceDir: config.traceDir });
     const queue = new QueueStore({
       db: database.db,
       traces,
@@ -309,6 +312,7 @@ export async function createRuntime(
       queue,
       handlers,
       projector,
+      eviction,
       pollMs: config.limits.workerPollMs,
       leaseMs: config.limits.jobLeaseMs,
     });
@@ -326,6 +330,7 @@ export async function createRuntime(
       ingress,
       traces,
       projector,
+      eviction,
     });
     receiver.initialize();
     const app = fastify({
@@ -345,6 +350,7 @@ export async function createRuntime(
     writes.recoverOpenAttempts();
     recovery.planPendingReconnects("google");
     await maintenance.recoverInterrupted();
+    eviction.evictCompletedTurns();
     const retention = new TraceRetentionService({
       db: database.db,
       traceDir: config.traceDir,
@@ -363,6 +369,7 @@ export async function createRuntime(
     const traceSweep = setInterval(() => {
       try {
         projector.projectPending();
+        eviction.evictCompletedTurns();
         retention.cleanup();
       } catch (error) {
         app.log.error({ err: error }, "trace retention sweep failed");
@@ -375,12 +382,13 @@ export async function createRuntime(
       database,
       worker,
       receiver,
-      dailyBrief,
-      handlers,
       queue,
       traces,
       projector,
+      eviction,
       tools,
+      dailyBrief,
+      handlers,
       localUi: { connections, links, memory },
       isReady() {
         return ready;

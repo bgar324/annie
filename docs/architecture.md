@@ -183,6 +183,6 @@ The memory job reconstructs the user message, final response, and ordered tool o
 
 ## Traces and replay
 
-Trace events first enter a redacted SQLite spool with a monotonically increasing sequence. JSONL files are repairable projections of that spool. A partial or divergent file is rebuilt atomically from SQLite. Terminal traces receive a digest and become eligible for age and byte-cap retention only after export.
+Trace events first enter a redacted SQLite spool with a monotonically increasing sequence. JSONL files are repairable projections of that spool. A partial or divergent file is rebuilt atomically from SQLite. Traces are debugging artifacts, not functional state: once a turn fully succeeds — completed run, memory maintenance applied, reply delivery confirmed, no failure notice, open write, or queued work — its trace is evicted immediately when the last job settles, and a clean Sendblue sweep or stream rotation evicts its trace without ever projecting a file. Failures, ambiguous writes, and in-flight turns keep their traces until terminal, then age and byte-cap retention expire them after export.
 
 `pnpm trace -- <trace-id>` renders the chronology and identifies the final failure. `pnpm replay -- <trace-id>` reconstructs the captured transcript and tool outcomes in `mock_only` mode. Replay loads storage configuration only; it cannot load the credential key, decrypt connections, contact a provider, execute a tool, or update application rows.

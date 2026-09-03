@@ -1,5 +1,5 @@
 import { getEventListeners } from "node:events";
-import { rmSync } from "node:fs";
+import { readdirSync, rmSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadRuntimeConfig, type RuntimeConfig } from "../src/config.js";
 import {
@@ -25,6 +25,7 @@ import {
 } from "../src/messages/types.js";
 import { QueueCapacityError, QueueStore, type ClaimedJob } from "../src/queue/store.js";
 import { DurableWorker } from "../src/queue/worker.js";
+import { TraceEvictionService } from "../src/tracing/eviction.js";
 import { TraceProjector } from "../src/tracing/jsonl.js";
 import { createTraceRedactor } from "../src/tracing/redaction.js";
 import { TraceStore } from "../src/tracing/store.js";
@@ -42,6 +43,7 @@ interface MessagingHarness {
   queue: QueueStore;
   traces: TraceStore;
   projector: TraceProjector;
+  eviction: TraceEvictionService;
   writes: WriteStore;
   gateway: FakeSendblueGateway;
   ingress: MessageIngressService;
@@ -53,6 +55,7 @@ class FakeSendblueGateway implements MessageGateway {
   inbox: InboundMessage[] = [];
   maxPageSize = pageSize;
   listError: MessagingProviderError | undefined;
+  streamError: MessagingProviderError | undefined;
   wakeEventCount = 0;
   streamOpens = 0;
   sendHandle = "msg_handle_1";
@@ -107,6 +110,9 @@ class FakeSendblueGateway implements MessageGateway {
 
   async openInboundWakeStream(signal: AbortSignal): Promise<InboundWakeStream> {
     this.streamOpens += 1;
+    if (this.streamError !== undefined) {
+      throw this.streamError;
+    }
     return {
       events: wakeEvents(this.wakeEventCount, signal),
       requestId: `req_stream_${this.streamOpens}`,
@@ -279,11 +285,49 @@ describe("Sendblue inbound sweep", () => {
     await running;
 
     expect(harness.gateway.streamOpens).toBe(1);
-    expect(spooledEvents(harness, "sendblue_stream").map((event) => event.event)).toContain(
-      "stream_opened",
-    );
+    expect(spooledEvents(harness, "sendblue_stream")).toHaveLength(0);
     expect(countRows(harness, "inbound_messages")).toBe(0);
     expect(countRows(harness, "webhook_deliveries")).toBe(0);
+  });
+
+  it("evicts the trace of a clean stream rotation without projecting it", async () => {
+    const harness = createMessagingHarness();
+    harness.gateway.wakeEventCount = 1;
+    const receiver = createReceiver(harness);
+    receiver.initialize(Date.now());
+    const controller = new AbortController();
+
+    const running = receiver.run(controller.signal);
+    await harness.gateway.listedAtLeast(2);
+    controller.abort();
+    await running;
+
+    expect(spooledEvents(harness, "sendblue_stream")).toHaveLength(0);
+    const traceFiles = readdirSync(harness.config.traceDir).filter((name) =>
+      name.endsWith(".jsonl"),
+    );
+    expect(traceFiles).toHaveLength(0);
+  });
+
+  it("keeps the trace of a failed stream rotation for debugging", async () => {
+    const harness = createMessagingHarness();
+    harness.gateway.streamError = new MessagingProviderError({
+      message: "stream unavailable",
+      kind: "transient",
+      retryAfterMs: 10,
+    });
+    const receiver = createReceiver(harness);
+    receiver.initialize(Date.now());
+    const controller = new AbortController();
+
+    const running = receiver.run(controller.signal);
+    await harness.gateway.listedAtLeast(2);
+    controller.abort();
+    await running;
+
+    expect(
+      spooledEvents(harness, "sendblue_stream").map((event) => event.event),
+    ).toContain("stream_failed");
   });
 
   it("rejects any message that is not the exact trusted sender on the exact line", () => {
@@ -1187,6 +1231,7 @@ function createMessagingHarness(options: { maxPending?: number } = {}): Messagin
   const config = testRuntimeConfig(database);
   const traces = new TraceStore(database.handle.db, createTraceRedactor(config.secretValues));
   const projector = new TraceProjector(database.handle.db, traces, database.config.traceDir);
+  const eviction = new TraceEvictionService({ db: database.handle.db, traceDir: database.config.traceDir });
   const queue = new QueueStore({
     db: database.handle.db,
     traces,
@@ -1217,6 +1262,7 @@ function createMessagingHarness(options: { maxPending?: number } = {}): Messagin
     queue,
     traces,
     projector,
+    eviction,
     writes,
     gateway,
     ingress,
@@ -1234,6 +1280,7 @@ function createReceiver(harness: MessagingHarness): SendblueReceiver {
     ingress: harness.ingress,
     traces: harness.traces,
     projector: harness.projector,
+    eviction: harness.eviction,
   });
   harness.receivers.push(receiver);
   return receiver;
