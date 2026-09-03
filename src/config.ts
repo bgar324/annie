@@ -31,7 +31,7 @@ const storageEnvSchema = z.object({
   MEMORY_PATH: nonEmpty.optional(),
   TRACE_DIR: nonEmpty.optional(),
   TRACE_RETENTION_DAYS: positiveInteger(30, 365),
-  TRACE_MAX_BYTES: positiveInteger(536_870_912, 10_737_418_240),
+  TRACE_MAX_BYTES: positiveInteger(134_217_728, 10_737_418_240),
 });
 
 const runtimeEnvSchema = storageEnvSchema.extend({

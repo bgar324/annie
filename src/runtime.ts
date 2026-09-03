@@ -12,7 +12,7 @@ import { ConnectionRouter } from "./connections/router.js";
 import { ConnectionStore } from "./connections/store.js";
 import { connectionTools } from "./connections/tools.js";
 import { asEgressId, asRunId } from "./core/ids.js";
-import { openDatabase, type DatabaseHandle } from "./db/database.js";
+import { compactDatabase, openDatabase, type DatabaseHandle } from "./db/database.js";
 import type { GmailClientProvider } from "./gmail/client.js";
 import { GoogleGmailClientProvider } from "./gmail/client.js";
 import { GmailToolService } from "./gmail/tools.js";
@@ -48,12 +48,14 @@ import {
 import { CredentialVault } from "./security/vault.js";
 import { TraceProjector } from "./tracing/jsonl.js";
 import { createTraceRedactor } from "./tracing/redaction.js";
-import { TraceRetentionService } from "./tracing/retention.js";
 import { TraceStore } from "./tracing/store.js";
+import { TraceRetentionService, emergencyTrimTraceFiles } from "./tracing/retention.js";
 import { WriteStore } from "./writes/store.js";
 
 const memoryMaintenanceBudgetMs = 45_000;
 const memoryMaintenanceLeaseMarginMs = 5_000;
+const emergencyTraceBudgetBytes = 67_108_864;
+const traceSweepIntervalMs = 3_600_000;
 
 export interface AssistantModel extends ChatModel, MemoryMaintenanceModel {}
 
@@ -93,6 +95,13 @@ export async function createRuntime(
   config: RuntimeConfig,
   overrides: RuntimeOverrides = {},
 ): Promise<AssistantRuntime> {
+  // A previously filled volume makes the SQLite write probe fail before any
+  // cleanup could run, so free derived trace files first. The spool remains
+  // the source of truth and re-projects deleted files on demand.
+  emergencyTrimTraceFiles({
+    traceDir: config.traceDir,
+    maximumBytes: Math.min(config.traceMaxBytes, emergencyTraceBudgetBytes),
+  });
   const database = openDatabase(config);
   try {
     const traces = new TraceStore(database.db, createTraceRedactor(config.secretValues));
@@ -336,13 +345,30 @@ export async function createRuntime(
     writes.recoverOpenAttempts();
     recovery.planPendingReconnects("google");
     await maintenance.recoverInterrupted();
-    projector.projectPending();
-    new TraceRetentionService({
+    const retention = new TraceRetentionService({
       db: database.db,
       traceDir: config.traceDir,
       retentionDays: config.traceRetentionDays,
       maximumBytes: config.traceMaxBytes,
-    }).cleanup();
+    });
+    // Retention must run before projection: projecting first would resurrect
+    // files retention is about to delete and can fail mid-write on a full disk.
+    retention.cleanup();
+    try {
+      compactDatabase(database.db);
+    } catch (error) {
+      app.log.warn({ err: error }, "database compaction skipped");
+    }
+    projector.projectPending();
+    const traceSweep = setInterval(() => {
+      try {
+        projector.projectPending();
+        retention.cleanup();
+      } catch (error) {
+        app.log.error({ err: error }, "trace retention sweep failed");
+      }
+    }, traceSweepIntervalMs);
+    traceSweep.unref();
 
     return {
       app,
@@ -364,6 +390,7 @@ export async function createRuntime(
       },
       async close() {
         ready = false;
+        clearInterval(traceSweep);
         receiver.close();
         await app.close();
         database.close();

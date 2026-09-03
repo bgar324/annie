@@ -33,6 +33,7 @@ export function openDatabase(config: StorageConfig): DatabaseHandle {
     }
 
     db.pragma("synchronous = FULL");
+    db.pragma("journal_size_limit = 67108864");
     db.pragma("foreign_keys = ON");
 
     if (Number(db.pragma("synchronous", { simple: true })) !== 2) {
@@ -99,6 +100,30 @@ function assertDatabaseIntegrity(db: Database.Database): void {
   if (result !== "ok") {
     throw new Error(`SQLite quick_check failed: ${result}`);
   }
+}
+
+/**
+ * Reclaims SQLite file space after retention deleted large row ranges. The
+ * database file never shrinks on its own, so a volume that once filled stays
+ * filled even after cleanup. Gated on free-page bytes so steady-state boots
+ * pay nothing.
+ */
+export function compactDatabase(
+  db: Database.Database,
+  minimumFreeBytes = 67_108_864,
+): boolean {
+  const pageSize = Number(db.pragma("page_size", { simple: true }));
+  const freeListCount = Number(db.pragma("freelist_count", { simple: true }));
+  if (!Number.isSafeInteger(pageSize) || !Number.isSafeInteger(freeListCount)) {
+    return false;
+  }
+  if (pageSize * freeListCount < minimumFreeBytes) {
+    return false;
+  }
+  db.pragma("wal_checkpoint(TRUNCATE)");
+  db.exec("VACUUM");
+  db.pragma("wal_checkpoint(TRUNCATE)");
+  return true;
 }
 
 function assertWritableDirectory(directory: string): void {

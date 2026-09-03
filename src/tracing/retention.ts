@@ -106,17 +106,79 @@ export class TraceRetentionService {
     }
     let deleted = 0;
     for (const entry of readdirSync(this.#traceDir, { withFileTypes: true })) {
-      if (
-        entry.isFile() &&
-        /^tr_[a-f0-9]{32}\.jsonl$/u.test(entry.name) &&
-        !knownPaths.has(entry.name)
-      ) {
+      if (entry.isFile() && isTraceArtifactName(entry.name) && !knownPaths.has(entry.name)) {
         removeFile(join(this.#traceDir, entry.name));
         deleted += 1;
       }
     }
     return deleted;
   }
+}
+
+export interface EmergencyTrimResult {
+  deletedTraceFiles: number;
+  deletedOrphanFiles: number;
+  retainedBytes: number;
+}
+
+/**
+ * Frees trace file bytes before the database is opened. Runs when a previous
+ * deployment may have filled the volume: the SQLite write probe would fail
+ * with ENOSPC before startup retention could ever run. Trace JSONL files are
+ * derived artifacts (the spool regenerates them), so deleting the oldest
+ * files loses no durable state.
+ */
+export function emergencyTrimTraceFiles(input: {
+  traceDir: string;
+  maximumBytes: number;
+}): EmergencyTrimResult {
+  if (!existsSync(input.traceDir)) {
+    return { deletedTraceFiles: 0, deletedOrphanFiles: 0, retainedBytes: 0 };
+  }
+  const entries = readdirSync(input.traceDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && isTraceArtifactName(entry.name))
+    .map((entry) => ({ name: entry.name, ...fileEntryStats(join(input.traceDir, entry.name)) }))
+    .sort((a, b) => a.modifiedAtMs - b.modifiedAtMs);
+
+  const orphans = entries.filter((entry) => isTemporaryTraceName(entry.name));
+  for (const orphan of orphans) {
+    removeFile(join(input.traceDir, orphan.name));
+  }
+
+  const traceFiles = entries.filter((entry) => !isTemporaryTraceName(entry.name));
+  let retainedBytes = traceFiles.reduce((total, entry) => total + entry.size, 0);
+  const deletable = new Set<string>();
+  for (const entry of traceFiles) {
+    if (retainedBytes <= input.maximumBytes) {
+      break;
+    }
+    deletable.add(entry.name);
+    retainedBytes -= entry.size;
+  }
+  for (const name of deletable) {
+    removeFile(join(input.traceDir, name));
+  }
+  return {
+    deletedTraceFiles: deletable.size,
+    deletedOrphanFiles: orphans.length,
+    retainedBytes,
+  };
+}
+
+const traceFileNamePattern = /^tr_[a-f0-9]{32}\.jsonl$/u;
+const temporaryTraceNamePattern = /^tr_[a-f0-9]{32}\.jsonl\.[0-9a-f-]{36}\.tmp$/u;
+
+function isTraceArtifactName(name: string): boolean {
+  return traceFileNamePattern.test(name) || temporaryTraceNamePattern.test(name);
+}
+
+function isTemporaryTraceName(name: string): boolean {
+  return temporaryTraceNamePattern.test(name);
+}
+
+function fileEntryStats(path: string): { size: number; modifiedAtMs: number } {
+  const stats = statSync(path);
+  return { size: stats.size, modifiedAtMs: stats.mtimeMs };
 }
 
 function assertSafeTracePath(relativePath: string): void {

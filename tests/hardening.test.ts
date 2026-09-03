@@ -1,14 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentRunStore } from "../src/agent/store.js";
+import { compactDatabase } from "../src/db/database.js";
 import { runCli, type CliIo } from "../src/cli.js";
 import { newInboundId, newTraceId } from "../src/core/ids.js";
 import { buildSafeReplay, renderSafeReplay } from "../src/replay.js";
 import { TraceProjector } from "../src/tracing/jsonl.js";
 import { createTraceRedactor } from "../src/tracing/redaction.js";
-import { TraceRetentionService } from "../src/tracing/retention.js";
+import { TraceRetentionService, emergencyTrimTraceFiles } from "../src/tracing/retention.js";
 import { TraceStore } from "../src/tracing/store.js";
 import { createTestDatabase, type TestDatabase } from "./helpers.js";
 
@@ -191,7 +192,6 @@ describe("trace operations", () => {
     });
 
     const result = retention.cleanup(now);
-
     expect(result.deletedTraceIds).toEqual([old, pressure]);
     expect(result.deletedOrphanFiles).toBe(1);
     expect(result.retainedBytes).toBe(maximumBytes);
@@ -199,6 +199,120 @@ describe("trace operations", () => {
     expect(traceExists(database, pressure)).toBe(false);
     expect(traceExists(database, retained)).toBe(true);
     expect(traceExists(database, open)).toBe(true);
+  });
+
+  it("emergency-trims oldest trace files and crash-leftover temp files without the database", () => {
+    const database = trackedDatabase();
+    const traceDir = database.config.traceDir;
+    mkdirSync(traceDir, { recursive: true });
+    const oldest = `${newTraceId()}.jsonl`;
+    const middle = `${newTraceId()}.jsonl`;
+    const newest = `${newTraceId()}.jsonl`;
+    for (const name of [oldest, middle, newest]) {
+      writeFileSync(join(traceDir, name), "0".repeat(2_048), { mode: 0o600 });
+    }
+    const base = Date.now() / 1_000;
+    utimesSync(join(traceDir, oldest), base - 3_000, base - 3_000);
+    utimesSync(join(traceDir, middle), base - 2_000, base - 2_000);
+    utimesSync(join(traceDir, newest), base - 1_000, base - 1_000);
+    const tempName = `${newTraceId()}.jsonl.${randomUUID()}.tmp`;
+    writeFileSync(join(traceDir, tempName), "partial", { mode: 0o600 });
+    const unrelated = join(traceDir, "notes.txt");
+    writeFileSync(unrelated, "keep", { mode: 0o600 });
+
+    const result = emergencyTrimTraceFiles({ traceDir, maximumBytes: 3_000 });
+
+    expect(result.deletedTraceFiles).toBe(2);
+    expect(result.deletedOrphanFiles).toBe(1);
+    expect(result.retainedBytes).toBe(2_048);
+    expect(existsSync(join(traceDir, oldest))).toBe(false);
+    expect(existsSync(join(traceDir, middle))).toBe(false);
+    expect(existsSync(join(traceDir, newest))).toBe(true);
+    expect(existsSync(join(traceDir, tempName))).toBe(false);
+    expect(existsSync(unrelated)).toBe(true);
+  });
+
+  it("deletes crash-leftover temporary projection files as orphans during retention", () => {
+    const database = trackedDatabase();
+    const traceDir = database.config.traceDir;
+    mkdirSync(traceDir, { recursive: true });
+    const tempPath = join(traceDir, `${newTraceId()}.jsonl.${randomUUID()}.tmp`);
+    writeFileSync(tempPath, "partial\n", { mode: 0o600 });
+    const retention = new TraceRetentionService({
+      db: database.handle.db,
+      traceDir,
+      retentionDays: 30,
+      maximumBytes: 1_073_741_824,
+    });
+
+    const result = retention.cleanup();
+
+    expect(result.deletedOrphanFiles).toBe(1);
+    expect(existsSync(tempPath)).toBe(false);
+  });
+
+  it("deletes aged trace rows whose projected file is already gone", () => {
+    const database = trackedDatabase();
+    const traces = new TraceStore(database.handle.db, createTraceRedactor([]));
+    const projector = new TraceProjector(database.handle.db, traces, database.config.traceDir);
+    const now = Date.now();
+    const aged = exportedTrace(traces, projector, "aged", 128);
+    database.handle.db
+      .prepare<{ trace_id: string; finalized_at_ms: number }>(`
+        UPDATE trace_exports SET finalized_at_ms = @finalized_at_ms WHERE trace_id = @trace_id
+      `)
+      .run({ trace_id: aged, finalized_at_ms: now - 31 * 24 * 60 * 60 * 1_000 });
+    rmSync(join(database.config.traceDir, `${aged}.jsonl`));
+    const retention = new TraceRetentionService({
+      db: database.handle.db,
+      traceDir: database.config.traceDir,
+      retentionDays: 30,
+      maximumBytes: 536_870_912,
+    });
+
+    const result = retention.cleanup(now);
+
+    expect(result.deletedTraceIds).toEqual([aged]);
+    expect(traceExists(database, aged)).toBe(false);
+  });
+
+  it("reclaims SQLite file space after retention frees large spool ranges", () => {
+    const database = trackedDatabase();
+    expect(compactDatabase(database.handle.db)).toBe(false);
+    const traces = new TraceStore(database.handle.db, createTraceRedactor([]));
+    const projector = new TraceProjector(database.handle.db, traces, database.config.traceDir);
+    const now = Date.now();
+    const aged = newTraceId();
+    for (let index = 0; index < 128; index += 1) {
+      traces.append({
+        traceId: aged,
+        component: "fixture",
+        event: "bulk",
+        data: { payload: "x".repeat(4_000) },
+      });
+    }
+    traces.markTerminal(aged);
+    projector.project(aged);
+    database.handle.db
+      .prepare<{ trace_id: string; finalized_at_ms: number }>(`
+        UPDATE trace_exports SET finalized_at_ms = @finalized_at_ms WHERE trace_id = @trace_id
+      `)
+      .run({ trace_id: aged, finalized_at_ms: now - 31 * 24 * 60 * 60 * 1_000 });
+    const retention = new TraceRetentionService({
+      db: database.handle.db,
+      traceDir: database.config.traceDir,
+      retentionDays: 30,
+      maximumBytes: 536_870_912,
+    });
+    retention.cleanup(now);
+    database.handle.db.pragma("wal_checkpoint(TRUNCATE)");
+    const sizeBefore = statSync(database.config.databasePath).size;
+
+    expect(compactDatabase(database.handle.db, 65_536)).toBe(true);
+
+    const sizeAfter = statSync(database.config.databasePath).size;
+    expect(sizeAfter).toBeLessThan(sizeBefore);
+    expect(compactDatabase(database.handle.db, 65_536)).toBe(false);
   });
 });
 
