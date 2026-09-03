@@ -1252,7 +1252,7 @@ function testRuntimeConfig(database: TestDatabase): RuntimeConfig {
     SENDBLUE_BASE_URL: "https://api.sendblue.test",
     USER_PHONE_NUMBER: trustedSender,
     PUBLIC_BASE_URL: "https://assistant.example",
-    GEMINI_API_KEY: "gemini_test_key",
+    DEEPSEEK_API_KEY: "deepseek_test_key",
     GOOGLE_CLIENT_ID: "google_test_client",
     GOOGLE_CLIENT_SECRET: "google_test_secret",
     CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),

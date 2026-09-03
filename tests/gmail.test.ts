@@ -553,7 +553,7 @@ function gmailHarness(): GmailHarness {
   const database = createTestDatabase();
   databases.push(database);
   const config = testRuntimeConfig(database);
-  const traces = new TraceStore(database.handle.db, createTraceRedactor([config.gemini.apiKey]));
+  const traces = new TraceStore(database.handle.db, createTraceRedactor([config.deepseek.apiKey]));
   const connections = new ConnectionStore(
     database.handle.db,
     new CredentialVault(Buffer.alloc(32, 19)),
@@ -741,7 +741,7 @@ function testRuntimeConfig(database: TestDatabase): RuntimeConfig {
     SENDBLUE_BASE_URL: "https://api.sendblue.co",
     USER_PHONE_NUMBER: "+15559990000",
     PUBLIC_BASE_URL: "https://assistant.example",
-    GEMINI_API_KEY: "gemini_test_key",
+    DEEPSEEK_API_KEY: "deepseek_test_key",
     GOOGLE_CLIENT_ID: "google_test_client",
     GOOGLE_CLIENT_SECRET: "google_test_secret",
     CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),

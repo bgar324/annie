@@ -1,6 +1,6 @@
 import fastify, { type FastifyInstance } from "fastify";
 import { AgentLoop } from "./agent/loop.js";
-import { GeminiChatModel } from "./agent/gemini.js";
+import { DeepSeekChatModel } from "./agent/deepseek.js";
 import { ConversationHistoryStore } from "./agent/history.js";
 import type { ChatModel, MemoryMaintenanceModel } from "./agent/model.js";
 import { AgentRunStore } from "./agent/store.js";
@@ -171,7 +171,7 @@ export async function createRuntime(
     assertProductionTools(tools);
     const agentTools = new ToolRegistry([...providerTools, ...connectionTools(connections)]);
     assertAgentTools(agentTools, tools);
-    const model = overrides.model ?? new GeminiChatModel({ config, traces });
+    const model = overrides.model ?? new DeepSeekChatModel({ config, traces });
     const agentLimits = {
       maxToolRounds: config.limits.maxAgentToolRounds,
       maxToolCalls: config.limits.maxAgentToolCalls,

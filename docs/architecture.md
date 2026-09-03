@@ -2,7 +2,7 @@
 
 ## Scope
 
-This service is a private iMessage assistant for one configured sender. One Node.js 24 process polls the Sendblue Free Sandbox for inbound iMessages, runs a bounded Gemini tool loop, accesses explicitly connected Google Workspace and Notion accounts, maintains one local memory document, and sends replies from the configured Sendblue line.
+This service is a private iMessage assistant for one configured sender. One Node.js 24 process polls the Sendblue Free Sandbox for inbound iMessages, runs a bounded DeepSeek tool loop, accesses explicitly connected Google Workspace and Notion accounts, maintains one local memory document, and sends replies from the configured Sendblue line.
 
 The service does not support group chats, multiple assistant users, arbitrary autonomous schedules, destructive provider operations, or generic provider method execution. It supports one fixed read-only daily brief.
 
@@ -109,7 +109,7 @@ Internal tool names use dots. The OpenAI-compatible adapter alone converts dots 
 
 Only the six provider reads explicitly registered as `parallel_read` execute concurrently, up to the four-call response limit. Unmarked reads, both connection-control tools, and writes remain serial by default. Parallel results are persisted back to the transcript in model call order, and individual failures remain isolated.
 
-The repository retains its legacy `GEMINI_*` configuration contract and the `gemini-3.7-flash`/low fallback. At benchmark time, the deployed Railway environment overrode those settings with `deepseek-v4-flash` and high reasoning effort. This bundle does not rename secrets or change the fallback. Direct deployed-model benchmarks showed that disabling thinking reduced latency but missed an explicit future-brief preference during memory maintenance, so the deployment remains on high effort.
+The production model is `deepseek-v4-flash` through DeepSeek's OpenAI-compatible chat-completions endpoint with high reasoning effort. Each assistant wire message is replayed unchanged so DeepSeek `reasoning_content` survives tool rounds. Direct deployed-model checks found that disabling thinking reduced latency but missed an explicit future-brief preference during memory maintenance, so high reasoning remains the correctness-preserving default.
 
 ## Production tools
 

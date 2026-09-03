@@ -20,7 +20,7 @@ Then deploy:
 6. Register `https://<domain>/oauth/google/callback` as an authorized Google OAuth redirect URI.
 7. Enable the Gmail API, Google Calendar API, Google Drive API, People API, and Google Tasks API in the OAuth client's Google Cloud project.
 8. Add the fixed scopes listed in [Connect Google Workspace and Notion accounts](#connect-google-workspace-and-notion-accounts) to the OAuth consent screen. Do not set `GOOGLE_WORKSPACE_SCOPES`. The service does not read that variable.
-9. Complete the Google verification and security-assessment steps that apply to the OAuth client. `gmail.readonly` and `drive.readonly` are restricted, and this service transmits Gmail and Drive content to Gemini. A production publishing status alone does not approve restricted scopes.
+9. Complete the Google verification and security-assessment steps that apply to the OAuth client. `gmail.readonly` and `drive.readonly` are restricted, and this service transmits Gmail and Drive content to DeepSeek. A production publishing status alone does not approve restricted scopes.
 10. Confirm that Notion can reach these endpoints:
     - `https://<domain>/.well-known/notion-mcp-client.json`
     - `https://<domain>/oauth/notion/callback`
@@ -30,7 +30,7 @@ Then deploy:
 
 The HTTP process serves health checks and browser OAuth flows. Messaging needs no public URL, webhook route, external cron, or inbound network path. The receiver polls Sendblue, and the daily brief scheduler writes future work to the same durable queue.
 
-Startup does not contact Sendblue, Google Workspace, Notion, or Gemini. An unhealthy provider connection cannot prevent the process from becoming ready. Startup validates configuration, migrates SQLite, repairs interrupted memory and write state, projects pending traces, and applies trace retention. The scheduler can insert the next daily brief job without contacting a provider.
+Startup does not contact Sendblue, Google Workspace, Notion, or DeepSeek. An unhealthy provider connection cannot prevent the process from becoming ready. Startup validates configuration, migrates SQLite, repairs interrupted memory and write state, projects pending traces, and applies trace retention. The scheduler can insert the next daily brief job without contacting a provider.
 
 The process handles `SIGTERM` by failing health checks, closing the HTTP listener, and stopping the receiver, the scheduler, and the worker after in-flight work returns. It then projects remaining trace events and closes SQLite.
 
@@ -161,10 +161,10 @@ Changing `SENDBLUE_FROM_NUMBER` or `USER_PHONE_NUMBER` changes the trusted ident
 
 The predeployment message can be older than the cursor overlap. Do not use that message as the smoke test.
 
-### Gemini API key
+### DeepSeek API key
 
-1. Create a replacement Gemini Developer API key in Google AI Studio.
-2. Replace `GEMINI_API_KEY` in Railway and redeploy.
+1. Create a replacement API key in the DeepSeek platform.
+2. Replace `DEEPSEEK_API_KEY` in Railway and redeploy.
 3. Send a read-only request and inspect its trace.
 4. Revoke the previous key.
 

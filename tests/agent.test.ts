@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentLoop } from "../src/agent/loop.js";
-import { GeminiChatModel } from "../src/agent/gemini.js";
+import { DeepSeekChatModel } from "../src/agent/deepseek.js";
 import { ConversationHistoryStore } from "../src/agent/history.js";
 import type { ChatModel, ModelRequest, ModelResponse } from "../src/agent/model.js";
 import {
@@ -64,7 +64,7 @@ describe("assistant prompt", () => {
   });
 });
 
-describe("Gemini model adapter", () => {
+describe("DeepSeek model adapter", () => {
   it("uses the OpenAI-compatible contract and replays provider extras exactly", async () => {
     const harness = modelHarness();
     let requestedUrl = "";
@@ -73,35 +73,33 @@ describe("Gemini model adapter", () => {
     const priorProviderMessage = {
       role: "assistant",
       content: null,
+      reasoning_content: "prior reasoning",
       tool_calls: [
         {
           id: "prior_call",
           type: "function",
           function: { name: "test_echo", arguments: "{\"value\":1}" },
-          extra_content: { google: { thought_signature: "prior-signature" } },
         },
       ],
     };
     const returnedProviderMessage = {
       role: "assistant",
       content: null,
+      reasoning_content: "next reasoning",
       tool_calls: [
         {
           id: "call_a",
           type: "function",
           function: { name: "test_echo", arguments: "{\"value\":\"a\"}" },
-          extra_content: { google: { thought_signature: "signature-a" } },
         },
         {
           id: "call_b",
           type: "function",
           function: { name: "test_echo", arguments: "{\"value\":\"b\"}" },
-          extra_content: { google: { thought_signature: "signature-b" } },
         },
       ],
-      extra_content: { google: { opaque_state: "keep-exactly" } },
     };
-    const model = new GeminiChatModel({
+    const model = new DeepSeekChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async (input, init) => {
@@ -134,13 +132,11 @@ describe("Gemini model adapter", () => {
       tools: [echoTool.definition],
     });
 
-    expect(requestedUrl).toBe(
-      "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-    );
-    expect(authorization).toBe("Bearer gemini_test_key");
+    expect(requestedUrl).toBe("https://api.deepseek.com/chat/completions");
+    expect(authorization).toBe("Bearer deepseek_test_key");
     expect(requestedBody).toMatchObject({
-      model: "gemini-3.7-flash",
-      reasoning_effort: "low",
+      model: "deepseek-v4-flash",
+      reasoning_effort: "high",
       messages: [
         { role: "user", content: "Do both" },
         priorProviderMessage,
@@ -162,7 +158,7 @@ describe("Gemini model adapter", () => {
 
   it("normalizes omitted and blank no-argument tool payloads", async () => {
     const harness = modelHarness();
-    const model = new GeminiChatModel({
+    const model = new DeepSeekChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async () =>
@@ -209,7 +205,7 @@ describe("Gemini model adapter", () => {
   it("omits the tools property for an explicit empty registry", async () => {
     const harness = modelHarness();
     let requestedBody: Record<string, unknown> = {};
-    const model = new GeminiChatModel({
+    const model = new DeepSeekChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async (input, init) => {
@@ -232,10 +228,10 @@ describe("Gemini model adapter", () => {
     expect(requestedBody).not.toHaveProperty("tool_choice");
   });
 
-  it("uses low reasoning without tools for memory maintenance", async () => {
+  it("uses high reasoning without tools for memory maintenance", async () => {
     const harness = modelHarness();
     let requestedBody: Record<string, unknown> = {};
-    const model = new GeminiChatModel({
+    const model = new DeepSeekChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async (input, init) => {
@@ -261,7 +257,7 @@ describe("Gemini model adapter", () => {
         ],
       }),
     ).resolves.toMatchObject({ content: "{\"action\":\"unchanged\"}" });
-    expect(requestedBody).toMatchObject({ reasoning_effort: "low" });
+    expect(requestedBody).toMatchObject({ reasoning_effort: "high" });
     expect(requestedBody).not.toHaveProperty("thinking");
     expect(requestedBody).not.toHaveProperty("tools");
     expect(requestedBody).not.toHaveProperty("tool_choice");
@@ -271,7 +267,7 @@ describe("Gemini model adapter", () => {
     const harness = modelHarness();
     let requests = 0;
     const waits: number[] = [];
-    const model = new GeminiChatModel({
+    const model = new DeepSeekChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async () => {
@@ -306,7 +302,7 @@ describe("Gemini model adapter", () => {
     const statuses = [503, 429, 429];
     let requests = 0;
     const waits: number[] = [];
-    const model = new GeminiChatModel({
+    const model = new DeepSeekChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async () => {
@@ -340,7 +336,7 @@ describe("Gemini model adapter", () => {
     const harness = modelHarness();
     let requests = 0;
     const waits: number[] = [];
-    const model = new GeminiChatModel({
+    const model = new DeepSeekChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async () => {
@@ -373,11 +369,11 @@ describe("Gemini model adapter", () => {
     expect(waits).toEqual([1_000, 2_000, 4_000, 8_000]);
   });
 
-  it("honors and bounds Gemini Retry-After on HTTP 429", async () => {
+  it("honors and bounds DeepSeek Retry-After on HTTP 429", async () => {
     const harness = modelHarness();
     let requests = 0;
     const waits: number[] = [];
-    const model = new GeminiChatModel({
+    const model = new DeepSeekChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async () => {
@@ -416,7 +412,7 @@ describe("Gemini model adapter", () => {
     const neverFinishSleeping = Promise.withResolvers<void>();
     const controller = new AbortController();
     let requests = 0;
-    const model = new GeminiChatModel({
+    const model = new DeepSeekChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async () => {
@@ -448,7 +444,7 @@ describe("Gemini model adapter", () => {
   it("does not retry HTTP 400", async () => {
     const harness = modelHarness();
     let requests = 0;
-    const model = new GeminiChatModel({
+    const model = new DeepSeekChatModel({
       config: harness.config,
       traces: harness.traces,
       fetchImpl: async () => {
@@ -1579,7 +1575,7 @@ function testRuntimeConfig(database: TestDatabase): RuntimeConfig {
     SENDBLUE_BASE_URL: "https://api.sendblue.co",
     USER_PHONE_NUMBER: "+15559990000",
     PUBLIC_BASE_URL: "https://assistant.example",
-    GEMINI_API_KEY: "gemini_test_key",
+    DEEPSEEK_API_KEY: "deepseek_test_key",
     GOOGLE_CLIENT_ID: "google_test_client",
     GOOGLE_CLIENT_SECRET: "google_test_secret",
     CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),

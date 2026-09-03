@@ -104,7 +104,7 @@ The complete template is [.env.example](.env.example). The main groups are:
 | `SENDBLUE_API_KEY_ID`, `SENDBLUE_API_SECRET_KEY` | Authenticate Sendblue reads and sends |
 | `SENDBLUE_FROM_NUMBER`, `USER_PHONE_NUMBER` | Define the exact assistant line and trusted sender |
 | `PUBLIC_BASE_URL` | Build Google and Notion OAuth callback URLs |
-| `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_BASE_URL` | Configure the OpenAI-compatible model endpoint |
+| `DEEPSEEK_API_KEY`, `DEEPSEEK_MODEL`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_REASONING_EFFORT` | Configure the DeepSeek chat-completions endpoint |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Run Google OAuth for connected accounts |
 | `NOTION_MCP_URL` | Select the hosted Notion MCP endpoint |
 | `CREDENTIAL_ENCRYPTION_KEY` | Encrypt provider credentials with AES-256-GCM |

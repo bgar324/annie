@@ -29,7 +29,7 @@ function validEnvironment(directory: string): NodeJS.ProcessEnv {
     SENDBLUE_BASE_URL: "https://api.sendblue.co",
     USER_PHONE_NUMBER: "+15550000002",
     PUBLIC_BASE_URL: "http://localhost:3000",
-    GEMINI_API_KEY: "gemini_test_key",
+    DEEPSEEK_API_KEY: "deepseek_test_key",
     GOOGLE_CLIENT_ID: "google_test_client",
     GOOGLE_CLIENT_SECRET: "google_test_secret",
     CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
@@ -63,11 +63,11 @@ describe("runtime configuration", () => {
       fromNumber: "+15550000001",
       baseUrl: "https://api.sendblue.co",
     });
-    expect(config.gemini).toEqual({
-      apiKey: "gemini_test_key",
-      model: "gemini-3.7-flash",
-      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
-      reasoningEffort: "low",
+    expect(config.deepseek).toEqual({
+      apiKey: "deepseek_test_key",
+      model: "deepseek-v4-flash",
+      baseUrl: "https://api.deepseek.com",
+      reasoningEffort: "high",
     });
     expect(config.dailyBrief).toEqual({
       enabled: false,
@@ -122,15 +122,15 @@ describe("runtime configuration", () => {
       /SENDBLUE_BASE_URL must use HTTPS in production/u,
     );
 
-    const geminiEnvironment = validEnvironment(testDatabase.directory);
-    geminiEnvironment.NODE_ENV = "production";
-    geminiEnvironment.PUBLIC_BASE_URL = "https://assistant.example.com";
-    geminiEnvironment.RAILWAY_VOLUME_MOUNT_PATH = testDatabase.directory;
-    geminiEnvironment.DATA_DIR = testDatabase.directory;
-    geminiEnvironment.GEMINI_BASE_URL = "http://gemini.example.test";
+    const deepseekEnvironment = validEnvironment(testDatabase.directory);
+    deepseekEnvironment.NODE_ENV = "production";
+    deepseekEnvironment.PUBLIC_BASE_URL = "https://assistant.example.com";
+    deepseekEnvironment.RAILWAY_VOLUME_MOUNT_PATH = testDatabase.directory;
+    deepseekEnvironment.DATA_DIR = testDatabase.directory;
+    deepseekEnvironment.DEEPSEEK_BASE_URL = "http://deepseek.example.test";
 
-    expect(() => loadRuntimeConfig(geminiEnvironment)).toThrow(
-      /GEMINI_BASE_URL must use HTTPS in production/u,
+    expect(() => loadRuntimeConfig(deepseekEnvironment)).toThrow(
+      /DEEPSEEK_BASE_URL must use HTTPS in production/u,
     );
   });
 });
@@ -794,10 +794,11 @@ describe("SQLite foundation", () => {
 });
 
 describe("trace projection", () => {
-  it("redacts secrets and repairs a malformed JSONL tail from the spool", () => {
+  it("redacts the DeepSeek key and reasoning state while repairing malformed JSONL", () => {
     testDatabase = createTestDatabase();
+    const config = loadRuntimeConfig(validEnvironment(testDatabase.directory));
     const traceId = newTraceId();
-    const redactor = createTraceRedactor(["top-secret-value"]);
+    const redactor = createTraceRedactor(config.secretValues);
     const store = new TraceStore(testDatabase.handle.db, redactor);
     const projector = new TraceProjector(
       testDatabase.handle.db,
@@ -811,17 +812,17 @@ describe("trace projection", () => {
       event: "verified",
       outcome: "accepted",
       data: {
-        apiKey: "top-secret-value",
-        providerState: "{\"extra_content\":{\"google\":{\"thought_signature\":\"opaque\"}}}",
+        apiKey: "deepseek_test_key",
+        providerState: "{\"reasoning_content\":\"opaque\"}",
         link: "https://assistant.example.com/connect/google?token=bearer-value",
       },
     });
     store.markTerminal(traceId);
     const tracePath = projector.project(traceId);
     let content = readFileSync(tracePath, "utf8");
-    expect(content).not.toContain("top-secret-value");
+    expect(content).not.toContain("deepseek_test_key");
     expect(content).not.toContain("bearer-value");
-    expect(content).not.toContain("thought_signature");
+    expect(content).not.toContain("reasoning_content");
     expect(projector.read(traceId)).toHaveLength(1);
 
     appendFileSync(tracePath, "{malformed");
