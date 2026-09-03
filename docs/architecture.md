@@ -44,7 +44,7 @@ When enabled, the authoritative process adds a second Fastify instance bound onl
 
 SQLite, `MEMORY.md`, and projected traces share the Railway volume. Production runs one replica because the queue, worker, and WAL database are one local durability unit.
 
-Startup performs configuration validation, SQLite migration and integrity checks, interrupted-write recovery, interrupted-memory recovery, pending trace projection, and trace retention. Startup does not contact Sendblue, the configured model endpoint, Google Workspace, or Notion. The receiver, the daily brief scheduler, and the worker start after every configured HTTP listener is bound.
+Before SQLite opens, startup trims projected trace files down to a small emergency budget so a previously filled volume cannot strand the write probe in a crash loop; the spool re-projects any deleted file on demand. Startup then performs configuration validation, SQLite migration and integrity checks, interrupted-write recovery, interrupted-memory recovery, trace retention, freelist-gated SQLite compaction, and pending trace projection, in that order, because projecting first would resurrect files retention is about to delete. While running, an hourly sweep repeats projection and retention, and the WAL carries a size limit. Startup does not contact Sendblue, the configured model endpoint, Google Workspace, or Notion. The receiver, the daily brief scheduler, and the worker start after every configured HTTP listener is bound.
 
 ## Inbound message flow
 
