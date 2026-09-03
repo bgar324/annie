@@ -10,10 +10,14 @@ import { buildSafeReplay, renderSafeReplay } from "../src/replay.js";
 import { TraceProjector } from "../src/tracing/jsonl.js";
 import { createTraceRedactor } from "../src/tracing/redaction.js";
 import { TraceEvictionService } from "../src/tracing/eviction.js";
-import { TraceRetentionService, emergencyTrimTraceFiles } from "../src/tracing/retention.js";
 import { TraceStore } from "../src/tracing/store.js";
-import { createTestDatabase, type TestDatabase } from "./helpers.js";
+import {
+  TraceRetentionService,
+  emergencyTrimTraceFiles,
+  traceDiskBytes,
+} from "../src/tracing/retention.js";
 
+import { createTestDatabase, type TestDatabase } from "./helpers.js";
 const databases: TestDatabase[] = [];
 afterEach(() => {
   for (const database of databases.splice(0)) {
@@ -181,7 +185,7 @@ describe("trace operations", () => {
       `)
       .run({ trace_id: retained, finalized_at_ms: now - 1_000 });
     const retainedPath = join(database.config.traceDir, `${retained}.jsonl`);
-    const maximumBytes = statSync(retainedPath).size;
+    const maximumBytes = traceDiskBytes(retainedPath);
     const orphanId = newTraceId();
     const orphanPath = join(database.config.traceDir, `${orphanId}.jsonl`);
     writeFileSync(orphanPath, "orphan\n", { mode: 0o600 });
@@ -221,11 +225,15 @@ describe("trace operations", () => {
     const unrelated = join(traceDir, "notes.txt");
     writeFileSync(unrelated, "keep", { mode: 0o600 });
 
-    const result = emergencyTrimTraceFiles({ traceDir, maximumBytes: 3_000 });
+    const newestDiskBytes = traceDiskBytes(join(traceDir, newest));
+    const result = emergencyTrimTraceFiles({
+      traceDir,
+      maximumBytes: newestDiskBytes + 1,
+    });
 
     expect(result.deletedTraceFiles).toBe(2);
     expect(result.deletedOrphanFiles).toBe(1);
-    expect(result.retainedBytes).toBe(2_048);
+    expect(result.retainedBytes).toBe(newestDiskBytes);
     expect(existsSync(join(traceDir, oldest))).toBe(false);
     expect(existsSync(join(traceDir, middle))).toBe(false);
     expect(existsSync(join(traceDir, newest))).toBe(true);

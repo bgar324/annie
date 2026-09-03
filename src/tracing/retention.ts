@@ -46,7 +46,7 @@ export class TraceRetentionService {
     const sizes = new Map<TraceId, number>();
     for (const row of rows) {
       assertSafeTracePath(row.relative_path);
-      sizes.set(row.trace_id, fileSize(join(this.#traceDir, row.relative_path)));
+      sizes.set(row.trace_id, traceDiskBytes(join(this.#traceDir, row.relative_path)));
     }
 
     const deletions = new Set<TraceId>();
@@ -146,14 +146,14 @@ export function emergencyTrimTraceFiles(input: {
   }
 
   const traceFiles = entries.filter((entry) => !isTemporaryTraceName(entry.name));
-  let retainedBytes = traceFiles.reduce((total, entry) => total + entry.size, 0);
+  let retainedBytes = traceFiles.reduce((total, entry) => total + entry.diskBytes, 0);
   const deletable = new Set<string>();
   for (const entry of traceFiles) {
     if (retainedBytes <= input.maximumBytes) {
       break;
     }
     deletable.add(entry.name);
-    retainedBytes -= entry.size;
+    retainedBytes -= entry.diskBytes;
   }
   for (const name of deletable) {
     removeFile(join(input.traceDir, name));
@@ -176,9 +176,9 @@ function isTemporaryTraceName(name: string): boolean {
   return temporaryTraceNamePattern.test(name);
 }
 
-function fileEntryStats(path: string): { size: number; modifiedAtMs: number } {
+function fileEntryStats(path: string): { diskBytes: number; modifiedAtMs: number } {
   const stats = statSync(path);
-  return { size: stats.size, modifiedAtMs: stats.mtimeMs };
+  return { diskBytes: allocatedBytes(stats), modifiedAtMs: stats.mtimeMs };
 }
 
 function assertSafeTracePath(relativePath: string): void {
@@ -190,15 +190,24 @@ function assertSafeTracePath(relativePath: string): void {
   }
 }
 
-function fileSize(path: string): number {
+export function traceDiskBytes(path: string): number {
   try {
-    return statSync(path).size;
+    return allocatedBytes(statSync(path));
   } catch (error) {
     if (isMissingFile(error)) {
       return 0;
     }
     throw error;
   }
+}
+
+/**
+ * Caps bound disk, not payload: tens of thousands of micro-traces consume
+ * four-kilobyte blocks each, so apparent size alone understates usage by
+ * several times.
+ */
+function allocatedBytes(stats: { size: number; blocks: number }): number {
+  return Math.max(stats.size, stats.blocks * 512);
 }
 
 function removeFile(path: string): void {
