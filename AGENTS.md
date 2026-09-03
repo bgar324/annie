@@ -72,7 +72,7 @@ Inbound listing is filtered server-side to the trusted sender, the configured li
 
 ### DeepSeek
 
-Use `deepseek-v4-flash` through DeepSeek's OpenAI-compatible `/chat/completions`. Tool wire names use underscores; internal names use dots. Preserve each returned assistant wire message as opaque provider state and replay it unchanged before tool results so `reasoning_content` survives every tool round. Use high reasoning by default and omit `tool_choice`.
+Use `deepseek-v4-flash` through DeepSeek's OpenAI-compatible `/chat/completions`. Send `thinking: { type: "enabled" }` with high reasoning by default. Allow up to 90 seconds for one DeepSeek response, while the whole agent run remains capped at 120 seconds. Tool wire names use underscores; internal names use dots. Preserve each returned assistant wire message as opaque provider state. Replay it unchanged before tool results so `reasoning_content` survives every tool round. Omit `tool_choice`.
 
 ### Google
 

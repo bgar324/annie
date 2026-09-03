@@ -68,6 +68,7 @@ describe("runtime configuration", () => {
       model: "deepseek-v4-flash",
       baseUrl: "https://api.deepseek.com",
       reasoningEffort: "high",
+      requestTimeoutMs: 90_000,
     });
     expect(config.dailyBrief).toEqual({
       enabled: false,

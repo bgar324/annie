@@ -90,6 +90,7 @@ export class DeepSeekChatModel implements ChatModel, MemoryMaintenanceModel {
       wireToolNames,
       body: {
         model: this.#config.deepseek.model,
+        thinking: { type: "enabled" },
         messages: request.messages.map(toDeepSeekMessage),
         reasoning_effort: this.#config.deepseek.reasoningEffort,
         ...(request.tools.length === 0
@@ -118,6 +119,7 @@ export class DeepSeekChatModel implements ChatModel, MemoryMaintenanceModel {
       wireToolNames: new Map(),
       body: {
         model: this.#config.deepseek.model,
+        thinking: { type: "enabled" },
         messages: request.messages,
         reasoning_effort: this.#config.deepseek.reasoningEffort,
       },
@@ -144,7 +146,7 @@ export class DeepSeekChatModel implements ChatModel, MemoryMaintenanceModel {
       traces: this.#traces,
       traceId: input.traceId,
       component: input.fetchComponent,
-      timeoutMs: this.#config.limits.providerRequestTimeoutMs,
+      timeoutMs: this.#config.deepseek.requestTimeoutMs,
       ...(this.#fetchImpl === undefined ? {} : { fetchImpl: this.#fetchImpl }),
     });
     const url = `${this.#config.deepseek.baseUrl}/chat/completions`;
@@ -300,8 +302,7 @@ function toDeepSeekToolName(name: string): string {
 }
 
 function providerRequestMetadata(response: Response): { providerRequestId?: string } {
-  const providerRequestId =
-    response.headers.get("x-request-id") ?? response.headers.get("x-goog-request-id");
+  const providerRequestId = response.headers.get("x-request-id");
   return providerRequestId === null ? {} : { providerRequestId };
 }
 

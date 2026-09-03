@@ -143,7 +143,7 @@ describe("DeepSeek model adapter", () => {
         { role: "tool", tool_call_id: "prior_call", content: "{\"ok\":true}" },
       ],
     });
-    expect(requestedBody).not.toHaveProperty("thinking");
+    expect(requestedBody).toHaveProperty("thinking", { type: "enabled" });
     expect(requestedBody).not.toHaveProperty("tool_choice");
     expect(response).toMatchObject({
       id: "response_1",
@@ -154,6 +154,143 @@ describe("DeepSeek model adapter", () => {
       ],
     });
     expect(JSON.parse(response.providerState ?? "null")).toEqual(returnedProviderMessage);
+  });
+
+  it("replays returned reasoning content unchanged on the next tool request", async () => {
+    const harness = modelHarness();
+    const requestedBodies: Record<string, unknown>[] = [];
+    const returnedProviderMessage = {
+      role: "assistant",
+      content: null,
+      reasoning_content: "Call the tool, then continue with its result.",
+      tool_calls: [
+        {
+          id: "call_round_trip",
+          type: "function",
+          function: { name: "test_echo", arguments: "{\"value\":\"round-trip\"}" },
+        },
+      ],
+    };
+    const responses = [
+      completionResponse({
+        finish_reason: "tool_calls",
+        message: returnedProviderMessage,
+      }),
+      completionResponse({
+        finish_reason: "stop",
+        message: { role: "assistant", content: "done", reasoning_content: "Use the result." },
+      }),
+    ];
+    const model = new DeepSeekChatModel({
+      config: harness.config,
+      traces: harness.traces,
+      fetchImpl: async (input, init) => {
+        requestedBodies.push(
+          (await new Request(input, init).json()) as Record<string, unknown>,
+        );
+        const response = responses.shift();
+        if (response === undefined) {
+          throw new Error("No DeepSeek fixture response remains");
+        }
+        return response;
+      },
+    });
+    const first = await model.complete({
+      traceId: newTraceId(),
+      runId: newRunId(),
+      messages: [{ role: "user", content: "Echo this" }],
+      tools: [echoTool.definition],
+    });
+    if (first.providerState === null) {
+      throw new Error("Expected opaque DeepSeek provider state");
+    }
+
+    await model.complete({
+      traceId: newTraceId(),
+      runId: newRunId(),
+      messages: [
+        { role: "user", content: "Echo this" },
+        {
+          role: "assistant",
+          content: first.content,
+          providerState: first.providerState,
+          toolCalls: first.toolCalls,
+        },
+        {
+          role: "tool",
+          toolCallId: "call_round_trip",
+          content: "{\"ok\":true}",
+        },
+      ],
+      tools: [echoTool.definition],
+    });
+
+    expect(requestedBodies[1]).toMatchObject({
+      thinking: { type: "enabled" },
+      reasoning_effort: "high",
+      messages: [
+        { role: "user", content: "Echo this" },
+        returnedProviderMessage,
+        {
+          role: "tool",
+          tool_call_id: "call_round_trip",
+          content: "{\"ok\":true}",
+        },
+      ],
+    });
+  });
+
+  it("uses a DeepSeek-specific timeout for a slow response body", async () => {
+    const harness = modelHarness({
+      PROVIDER_REQUEST_TIMEOUT_MS: "20",
+      DEEPSEEK_REQUEST_TIMEOUT_MS: "100",
+    });
+    const payload = new TextEncoder().encode(
+      JSON.stringify({
+        id: "slow_response",
+        choices: [
+          {
+            finish_reason: "stop",
+            message: { role: "assistant", content: "done" },
+          },
+        ],
+        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+      }),
+    );
+    const model = new DeepSeekChatModel({
+      // Native AbortSignal.timeout and response-body cancellation require the platform clock.
+      config: harness.config,
+      traces: harness.traces,
+      fetchImpl: async (input, init) => {
+        const signal = new Request(input, init).signal;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              const onAbort = () => {
+                clearTimeout(timer);
+                controller.error(signal.reason);
+              };
+              const timer = setTimeout(() => {
+                signal.removeEventListener("abort", onAbort);
+                controller.enqueue(payload);
+                controller.close();
+              }, 50);
+              signal.addEventListener("abort", onAbort, { once: true });
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+
+    await expect(
+      model.complete({
+        traceId: newTraceId(),
+        runId: newRunId(),
+        messages: [{ role: "user", content: "Finish the turn" }],
+        tools: [],
+      }),
+    ).resolves.toMatchObject({ content: "done" });
   });
 
   it("normalizes omitted and blank no-argument tool payloads", async () => {
@@ -257,8 +394,10 @@ describe("DeepSeek model adapter", () => {
         ],
       }),
     ).resolves.toMatchObject({ content: "{\"action\":\"unchanged\"}" });
-    expect(requestedBody).toMatchObject({ reasoning_effort: "high" });
-    expect(requestedBody).not.toHaveProperty("thinking");
+    expect(requestedBody).toMatchObject({
+      reasoning_effort: "high",
+      thinking: { type: "enabled" },
+    });
     expect(requestedBody).not.toHaveProperty("tools");
     expect(requestedBody).not.toHaveProperty("tool_choice");
   });
@@ -1422,7 +1561,7 @@ const echoTool: RegisteredTool = {
   },
 };
 
-function modelHarness(): {
+function modelHarness(overrides: Record<string, string> = {}): {
   database: TestDatabase;
   config: RuntimeConfig;
   traces: TraceStore;
@@ -1431,7 +1570,7 @@ function modelHarness(): {
   databases.push(database);
   return {
     database,
-    config: testRuntimeConfig(database),
+    config: testRuntimeConfig(database, overrides),
     traces: new TraceStore(database.handle.db, createTraceRedactor([])),
   };
 }
@@ -1562,7 +1701,10 @@ function completionResponse(choice: {
   );
 }
 
-function testRuntimeConfig(database: TestDatabase): RuntimeConfig {
+function testRuntimeConfig(
+  database: TestDatabase,
+  overrides: Record<string, string> = {},
+): RuntimeConfig {
   return loadRuntimeConfig({
     NODE_ENV: "test",
     DATA_DIR: database.directory,
@@ -1579,5 +1721,6 @@ function testRuntimeConfig(database: TestDatabase): RuntimeConfig {
     GOOGLE_CLIENT_ID: "google_test_client",
     GOOGLE_CLIENT_SECRET: "google_test_secret",
     CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
+    ...overrides,
   });
 }
