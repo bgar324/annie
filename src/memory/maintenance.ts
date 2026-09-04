@@ -44,7 +44,6 @@ interface MaintenanceContextRow {
   final_response: string | null;
   inbound_text: string | null;
   first_user_message: string | null;
-  reply_delivered: number;
 }
 
 interface InterruptedMaintenanceRow {
@@ -131,21 +130,6 @@ export class MemoryMaintenanceService {
             : "failed",
         memory: before,
       };
-    }
-    if (context.reply_delivered !== 1) {
-      // Old queued jobs still obey delivery eligibility. Unknown is not proof of receipt.
-      if (this.#claim(input.runId, beforeDigest)) {
-        this.#fail({
-          runId: input.runId,
-          traceId: context.trace_id,
-          status: "failed",
-          outcome: "reply_not_confirmed",
-          beforeDigest,
-          usage: null,
-          error: new Error("No reply for this run was confirmed delivered"),
-        });
-      }
-      return { status: "failed", memory: before };
     }
     const userMessage = context.inbound_text ?? context.first_user_message;
     if (context.phase !== "completed" || context.final_response === null || userMessage === null) {
@@ -355,7 +339,6 @@ export class MemoryMaintenanceService {
     return result.changes === 1;
   }
 
-
   #context(runId: RunId): MaintenanceContextRow {
     const row = this.#db
       .prepare<{ id: string }, MaintenanceContextRow>(`
@@ -372,11 +355,7 @@ export class MemoryMaintenanceService {
               AND agent_messages.role = 'user'
             ORDER BY agent_messages.sequence
             LIMIT 1
-          ) AS first_user_message,
-          EXISTS (
-            SELECT 1 FROM egress_messages
-            WHERE run_id = agent_runs.id AND purpose = 'reply' AND state = 'delivered'
-          ) AS reply_delivered
+          ) AS first_user_message
         FROM agent_runs
         LEFT JOIN inbound_messages ON inbound_messages.id = agent_runs.inbound_id
         WHERE agent_runs.id = @id

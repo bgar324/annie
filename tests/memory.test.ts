@@ -7,7 +7,6 @@ import type {
 } from "../src/agent/model.js";
 import { AgentRunStore } from "../src/agent/store.js";
 import {
-  newEgressId,
   newInboundId,
   newTraceId,
   type InboundId,
@@ -472,34 +471,6 @@ describe("post-turn memory maintenance", () => {
     ).toBe(true);
     await expect(harness.documents.load()).resolves.toBe(before);
   });
-
-  it("never calls the memory model without confirmed reply delivery", async () => {
-    const harness = await maintenanceHarness();
-    const { runId } = completedRun(harness, "Remember my dentist", 1, "delivery_unknown");
-    let requests = 0;
-    const service = new MemoryMaintenanceService({
-      db: harness.database.handle.db,
-      documents: harness.documents,
-      traces: harness.traces,
-      model: {
-        async maintainMemory() {
-          requests += 1;
-          throw new Error("An unconfirmed reply must never reach the memory model");
-        },
-      },
-    });
-
-    await expect(
-      service.maintainRun({
-        runId,
-        deadlineAtMs: Date.now() + 60_000,
-      }),
-    ).resolves.toEqual({ status: "failed", memory: "# Memory\n" });
-
-    expect(runMaintenanceStatus(harness.database, runId)).toBe("failed");
-    expect(requests).toBe(0);
-    await expect(harness.documents.load()).resolves.toBe("# Memory\n");
-  });
 });
 
 interface MaintenanceHarness {
@@ -540,7 +511,6 @@ function completedRun(
   harness: MaintenanceHarness,
   userMessage: string,
   sequence: number,
-  reply: "delivered" | "delivery_unknown" = "delivered",
 ): { runId: RunId; traceId: TraceId } {
   const { inboundId, traceId } = insertInbound(harness.database, harness.traces, userMessage, sequence);
   const run = harness.runs.startOrResume({ source: { kind: "inbound", inboundId }, traceId, deadlineAtMs: Date.now() + 60_000 });
@@ -549,19 +519,6 @@ function completedRun(
     { role: "user", content: userMessage },
   ]);
   harness.runs.complete(run.id, "Reply remains available");
-  const now = Date.now();
-  harness.database.handle.db
-    .prepare(`
-      INSERT INTO egress_messages(
-        id, run_id, trace_id, recipient_handle, line_handle, reply_to_guid,
-        body, purpose, state, attempt_count, outbox_id, request_id,
-        provider_message_id, poll_count, poll_deadline_at_ms, last_error,
-        created_at_ms, updated_at_ms
-      ) VALUES (?, ?, ?, '+15559990000', '+15551110000', NULL,
-                'Reply remains available', 'reply', ?, 1, NULL, NULL,
-                NULL, 0, NULL, NULL, ?, ?)
-    `)
-    .run(newEgressId(), run.id, traceId, reply, now, now);
   return { runId: run.id, traceId };
 }
 

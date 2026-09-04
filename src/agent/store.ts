@@ -280,6 +280,94 @@ export class AgentRunStore {
     transaction.immediate();
   }
 
+  appendInfrastructureToolTurn(input: {
+    runId: RunId;
+    authorizationMessage: string;
+    call: ModelToolCall;
+    result: unknown;
+    completion: string;
+  }): void {
+    const transaction = this.#db.transaction(() => {
+      const messages = this.loadMessages(input.runId);
+      const callIndex = messages.findIndex(
+        (message) =>
+          message.role === "assistant" &&
+          message.toolCalls?.some((call) => call.id === input.call.id),
+      );
+      const resultIndex = messages.findIndex(
+        (message) => message.role === "tool" && message.toolCallId === input.call.id,
+      );
+      const serializedResult = canonicalJson(input.result);
+      const authorizationIndex = messages.findLastIndex((message) => message.role === "user");
+      if (
+        authorizationIndex === -1 ||
+        messages[authorizationIndex]?.content !== input.authorizationMessage ||
+        (callIndex !== -1 && authorizationIndex >= callIndex)
+      ) {
+        throw new Error(
+          "Infrastructure tool transcript is not authorized by the current user message",
+        );
+      }
+      if (callIndex !== -1 || resultIndex !== -1) {
+        if (callIndex === -1 || resultIndex <= callIndex) {
+          throw new Error("Infrastructure tool transcript is incomplete");
+        }
+        const storedCall = messages[callIndex];
+        const matchingCall =
+          storedCall?.role === "assistant"
+            ? storedCall.toolCalls?.find((call) => call.id === input.call.id)
+            : undefined;
+        const storedResult = messages[resultIndex];
+        const completion = messages
+          .slice(resultIndex + 1)
+          .find(
+            (message) =>
+              message.role === "assistant" && (message.toolCalls?.length ?? 0) === 0,
+          );
+        if (
+          matchingCall === undefined ||
+          canonicalJson(matchingCall) !== canonicalJson(input.call) ||
+          storedResult?.role !== "tool" ||
+          storedResult.content !== serializedResult ||
+          completion?.content !== input.completion
+        ) {
+          throw new Error("Infrastructure tool transcript does not match the durable action");
+        }
+        return;
+      }
+
+      this.#appendMessageInTransaction(
+        input.runId,
+        { role: "assistant", content: "", toolCalls: [input.call] },
+        {},
+      );
+      this.#appendMessageInTransaction(
+        input.runId,
+        {
+          role: "tool",
+          content: serializedResult,
+          toolCallId: input.call.id,
+        },
+        {},
+      );
+      this.#appendMessageInTransaction(
+        input.runId,
+        { role: "assistant", content: input.completion },
+        {},
+      );
+      const run = this.getRequired(input.runId);
+      this.#traces.appendInTransaction({
+        traceId: run.traceId,
+        component: "agent",
+        event: "infrastructure_turn_saved",
+        outcome: input.call.name,
+        runId: input.runId,
+        data: { toolCallId: input.call.id },
+      });
+    });
+    transaction.immediate();
+  }
+
   loadMessages(runId: RunId): readonly ModelMessage[] {
     return this.#db
       .prepare<{ run_id: string }, MessageRow>(`
@@ -426,6 +514,47 @@ export class AgentRunStore {
 
   block(runId: RunId, failureCode: string): void {
     this.#finishRun(runId, "blocked", null, failureCode, "blocked");
+  }
+
+  quarantineCompletedInTransaction(runId: RunId, failureCode: string): void {
+    const now = Date.now();
+    const run = this.getRequired(runId);
+    if (run.phase === "blocked" && run.failureCode === failureCode) {
+      return;
+    }
+    if (run.phase !== "completed" || run.source.kind !== "inbound") {
+      throw new Error(`Run ${runId} cannot be quarantined`);
+    }
+    const runUpdate = this.#db
+      .prepare<{ id: string; failure_code: string; now_ms: number }>(`
+        UPDATE agent_runs
+        SET phase = 'blocked', final_response = NULL,
+            failure_code = @failure_code, updated_at_ms = @now_ms
+        WHERE id = @id AND phase = 'completed'
+      `)
+      .run({ id: runId, failure_code: failureCode, now_ms: now });
+    const inboundUpdate = this.#db
+      .prepare<{ id: string; now_ms: number }>(`
+        UPDATE inbound_messages
+        SET state = 'blocked', updated_at_ms = @now_ms
+        WHERE id = @id AND state = 'done'
+      `)
+      .run({ id: run.source.inboundId, now_ms: now });
+    if (runUpdate.changes !== 1 || inboundUpdate.changes !== 1) {
+      throw new Error(`Run ${runId} could not be quarantined atomically`);
+    }
+    this.#traces.appendInTransaction({
+      traceId: run.traceId,
+      component: "agent",
+      event: "quarantined",
+      outcome: failureCode,
+      runId,
+      data: {
+        responseBytes:
+          run.finalResponse === null ? 0 : Buffer.byteLength(run.finalResponse),
+      },
+      occurredAtMs: now,
+    });
   }
 
   #finishRun(

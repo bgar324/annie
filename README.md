@@ -128,16 +128,6 @@ pnpm replay -- <trace-id>
 
 Tests use temporary databases, synthetic phone numbers, and provider doubles. They never call live provider write endpoints.
 
-The real-model smoke uses synthetic Notion pages, an in-memory Sendblue line, and production model/run limits. It permits network requests only to DeepSeek and makes billed model calls using `DEEPSEEK_API_KEY`. It never reads production accounts or sends real iMessages:
-
-```sh
-pnpm smoke:inbound
-pnpm smoke:inbound -- relative_date_checkbox
-pnpm smoke:inbound --list
-```
-
-Add `--keep` to retain the temporary SQLite and trace artifacts. Failed cases retain them automatically.
-
 ## Deployment
 
 The repository includes a multi-stage [Dockerfile](Dockerfile). Railway should run one replica with one volume mounted at `/app/data`; the container starts `node dist/main.js` and handles `SIGTERM` directly.

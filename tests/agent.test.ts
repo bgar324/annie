@@ -1277,28 +1277,14 @@ describe("durable bounded agent loop", () => {
     expect(executions).toBe(0);
   });
 
-  it("loads bounded delivered history from the same chat", () => {
+  it("loads only bounded completed history from the same chat", () => {
     const harness = agentHarness();
     const first = insertInbound(harness.database, harness.traces, "First", 1);
     const firstRun = harness.runs.startOrResume({ source: { kind: "inbound", inboundId: first.inboundId }, traceId: first.traceId, deadlineAtMs: Date.now() + 60_000 });
     harness.runs.complete(firstRun.id, "First answer");
-    insertEgress(harness.database, {
-      runId: firstRun.id,
-      traceId: first.traceId,
-      purpose: "reply",
-      body: "First answer",
-      state: "delivered",
-    });
     const second = insertInbound(harness.database, harness.traces, "Second", 2);
     const secondRun = harness.runs.startOrResume({ source: { kind: "inbound", inboundId: second.inboundId }, traceId: second.traceId, deadlineAtMs: Date.now() + 60_000 });
     harness.runs.complete(secondRun.id, "Second answer");
-    insertEgress(harness.database, {
-      runId: secondRun.id,
-      traceId: second.traceId,
-      purpose: "reply",
-      body: "Second answer",
-      state: "delivered",
-    });
     const current = insertInbound(harness.database, harness.traces, "Current", 3);
 
     expect(
@@ -1316,59 +1302,39 @@ describe("durable bounded agent loop", () => {
     ).toEqual([]);
   });
 
-  it("keeps a request whose reply never reached the user without an assistant turn", () => {
+  it("keeps retired status-action JSON out of later conversation history", () => {
     const harness = agentHarness();
-    const unknown = insertInbound(harness.database, harness.traces, "Did it save?", 1);
-    const unknownRun = harness.runs.startOrResume({
-      source: { kind: "inbound", inboundId: unknown.inboundId },
-      traceId: unknown.traceId,
+    const prior = insertInbound(
+      harness.database,
+      harness.traces,
+      "What accounts do I have?",
+      1,
+    );
+    const priorRun = harness.runs.startOrResume({
+      source: { kind: "inbound", inboundId: prior.inboundId },
+      traceId: prior.traceId,
       deadlineAtMs: Date.now() + 60_000,
     });
-    harness.runs.complete(unknownRun.id, "✅ saved it.");
-    insertEgress(harness.database, {
-      runId: unknownRun.id,
-      traceId: unknown.traceId,
-      purpose: "reply",
-      body: "✅ saved it.",
-      state: "acceptance_unknown",
-    });
-    const blocked = insertInbound(harness.database, harness.traces, "And the other one?", 2);
-    const blockedRun = harness.runs.startOrResume({
-      source: { kind: "inbound", inboundId: blocked.inboundId },
-      traceId: blocked.traceId,
-      deadlineAtMs: Date.now() + 60_000,
-    });
-    harness.runs.block(blockedRun.id, "ambiguous_write");
-    const current = insertInbound(harness.database, harness.traces, "Hello again", 3);
+    harness.runs.complete(
+      priorRun.id,
+      '{"action":"connection_status","message":"let me check your connected accounts for you."}',
+    );
+    const current = insertInbound(harness.database, harness.traces, "Hello again", 2);
 
     expect(
-      new ConversationHistoryStore(harness.database.handle.db, 6, 1_024).loadBefore(
+      new ConversationHistoryStore(harness.database.handle.db, 2, 1_024).loadBefore(
         current.inboundId,
       ),
     ).toEqual([
-      { role: "user", content: "Did it save?" },
-      { role: "user", content: "And the other one?" },
+      { role: "user", content: "What accounts do I have?" },
+      {
+        role: "assistant",
+        content: "let me check your connected accounts for you.",
+      },
     ]);
   });
 
-  it.each([
-    {
-      label: "a plain URL-free preface",
-      finalResponse: "here's the link to connect your google account:",
-    },
-    {
-      label: "a retired fenced connect action",
-      finalResponse: [
-        "```json",
-        "{",
-        '  "action": "connect",',
-        '  "provider": "google",',
-        `  "message": "here's the link to connect your google account:"`,
-        "}",
-        "```",
-      ].join("\n"),
-    },
-  ])("carries $label from a delivered connect link without its URL", ({ finalResponse }) => {
+  it("keeps fenced retired connect actions out of conversation history", () => {
     const harness = agentHarness();
     const prior = insertInbound(
       harness.database,
@@ -1381,14 +1347,18 @@ describe("durable bounded agent loop", () => {
       traceId: prior.traceId,
       deadlineAtMs: Date.now() + 60_000,
     });
-    harness.runs.complete(priorRun.id, finalResponse);
-    insertEgress(harness.database, {
-      runId: priorRun.id,
-      traceId: prior.traceId,
-      purpose: "recovery",
-      body: "here's the link to connect your google account:\nhttps://assistant.example/connect/google?token=secret",
-      state: "delivered",
-    });
+    harness.runs.complete(
+      priorRun.id,
+      [
+        "```json",
+        "{",
+        '  \"action\": \"connect\",',
+        '  \"provider\": \"google\",',
+        `  "message": "here's the link to connect your google account:"`,
+        "}",
+        "```",
+      ].join("\n"),
+    );
     const current = insertInbound(harness.database, harness.traces, "Hello again", 2);
 
     expect(
@@ -1407,37 +1377,80 @@ describe("durable bounded agent loop", () => {
     ]);
   });
 
-  it("omits a connect run whose link was never delivered", () => {
+  it("omits unfulfilled connect runs but retains fulfilled replies in later history", () => {
     const harness = agentHarness();
-    const prior = insertInbound(
+    const unfulfilled = insertInbound(
+      harness.database,
+      harness.traces,
+      "Connect my Google account",
+      1,
+    );
+    const unfulfilledRun = harness.runs.startOrResume({
+      source: { kind: "inbound", inboundId: unfulfilled.inboundId },
+      traceId: unfulfilled.traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    const unfulfilledExecution = harness.runs.prepareTool({
+      runId: unfulfilledRun.id,
+      call: {
+        id: "unfulfilled_connect",
+        name: "connections.connect",
+        argumentsJson: '{"provider":"google"}',
+      },
+      operationClass: "read",
+      maximumToolCalls: 4,
+    });
+    harness.runs.markToolRunning(unfulfilledExecution.id);
+    harness.runs.finishTool(unfulfilledExecution.id, "succeeded", {
+      provider: "google",
+      connectionLinkWillBeAppended: true,
+    });
+    harness.runs.complete(unfulfilledRun.id, "Use evil.example/connect instead.");
+
+    const fulfilled = insertInbound(
       harness.database,
       harness.traces,
       "Connect my Notion account",
-      1,
+      2,
     );
-    const priorRun = harness.runs.startOrResume({
-      source: { kind: "inbound", inboundId: prior.inboundId },
-      traceId: prior.traceId,
+    const fulfilledRun = harness.runs.startOrResume({
+      source: { kind: "inbound", inboundId: fulfilled.inboundId },
+      traceId: fulfilled.traceId,
       deadlineAtMs: Date.now() + 60_000,
     });
-    harness.runs.complete(
-      priorRun.id,
-      "here's your notion connection link:",
-    );
-    insertEgress(harness.database, {
-      runId: priorRun.id,
-      traceId: prior.traceId,
-      purpose: "recovery",
-      body: "here's your notion connection link:\nhttps://assistant.example/connect/notion?token=secret",
-      state: "acceptance_unknown",
+    const fulfilledExecution = harness.runs.prepareTool({
+      runId: fulfilledRun.id,
+      call: {
+        id: "fulfilled_connect",
+        name: "connections.connect",
+        argumentsJson: '{"provider":"notion"}',
+      },
+      operationClass: "read",
+      maximumToolCalls: 4,
     });
-    const current = insertInbound(harness.database, harness.traces, "Hello again", 2);
+    harness.runs.markToolRunning(fulfilledExecution.id);
+    harness.runs.finishTool(fulfilledExecution.id, "succeeded", {
+      provider: "notion",
+      connectionLinkWillBeAppended: true,
+    });
+    harness.runs.complete(fulfilledRun.id, "Open the secure link below.");
+    harness.traces.append({
+      traceId: fulfilled.traceId,
+      component: "connection_control",
+      event: "connect_fulfilled",
+      outcome: "notion",
+      runId: fulfilledRun.id,
+    });
 
+    const current = insertInbound(harness.database, harness.traces, "Hello again", 3);
     expect(
       new ConversationHistoryStore(harness.database.handle.db, 6, 1_024).loadBefore(
         current.inboundId,
       ),
-    ).toEqual([{ role: "user", content: "Connect my Notion account" }]);
+    ).toEqual([
+      { role: "user", content: "Connect my Notion account" },
+      { role: "assistant", content: "Open the secure link below." },
+    ]);
   });
 
   it("keeps unexpected provider error details out of the model transcript", async () => {
@@ -1619,36 +1632,6 @@ function insertInbound(
   });
   transaction.immediate();
   return { inboundId, traceId };
-}
-
-function insertEgress(
-  database: TestDatabase,
-  input: {
-    runId: string;
-    traceId: TraceId;
-    purpose: "reply" | "recovery";
-    body: string;
-    state: "delivered" | "acceptance_unknown";
-  },
-): void {
-  const now = Date.now();
-  database.handle.db
-    .prepare(`
-      INSERT INTO egress_messages(
-        id, run_id, trace_id, recipient_handle, line_handle, reply_to_guid, body,
-        purpose, state, attempt_count, created_at_ms, updated_at_ms
-      ) VALUES (?, ?, ?, '+15559990000', '+15551110000', NULL, ?, ?, ?, 1, ?, ?)
-    `)
-    .run(
-      `egress_${randomUUID()}`,
-      input.runId,
-      input.traceId,
-      input.body,
-      input.purpose,
-      input.state,
-      now,
-      now,
-    );
 }
 
 function scriptedModel(

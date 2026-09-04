@@ -68,7 +68,7 @@ Sendblue does not transcribe inbound audio. A media-only message therefore arriv
 
 The queue holds five active job types: `inbound`, `daily_brief`, `egress_send`, `egress_reconcile`, and `memory_maintenance`. Jobs use lease tokens and lease expirations. A claim increments its attempt count and sets one random lease token. Heartbeats, completion, requeue, failure, and shutdown checks must present that token. An expired lease can be reclaimed; the stale owner cannot commit afterward.
 
-Only one job for a chat runs at once. Inbound sequence numbers preserve per-chat order, and pending reply sends take priority. Memory work is created only after confirmed delivery and waits for unresolved earlier reply receipts, so older preferences cannot overwrite newer ones. Waiting memory jobs do not block newer inbound messages. Expired running jobs remain ordered by lease expiration so recovery cannot starve. Internal egress and memory jobs are capacity-exempt so a full user queue cannot strand a committed result.
+Only one job for a chat can run at once. Inbound sequence numbers preserve per-chat order. Pending reply egress takes priority, followed by its memory job and then ordinary work; expired running jobs remain ordered by lease expiration so recovery cannot starve. A memory job is ineligible while its same-trace reply job is pending or running. Reply and memory jobs inherit the inbound sequence, so the next inbound turn cannot overtake either boundary. Internal egress and memory jobs are capacity-exempt so a full user queue cannot strand a committed result.
 
 A process stop does not release a lease while its handler may still be running. On `SIGTERM`, the configured HTTP listeners begin draining; the receiver, the daily brief scheduler, and the worker observe one shared abort signal and stop after their in-flight sweep or handler returns. SQLite stays open unless every listener drains successfully. Pending traces then project and SQLite closes. If the platform kills the process first, the lease expires and the durable ingress cursor and queue let the next process resume without losing work.
 
@@ -76,7 +76,7 @@ A process stop does not release a lease while its handler may still be running. 
 
 The in-process scheduler reconciles SQLite once per minute. It creates one `daily_brief` job per Los Angeles calendar date with `available_at` set to 08:00 America/Los_Angeles. The unique `(type, subject)` key makes overlapping passes and restarts idempotent. A missing brief can catch up for two hours after 08:00; after that window, the scheduler creates the next day's job. Scheduling performs no provider request.
 
-A daily brief run points `agent_runs.scheduled_job_id` at the claimed job instead of fabricating an inbound message. It uses the normal bounded agent loop, durable reply planning, egress write intent, delivery reconciliation, and post-delivery memory maintenance.
+A daily brief run points `agent_runs.scheduled_job_id` at the claimed job instead of fabricating an inbound message. It runs through the normal bounded agent loop, durable reply planning, egress write-intent, post-send memory maintenance, and delivery reconciliation paths.
 
 The production registry remains exactly eight tools. For a daily brief, `AgentLoop` filters the model definitions to `gmail.search`, `gmail.read_thread`, `google.search`, `google.read`, `notion.search`, and `notion.fetch`. The request requires one Gmail search and one batched Calendar, Drive, and Tasks search for each capable Google account. It requires one search for each capable Notion workspace. Contacts remain available on demand but are not part of the daily brief. The completion guard checks each account and product facet by the bound connection and exact safe label. With no healthy source, the service sends connection instructions without calling the model.
 
@@ -102,7 +102,7 @@ Each run has a durable transcript and enforces these bounds:
 - six tool rounds plus a final answer;
 - sixteen tool calls total;
 - four tool calls in one model response;
-- one dispatched provider mutation per inbound request; no provider mutations in daily briefs;
+- two provider writes;
 - eight exponentially backed-off transport attempts for one model request, still bounded by the whole-run deadline;
 - 18,996 characters for the final iMessage response, matching the Sendblue content cap.
 
@@ -161,15 +161,17 @@ The signed token contains a random identifier, provider, issue time, and expiry.
 Connection and callback routes suppress request logging, disable caching, and set a no-referrer policy so signed query values and OAuth codes do not enter routine logs or browser referrers.
 
 ## Provider writes and ambiguous acceptance
-The model interprets the current user request, including ordinary task additions, shorthand, and relative dates. The runtime does not parse English authorization or judge the final reply's wording. History and provider content are context, not new authorization. Intent interpretation and accurate wording remain model responsibilities; they are not mechanically proven.
+Inbound writes fail closed before tool preparation. The current raw user message must identify the write action and its target. The proposed tool arguments must stay within both. A task-completion request authorizes one matching checkbox-marker transition only. It cannot authorize page creation, a different task label, `replace_all`, or bundled edits. A final response may claim a provider change only when the same run has a succeeded tool execution backed by a succeeded write intent.
 
-`NotionToolService` owns update safety. An update uses the latest successful `notion.fetch` for that page in the same run and selected connection. That result must be complete, and its returned safe workspace label must match. A newer incomplete result cannot fall back to an older complete one. Search discovers candidates; it is not an additional authorization step, and no page-scoped proof search is injected.
+Every Notion update starts from a successful, complete same-run `notion.search` result, then fetches the same page from the same workspace. The adapter marks a search incomplete when it fills the requested result limit without an explicit provider completion signal. If that search contains exactly one title matching the query after punctuation normalization, the adapter repeats it at the provider maximum while scoped to that page. A checkbox update may use this complete page-scoped result; a property update, full-content replacement, or text replacement still requires an exact page title in the current request and a complete unscoped search whose query equals that title and resolves it to one page.
 
-An update accepts one scalar property or one bounded exact-text patch. The patch's old text must occur exactly once in the fetched page; unchanged headings or neighboring lines can disambiguate repeated tasks. Replace-all is unavailable. Full-content replacement remains available for user-requested rewrites after a complete fetch; deciding whether the user requested a rewrite belongs to the model.
+Notion read responses signal an incomplete page with `truncated: true` or omitted-block metadata; the adapter keeps either state truncated and the write guard rejects it. The hosted MCP omits `truncated` from complete read responses, so absence without omitted blocks is complete. A checkbox request can omit the page title when the complete fetched text contains one matching task label. A contextual replacement can distinguish repeated copies of that same label, but it must change exactly one checkbox marker. Exact-text replacements require the exact, complete source text.
 
-An identical patch or full-content replacement returns `outcome: "unchanged"` without preparing an intent or contacting the provider. A confirmed mutation returns `outcome: "succeeded"`. These results live in the existing tool and write records, not a second action state machine. A read-grounded already-set answer or natural clarification needs no special response validator.
+An exact checkbox request may return a read-only no-op only when the same run prepared no provider write, a complete fetched page from a current search contains exactly one checkbox matching the authorized task, that checkbox is already in the requested state, and the reply explicitly says it was already set and no change was made.
 
-The loop permits one dispatched mutation per inbound request. Invalid arguments, missing source evidence, and other pre-dispatch failures return sanitized tool errors, so the model can correct its proposal without spending that budget. A later write after the budget is spent returns `write_limit`; it does not discard an earlier successful result. Multiple write calls in one response are rejected before any call in that response executes.
+An inexact shorthand request may instead return a read-only target clarification when the complete fetched page contains exactly one occurrence of the related checkbox named in the reply, that checkbox is already in the requested state, the reply explicitly says no change was made, and it asks whether that related item is what the user intended. Both branches require proof from the explicitly authorized workspace or, for an unscoped request, the sole healthy workspace capable of the requested Notion update. Every other no-write completion remains blocked as an unverified write claim.
+
+One parsed authorization binds one provider-write tool call. A crash recovery may resume that same tool-call ID, but a second write call needs a new inbound request. An explicit Notion workspace must use the exact `in Notion workspace <safe label>` suffix and must match the tool argument. If an unscoped write has multiple eligible workspaces, the only no-write completion allowed is a pre-intent clarification that lists every eligible safe label and asks the user to repeat the full request with that suffix.
 
 
 Every provider mutation follows a write-intent state machine:
@@ -182,19 +184,15 @@ For Notion updates, a non-error MCP envelope does not prove acceptance. The adap
 
 
 If the process stops while a write is `attempting`, startup changes it to `ambiguous`. The service never automatically repeats an ambiguous write. The related agent run blocks and reports its trace ID.
-If a run completed before reply planning committed, recovery resumes idempotent reply planning from its stored response without another model call or prose revalidation. Completed inbound finalization remains reclaimable beyond the ordinary job-attempt cap. Recovery never replaces or repeats a reply whose dispatch may have begun.
+Recovery revalidates a completed response before resuming its reply. Completed inbound finalization remains reclaimable beyond the ordinary job-attempt cap because it performs only local idempotent state transitions. If a prior crash left an invalid reply prepared, one transaction cancels that send intent, blocks its send and memory jobs, quarantines the run, and prepares the failure notice. Once reply dispatch has begun, recovery leaves the reply and write intent unchanged, blocks pending memory work, and removes the false response from conversation history.
 
 Sendblue reply sending uses the same rule. One `POST` send carries the reply, and its returned message handle is the only identifier the service keeps. If the send may have been accepted, the egress row becomes `acceptance_unknown` and the write intent becomes `ambiguous`; the service never issues a second send. A send whose acceptance is known but whose delivery is not is reconciled with bounded `GET` status polls, at most twelve within a 30-minute deadline, ending as `delivered`, `provider_failed`, or `delivery_unknown`.
-
-## Conversation history
-
-Earlier accepted user messages remain in bounded history even when their turn failed or their reply was not confirmed. Assistant text enters history only after confirmed delivery. Normal replies use the delivered body; delivered connection links contribute only their stored URL-free preface. Failed or unknown delivery contributes no assistant message. Unknown does not mean the message definitely failed to arrive.
 
 ## Memory
 
 `MEMORY.md` is the only canonical long-term memory. It starts with `# Memory`, is at most 16 KiB, and cannot contain configured secrets or signed connection URLs.
 
-Reply preparation commits the egress row, Sendblue write intent, and send job together. Either an immediately delivered send result or a later delivery receipt enqueues `memory_maintenance` in the transaction that records delivery. The existing unique job identity prevents duplicate maintenance. Failed, ambiguous, and unconfirmed replies create no memory work. Pre-existing queued jobs independently check delivery eligibility before calling the model. A memory failure never retracts or repeats a reply.
+After a successful agent answer, reply preparation writes the egress row, Sendblue write intent, `egress_send` job, and `memory_maintenance` job in one SQLite transaction. The worker attempts reply egress first. Memory remains ineligible while that reply job is pending or running, then runs after the reply reaches a terminal queue state; memory failure never retracts or repeats the reply.
 
 The memory job reconstructs the user message, final response, and ordered tool outcomes from the durable run instead of carrying transient context in its payload. One configured-model request, bounded to 45 seconds and ending at least five seconds before the job lease, returns either `unchanged` or a complete replacement document. The service validates a replacement and writes it through a same-directory temporary file, file sync, atomic rename, and directory sync. It records before and after digests plus a unified diff in the trace. The job is idempotent by run ID, and startup resolves an interrupted prepared replacement before reclaiming queued work.
 

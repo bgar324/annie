@@ -6,7 +6,7 @@ import type { ConnectionRouter } from "../connections/router.js";
 import type { ConnectionStore } from "../connections/store.js";
 import type { ConnectionCapability, ConnectionRecord } from "../connections/types.js";
 import { ModelSafeError } from "../core/errors.js";
-import type { TraceId } from "../core/ids.js";
+import type { TraceId, WriteIntentId } from "../core/ids.js";
 import type { WriteStore } from "../writes/store.js";
 import type { NotionClientProvider, NotionUpstreamTool } from "./client.js";
 
@@ -56,10 +56,7 @@ const updatePropertiesSchema = z
     workspace: accountSchema,
     pageId: z.string().min(1).max(2_048),
     command: z.literal("update_properties"),
-    properties: propertiesSchema.refine(
-      (properties) => Object.keys(properties).length === 1,
-      "Update one property at a time",
-    ),
+    properties: propertiesSchema,
   })
   .strict();
 const replaceContentSchema = z
@@ -74,7 +71,7 @@ const contentUpdateSchema = z
   .object({
     oldText: z.string().min(1).max(8_000),
     newText: z.string().max(8_000),
-    replaceAllMatches: z.literal(false).default(false),
+    replaceAllMatches: z.boolean().default(false),
   })
   .strict();
 const updateContentSchema = z
@@ -82,7 +79,7 @@ const updateContentSchema = z
     workspace: accountSchema,
     pageId: z.string().min(1).max(2_048),
     command: z.literal("update_content"),
-    updates: z.tuple([contentUpdateSchema]),
+    updates: z.array(contentUpdateSchema).min(1).max(20),
   })
   .strict();
 const updatePageArgumentsSchema = z.discriminatedUnion("command", [
@@ -130,35 +127,17 @@ interface NormalizedNotionReference {
 interface NormalizedNotionSearchResult {
   readonly results: readonly NormalizedNotionReference[];
   readonly truncated: boolean;
+  readonly pageScopedSearches?: readonly {
+    readonly pageId: string;
+    readonly results: readonly NormalizedNotionReference[];
+    readonly truncated: false;
+  }[];
 }
 
 interface NormalizedNotionTextResult {
   readonly text: string;
   readonly truncated: boolean;
 }
-
-const fetchedPageSchema = z.object({
-  workspace: z.object({ label: z.string() }),
-  result: z.object({
-    id: z.string().optional(),
-    text: z.string().optional(),
-    truncated: z.literal(false),
-  }),
-});
-
-type NotionWriteResult =
-  | {
-      ok: true;
-      outcome: "succeeded";
-      workspace: { label: string };
-      result: unknown;
-    }
-  | {
-      ok: true;
-      outcome: "unchanged";
-      workspace: { label: string };
-      result: { pageId: string };
-    };
 
 const notionSearchResultSchema = z
   .object({ results: z.array(notionReferenceSchema).max(100) })
@@ -223,7 +202,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.search",
-          description: "Search internal content in one connected Notion workspace. For automatic multi-account reads, call once per exact safe label in connected account status. Search finds candidate pages; fetch the selected page before editing it.",
+          description: "Search internal content in one connected Notion workspace. For automatic multi-account reads, call once per exact safe label in connected account status. When an incomplete result contains one exact title candidate, Annie performs a complete page-scoped search for that candidate. A truncated result without that scoped proof cannot establish an update target; narrow the query and search again.",
           parameters: {
             type: "object",
             properties: {
@@ -315,7 +294,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.update_page",
-          description: "Update one page fetched in this run using the same workspace. Use one unique exact-text patch for task changes or additions, one property for a property change, or replace_content only when the user requests a full rewrite. Include unchanged headings/context to distinguish repeated text. An unchanged patch returns outcome:unchanged without a provider write. Moving, deleting, and archiving are unavailable.",
+          description: "Update only a Notion page established by a complete same-run notion.search, including a complete page-scoped search added by Annie, and then fetched in this run using the same workspace label. Property, full-content, and text replacements require the current request to name the page; checkbox requests may instead name one unambiguous task. One replacement may include unchanged context, but a checkbox request must change exactly one marker. Text alone does not update it. Moving, deleting, and archiving are unavailable.",
           parameters: {
             type: "object",
             properties: {
@@ -327,7 +306,7 @@ export class NotionToolService {
               properties: {
                 type: "object",
                 minProperties: 1,
-                maxProperties: 1,
+                maxProperties: 50,
                 additionalProperties: {
                   anyOf: [
                     { type: "string", maxLength: 4_000 },
@@ -341,13 +320,13 @@ export class NotionToolService {
               updates: {
                 type: "array",
                 minItems: 1,
-                maxItems: 1,
+                maxItems: 20,
                 items: {
                   type: "object",
                   properties: {
                     oldText: { type: "string", minLength: 1, maxLength: 8_000 },
                     newText: { type: "string", maxLength: 8_000 },
-                    replaceAllMatches: { const: false, default: false },
+                    replaceAllMatches: { type: "boolean", default: false },
                   },
                   required: ["oldText", "newText"],
                   additionalProperties: false,
@@ -402,11 +381,57 @@ export class NotionToolService {
           query_type: "internal",
           page_size: input.pageSize,
         } as const;
-        return normalizeNotionResult(
+        const initial = normalizeNotionResult(
           "notion-search",
           await session.call("notion-search", request),
           request,
         );
+        if (!("results" in initial) || !initial.truncated) {
+          return initial;
+        }
+
+        const queryTitle = notionSearchTitle(input.query);
+        const candidates = initial.results.filter(
+          (
+            reference,
+          ): reference is NormalizedNotionReference & { readonly id: string; readonly title: string } =>
+            typeof reference.id === "string" &&
+            typeof reference.title === "string" &&
+            notionSearchTitle(reference.title) === queryTitle,
+        );
+        const candidate = candidates[0];
+        if (queryTitle.length === 0 || candidates.length !== 1 || candidate === undefined) {
+          return initial;
+        }
+
+        const scopedRequest = {
+          query: input.query,
+          query_type: "internal",
+          page_url: candidate.id,
+          page_size: 50,
+        } as const;
+        const scoped = normalizeNotionResult(
+          "notion-search",
+          await session.call("notion-search", scopedRequest),
+          scopedRequest,
+        );
+        if (
+          !("results" in scoped) ||
+          scoped.truncated ||
+          !scoped.results.some((reference) => reference.id === candidate.id)
+        ) {
+          return initial;
+        }
+        return {
+          ...initial,
+          pageScopedSearches: [
+            {
+              pageId: candidate.id,
+              results: scoped.results,
+              truncated: false,
+            },
+          ],
+        };
       },
       context.signal,
     );
@@ -433,7 +458,7 @@ export class NotionToolService {
   async createPage(
     input: z.infer<typeof createPageArgumentsSchema>,
     context: ToolExecutionContext,
-  ): Promise<NotionWriteResult> {
+  ): Promise<unknown> {
     const connection = this.#select("notion.create_page", input.workspace, context);
     const upstream = {
       ...(input.parent === undefined
@@ -455,6 +480,7 @@ export class NotionToolService {
       connection,
       context,
       upstreamName: "notion-create-pages",
+      capability: "notion.create_page",
       writeKind: "notion_create_page",
       argumentsValue: upstream,
       safeSummary: {
@@ -467,48 +493,16 @@ export class NotionToolService {
   async updatePage(
     input: z.infer<typeof updatePageArgumentsSchema>,
     context: ToolExecutionContext,
-  ): Promise<NotionWriteResult> {
+  ): Promise<unknown> {
     const connection = this.#select("notion.update_page", input.workspace, context);
-    const page = this.#fetchedPage(input.pageId, connection, context);
-    let unchanged = false;
-    if (input.command === "update_content") {
-      const [update] = input.updates;
-      const offset = page.text?.indexOf(update.oldText) ?? -1;
-      if (
-        offset < 0 ||
-        page.text?.indexOf(update.oldText, offset + 1) !== -1
-      ) {
-        throw new ModelSafeError(
-          "NotionWriteTargetError",
-          "write_target_ambiguous",
-          "The old text must occur exactly once in the fetched page. Fetch again and include enough unchanged context to identify one location.",
-        );
-      }
-      unchanged = update.oldText === update.newText;
-    } else if (input.command === "replace_content") {
-      if (page.text === undefined) {
-        throw new ModelSafeError(
-          "NotionWriteTargetError",
-          "write_target_unverified",
-          "Fetch the complete page text before replacing its content.",
-        );
-      }
-      unchanged = input.newContent === page.text;
-    }
-    if (unchanged) {
-      return {
-        ok: true,
-        outcome: "unchanged",
-        workspace: { label: connection.safeLabel },
-        result: { pageId: input.pageId },
-      };
-    }
+    const upstream = toUpdateArguments(input);
     return this.#write({
       connection,
       context,
       upstreamName: "notion-update-page",
+      capability: "notion.update_page",
       writeKind: "notion_update_page",
-      argumentsValue: toUpdateArguments(input),
+      argumentsValue: upstream,
       safeSummary: {
         command: input.command,
         pageId: input.pageId,
@@ -516,54 +510,15 @@ export class NotionToolService {
     });
   }
 
-  #fetchedPage(
-    pageId: string,
-    connection: ConnectionRecord,
-    context: ToolExecutionContext,
-  ): z.infer<typeof fetchedPageSchema>["result"] {
-    const row = this.#db
-      .prepare<
-        { run_id: string; connection_id: string; page_id: string },
-        { result_json: string }
-      >(`
-        SELECT result_json FROM tool_executions
-        WHERE run_id = @run_id AND connection_id = @connection_id
-          AND tool_name = 'notion.fetch' AND status = 'succeeded'
-          AND json_extract(arguments_json, '$.id') = @page_id
-          AND result_json IS NOT NULL
-        ORDER BY rowid DESC
-        LIMIT 1
-      `)
-      .get({
-        run_id: context.runId,
-        connection_id: connection.id,
-        page_id: pageId,
-      });
-    const fetched = fetchedPageSchema.safeParse(
-      row === undefined ? undefined : JSON.parse(row.result_json),
-    );
-    if (
-      !fetched.success ||
-      fetched.data.workspace.label !== connection.safeLabel ||
-      (fetched.data.result.id !== undefined && fetched.data.result.id !== pageId)
-    ) {
-      throw new ModelSafeError(
-        "NotionWriteTargetError",
-        "write_target_unverified",
-        "Fetch this page completely in the selected workspace during this request before editing it.",
-      );
-    }
-    return fetched.data.result;
-  }
-
   async #write(input: {
     connection: ConnectionRecord;
     context: ToolExecutionContext;
     upstreamName: Extract<NotionUpstreamTool, "notion-create-pages" | "notion-update-page">;
+    capability: Extract<ConnectionCapability, "notion.create_page" | "notion.update_page">;
     writeKind: "notion_create_page" | "notion_update_page";
     argumentsValue: Record<string, unknown>;
     safeSummary: unknown;
-  }): Promise<NotionWriteResult> {
+  }): Promise<unknown> {
     return this.#clients.withSession(
       input.connection.id,
       input.context.traceId,
@@ -579,22 +534,15 @@ export class NotionToolService {
           request: input.argumentsValue,
           safeSummary: input.safeSummary,
         });
-        this.#writes.beginAttempt({
-          writeId: write.id,
-          traceId: input.context.traceId,
-          ...(input.context.jobLease === undefined
-            ? {}
-            : { jobLease: { ...input.context.jobLease, nowMs: Date.now() } }),
-        });
+        this.#beginWrite(write.id, input.context);
         try {
           const result = normalizeNotionResult(
             input.upstreamName,
             await session.call(input.upstreamName, input.argumentsValue),
             input.argumentsValue,
           );
-          const normalized: NotionWriteResult = {
+          const normalized = {
             ok: true,
-            outcome: "succeeded",
             workspace: { label: input.connection.safeLabel },
             result,
           };
@@ -645,6 +593,21 @@ export class NotionToolService {
     return connection;
   }
 
+  #beginWrite(writeId: WriteIntentId, context: ToolExecutionContext): void {
+    this.#writes.beginAttempt({
+      writeId,
+      traceId: context.traceId,
+      ...(context.jobLease === undefined
+        ? {}
+        : {
+            jobLease: {
+              jobId: context.jobLease.jobId,
+              leaseToken: context.jobLease.leaseToken,
+              nowMs: Date.now(),
+            },
+          }),
+    });
+  }
 
   #markHealthy(connection: ConnectionRecord, traceId: TraceId): void {
     this.#connections.markHealthy({
@@ -821,6 +784,15 @@ function notionPayloadTruncated(value: unknown): boolean | undefined {
   return z.boolean().parse(value.truncated);
 }
 
+function notionSearchTitle(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/\p{M}/gu, "")
+    .toLowerCase()
+    .replace(/['’]/gu, "")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
 
 function truncateUtf8(value: string, maximumBytes: number): { value: string; truncated: boolean } {
   const encoded = Buffer.from(value);

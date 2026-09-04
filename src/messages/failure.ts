@@ -35,10 +35,42 @@ export class FailureNotificationService {
   }
 
   plan(input: FailurePlanInput): EgressId {
-    const transaction = this.#db.transaction(
-      () => this.#findExisting(input.traceId) ?? this.#prepareInTransaction(input),
-    );
+    const transaction = this.#db.transaction(() => this.planInTransaction(input));
     return transaction.immediate();
+  }
+
+  planInTransaction(input: FailurePlanInput): EgressId {
+    const existing = this.#findExisting(input.traceId);
+    return existing ?? this.#prepareInTransaction(input);
+  }
+
+  replaceSuppressedReplyInTransaction(
+    input: FailurePlanInput,
+    suppressedReplyId: EgressId,
+  ): EgressId {
+    const suppressed = this.#db
+      .prepare<
+        { id: string; trace_id: string; reason: string },
+        { suppressed: 1 }
+      >(`
+        SELECT 1 AS suppressed
+        FROM egress_messages
+        WHERE id = @id
+          AND trace_id = @trace_id
+          AND purpose = 'reply'
+          AND state = 'provider_failed'
+          AND last_error = @reason
+      `)
+      .get({
+        id: suppressedReplyId,
+        trace_id: input.traceId,
+        reason: input.failureCode,
+      });
+    if (suppressed === undefined) {
+      throw new Error(`Reply ${suppressedReplyId} was not safely suppressed`);
+    }
+    const existing = this.#findExisting(input.traceId, suppressedReplyId);
+    return existing ?? this.#prepareInTransaction(input);
   }
 
   #prepareInTransaction(input: FailurePlanInput): EgressId {
@@ -73,22 +105,35 @@ export class FailureNotificationService {
     return egressId;
   }
 
-  #findExisting(traceId: TraceId): EgressId | undefined {
+  #findExisting(
+    traceId: TraceId,
+    ignoredEgressId?: EgressId,
+  ): EgressId | undefined {
     return this.#db
-      .prepare<{ trace_id: string }, { id: EgressId }>(`
+      .prepare<
+        { trace_id: string; ignored_id: string | null },
+        { id: EgressId }
+      >(`
         SELECT id FROM egress_messages
         WHERE trace_id = @trace_id
           AND purpose IN ('reply', 'failure')
+          AND (@ignored_id IS NULL OR id <> @ignored_id)
         ORDER BY created_at_ms
         LIMIT 1
       `)
-      .get({ trace_id: traceId })?.id;
+      .get({
+        trace_id: traceId,
+        ignored_id: ignoredEgressId ?? null,
+      })?.id;
   }
 }
 
 function failureNotificationText(failureCode: string, traceId: TraceId): string {
   if (failureCode === "missing_text") {
     return "I can only process text messages right now. Please type your request.";
+  }
+  if (failureCode === "unverified_write_claim") {
+    return `I didn't confirm that provider change, so I didn't report it as done. Trace: ${traceId}`;
   }
   if (failureCode === "ambiguous_write") {
     return `The provider may have accepted that change, so I stopped without retrying it. Trace: ${traceId}`;

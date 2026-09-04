@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import {
   newEgressId,
   type EgressId,
+  type RunId,
   type TraceId,
   type WriteIntentId,
 } from "../core/ids.js";
@@ -30,6 +31,11 @@ export interface EgressSendPolicy {
   kind: "daily_brief";
   expiresAtMs: number;
 }
+
+export type PreparedReplySuppression =
+  | { kind: "absent" }
+  | { kind: "suppressed"; egressId: EgressId }
+  | { kind: "not_suppressible"; egressId: EgressId };
 
 export interface EgressSendConstraint {
   policy: EgressSendPolicy;
@@ -127,6 +133,20 @@ export class MessageEgressService {
           ? {}
           : { inboundSequence: input.inboundSequence }),
       });
+      if (input.runId !== undefined) {
+        this.#queue.enqueueInTransaction({
+          chatId: input.recipient,
+          subjectId: input.runId,
+          type: "memory_maintenance",
+          payload: { runId: input.runId },
+          traceId: input.traceId,
+          runId: input.runId,
+          capacityExempt: true,
+          ...(input.inboundSequence === undefined
+            ? {}
+            : { inboundSequence: input.inboundSequence }),
+        });
+      }
       return egressId;
     });
     return transaction.immediate();
@@ -220,6 +240,88 @@ export class MessageEgressService {
       occurredAtMs: now,
     });
     return egressId;
+  }
+
+  suppressPreparedReplyInTransaction(input: {
+    traceId: TraceId;
+    runId: RunId;
+    reason: string;
+    job: ClaimedJob;
+    nowMs: number;
+  }): PreparedReplySuppression {
+    this.#queue.assertLease(input.job, input.nowMs);
+    const existing = this.#db
+      .prepare<
+        { trace_id: string; run_id: string },
+        { id: EgressId }
+      >(`
+        SELECT id
+        FROM egress_messages
+        WHERE trace_id = @trace_id AND run_id = @run_id AND purpose = 'reply'
+        LIMIT 1
+      `)
+      .get({ trace_id: input.traceId, run_id: input.runId });
+    if (existing === undefined) {
+      return { kind: "absent" };
+    }
+    const egress = this.#get(existing.id);
+    if (egress.state !== "prepared") {
+      this.#queue.blockPendingMemoryWorkInTransaction({
+        traceId: input.traceId,
+        runId: input.runId,
+        error: input.reason,
+        occurredAtMs: input.nowMs,
+      });
+      return { kind: "not_suppressible", egressId: egress.id };
+    }
+    const result = {
+      ok: false,
+      error: {
+        code: input.reason,
+        message: "The reply was suppressed before provider dispatch",
+      },
+    };
+    this.#writes.cancelPreparedInTransaction({
+      writeId: egress.write_id,
+      traceId: egress.trace_id,
+      normalizedResult: result,
+      jobLease: {
+        jobId: input.job.id,
+        leaseToken: input.job.leaseToken,
+        nowMs: input.nowMs,
+      },
+    });
+    const updated = this.#db
+      .prepare<{ id: string; reason: string; now_ms: number }>(`
+        UPDATE egress_messages
+        SET state = 'provider_failed', last_error = @reason, updated_at_ms = @now_ms
+        WHERE id = @id AND state = 'prepared' AND attempt_count = 0
+      `)
+      .run({
+        id: egress.id,
+        reason: input.reason,
+        now_ms: input.nowMs,
+      });
+    if (updated.changes !== 1) {
+      throw new Error(`Egress ${egress.id} is not suppressible`);
+    }
+    this.#queue.blockPendingReplyWorkInTransaction({
+      traceId: input.traceId,
+      runId: input.runId,
+      egressId: egress.id,
+      error: input.reason,
+      occurredAtMs: input.nowMs,
+    });
+    this.#traces.appendInTransaction({
+      traceId: input.traceId,
+      component: "egress",
+      event: "canceled",
+      outcome: input.reason,
+      runId: input.runId,
+      data: { egressId: egress.id },
+      occurredAtMs: input.nowMs,
+    });
+    return { kind: "suppressed", egressId: egress.id };
   }
 
   async sendPrepared(
@@ -317,7 +419,6 @@ export class MessageEgressService {
           occurredAtMs: now,
         });
         if (state === "delivered") {
-          this.#scheduleMemoryMaintenanceInTransaction(egress);
           this.#traces.markTerminal(egress.trace_id);
         }
       });
@@ -533,7 +634,6 @@ export class MessageEgressService {
           data: { egressId: egress.id, messageHandle: delivery.messageHandle },
           occurredAtMs: now,
         });
-        this.#scheduleMemoryMaintenanceInTransaction(egress);
         this.#traces.markTerminal(egress.trace_id);
       });
       transaction.immediate();
@@ -703,41 +803,6 @@ export class MessageEgressService {
         WHERE egress_id = @egress_id AND status = 'planned'
       `)
       .run({ egress_id: egressId, now_ms: now });
-  }
-
-  /**
-   * Confirmed delivery is the only trigger for memory maintenance. Only a completed
-   * agent run whose ordinary reply reached the user is eligible; failure notices,
-   * connection links, and reconnect notices carry no conversation to remember. The
-   * queue's unique (type, subject_id) identity makes the direct and reconciled
-   * delivery transitions converge on one job.
-   */
-  #scheduleMemoryMaintenanceInTransaction(egress: EgressRow): void {
-    const runId = egress.run_id;
-    if (egress.purpose !== "reply" || runId === null) {
-      return;
-    }
-    const run = this.#db
-      .prepare<{ id: string }, { inbound_sequence: number | null }>(`
-        SELECT inbound.sequence AS inbound_sequence
-        FROM agent_runs AS runs
-        LEFT JOIN inbound_messages AS inbound ON inbound.id = runs.inbound_id
-        WHERE runs.id = @id AND runs.phase = 'completed'
-      `)
-      .get({ id: runId });
-    if (run === undefined) {
-      return;
-    }
-    this.#queue.enqueueInTransaction({
-      chatId: egress.recipient_handle,
-      subjectId: runId,
-      type: "memory_maintenance",
-      payload: { runId },
-      traceId: egress.trace_id,
-      runId,
-      capacityExempt: true,
-      ...(run.inbound_sequence === null ? {} : { inboundSequence: run.inbound_sequence }),
-    });
   }
 }
 

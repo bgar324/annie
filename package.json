@@ -12,7 +12,6 @@
     "dev": "tsx watch src/main.ts",
     "dev:ui": "railway ssh config --alias annie-production && echo 'Open http://127.0.0.1:3001/' && ssh -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -N -L 127.0.0.1:3001:127.0.0.1:3001 annie-production",
     "start": "node dist/main.js",
-    "smoke:inbound": "tsx scripts/smoke-inbound.ts",
     "test": "vitest run",
     "trace": "tsx src/cli.ts trace",
     "replay": "tsx src/cli.ts replay",

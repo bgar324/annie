@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import { newJobId, type JobId, type TraceId } from "../core/ids.js";
+import {
+  newJobId,
+  type EgressId,
+  type JobId,
+  type RunId,
+  type TraceId,
+} from "../core/ids.js";
 import type { TraceStore } from "../tracing/store.js";
 
 export type JobType =
@@ -175,6 +181,141 @@ export class QueueStore {
     return existing.id;
   }
 
+  blockPendingReplyWorkInTransaction(input: {
+    traceId: TraceId;
+    runId: RunId;
+    egressId: EgressId;
+    error: string;
+    occurredAtMs: number;
+  }): void {
+    const rows = this.#db
+      .prepare<
+        {
+          trace_id: string;
+          run_id: string;
+          egress_id: string;
+          error: string;
+          now_ms: number;
+        },
+        { id: JobId; type: JobType; run_id: string | null }
+      >(`
+        UPDATE jobs
+        SET status = 'blocked', lease_token = NULL, lease_expires_at_ms = NULL,
+            last_error = @error, updated_at_ms = @now_ms
+        WHERE trace_id = @trace_id
+          AND status = 'pending'
+          AND (
+            (type = 'egress_send' AND subject_id = @egress_id)
+            OR
+            (type = 'memory_maintenance' AND subject_id = @run_id)
+          )
+        RETURNING id, type, run_id
+      `)
+      .all({
+        trace_id: input.traceId,
+        run_id: input.runId,
+        egress_id: input.egressId,
+        error: input.error,
+        now_ms: input.occurredAtMs,
+      });
+    const active = this.#db
+      .prepare<
+        { trace_id: string; run_id: string; egress_id: string },
+        { count: number }
+      >(`
+        SELECT COUNT(*) AS count
+        FROM jobs
+        WHERE trace_id = @trace_id
+          AND status IN ('pending', 'running')
+          AND (
+            (type = 'egress_send' AND subject_id = @egress_id)
+            OR
+            (type = 'memory_maintenance' AND subject_id = @run_id)
+          )
+      `)
+      .get({
+        trace_id: input.traceId,
+        run_id: input.runId,
+        egress_id: input.egressId,
+      });
+    if ((active?.count ?? 0) !== 0) {
+      throw new Error(`Reply work for egress ${input.egressId} is already running`);
+    }
+    for (const row of rows) {
+      this.#traces.appendInTransaction({
+        traceId: input.traceId,
+        component: "queue",
+        event: "blocked",
+        outcome: row.type,
+        jobId: row.id,
+        runId: row.run_id ?? undefined,
+        data: { error: input.error },
+        occurredAtMs: input.occurredAtMs,
+      });
+    }
+  }
+
+  blockPendingMemoryWorkInTransaction(input: {
+    traceId: TraceId;
+    runId: RunId;
+    error: string;
+    occurredAtMs: number;
+  }): void {
+    const rows = this.#db
+      .prepare<
+        {
+          trace_id: string;
+          run_id: string;
+          error: string;
+          now_ms: number;
+        },
+        { id: JobId; run_id: string | null }
+      >(`
+        UPDATE jobs
+        SET status = 'blocked', lease_token = NULL, lease_expires_at_ms = NULL,
+            last_error = @error, updated_at_ms = @now_ms
+        WHERE trace_id = @trace_id
+          AND type = 'memory_maintenance'
+          AND subject_id = @run_id
+          AND status = 'pending'
+        RETURNING id, run_id
+      `)
+      .all({
+        trace_id: input.traceId,
+        run_id: input.runId,
+        error: input.error,
+        now_ms: input.occurredAtMs,
+      });
+    const active = this.#db
+      .prepare<
+        { trace_id: string; run_id: string },
+        { count: number }
+      >(`
+        SELECT COUNT(*) AS count
+        FROM jobs
+        WHERE trace_id = @trace_id
+          AND type = 'memory_maintenance'
+          AND subject_id = @run_id
+          AND status IN ('pending', 'running')
+      `)
+      .get({ trace_id: input.traceId, run_id: input.runId });
+    if ((active?.count ?? 0) !== 0) {
+      throw new Error(`Memory work for run ${input.runId} is already running`);
+    }
+    for (const row of rows) {
+      this.#traces.appendInTransaction({
+        traceId: input.traceId,
+        component: "queue",
+        event: "blocked",
+        outcome: "memory_maintenance",
+        jobId: row.id,
+        runId: row.run_id ?? undefined,
+        data: { error: input.error },
+        occurredAtMs: input.occurredAtMs,
+      });
+    }
+  }
+
   claim(nowMs = Date.now()): ClaimedJob | undefined {
     this.failExpiredFinalAttempts(nowMs);
     const leaseToken = randomUUID();
@@ -222,7 +363,15 @@ export class QueueStore {
                     WHERE active.chat_id = candidate.chat_id
                       AND active.status = 'running'
                   )
-                  AND NOT (${awaitingDeliveryReceiptSql("candidate")})
+                  AND (
+                    candidate.type <> 'memory_maintenance'
+                    OR NOT EXISTS (
+                      SELECT 1 FROM jobs AS reply
+                      WHERE reply.trace_id = candidate.trace_id
+                        AND reply.type = 'egress_send'
+                        AND reply.status IN ('pending', 'running')
+                    )
+                  )
                   AND (
                     candidate.inbound_sequence IS NULL
                     OR NOT EXISTS (
@@ -230,7 +379,6 @@ export class QueueStore {
                       WHERE earlier.chat_id = candidate.chat_id
                         AND earlier.inbound_sequence < candidate.inbound_sequence
                         AND earlier.status IN ('pending', 'running')
-                        AND NOT (${awaitingDeliveryReceiptSql("earlier")})
                     )
                   )
                 )
@@ -527,29 +675,4 @@ function toClaimedJob(row: JobRow): ClaimedJob {
     runId: row.run_id,
     inboundSequence: row.inbound_sequence,
   };
-}
-
-// Wait for this or an earlier inbound reply's receipt before learning preferences.
-// Waiting memory work must not hold up new inbound messages or delivery jobs.
-function awaitingDeliveryReceiptSql(job: "candidate" | "earlier"): string {
-  return `
-    ${job}.type = 'memory_maintenance'
-    AND EXISTS (
-      SELECT 1
-      FROM egress_messages AS reply
-      JOIN jobs AS delivery
-        ON delivery.subject_id = reply.id
-       AND delivery.type IN ('egress_send', 'egress_reconcile')
-      JOIN agent_runs AS reply_run ON reply_run.id = reply.run_id
-      LEFT JOIN inbound_messages AS reply_input ON reply_input.id = reply_run.inbound_id
-      WHERE reply.recipient_handle = ${job}.chat_id
-        AND (
-          reply.run_id = ${job}.subject_id
-          OR reply_input.sequence < ${job}.inbound_sequence
-        )
-        AND reply.purpose = 'reply'
-        AND reply.state IN ('prepared', 'attempting', 'accepted', 'sent')
-        AND delivery.status IN ('pending', 'running')
-    )
-  `;
 }
