@@ -1707,10 +1707,14 @@ function responseAsksTaskClarification(
       continue;
     }
     const question = normalized.slice(cueIndex, questionEnd);
-    if (
-      /\b(?:that|this|one|item|task|checkbox|those|them)\b/u.test(question) ||
-      tokensAppearInOrder(selectedTokens, taskTokens(question))
-    ) {
+    const namesSelectedTask = tokensAppearInOrder(selectedTokens, taskTokens(question));
+    const hasTaskReference =
+      /\b(?:that|this|it|one|item|task|checkbox|those|them)\b/u.test(question);
+    const hasTaskAction =
+      /\b(?:mean|intend(?:ed)?|refer(?:ring|red)?|confirm(?:ing|ed)?|mark(?:ed|ing)?|check(?:ed|ing)?|done|complete(?:d)?)\b/u.test(
+        question,
+      );
+    if (namesSelectedTask || (hasTaskReference && hasTaskAction)) {
       return true;
     }
   }
