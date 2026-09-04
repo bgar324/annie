@@ -1710,11 +1710,13 @@ function responseAsksTaskClarification(
     const namesSelectedTask = tokensAppearInOrder(selectedTokens, taskTokens(question));
     const namesTaskKind = /\b(?:item|task|checkbox)\b/u.test(question);
     const hasBareTaskReference = /\b(?:that|this|it|one|those|them)\b/u.test(question);
+    const hasClarificationIntent =
+      /\b(?:mean|intend(?:ed)?|refer(?:ring|red)?|confirm(?:ing|ed)?)\b/u.test(question);
     const hasTaskStateAction =
       /\b(?:mark(?:ed|ing)?|check(?:ed|ing)?|done|complete(?:d)?)\b/u.test(question);
     if (
       namesSelectedTask ||
-      namesTaskKind ||
+      (namesTaskKind && (hasClarificationIntent || hasTaskStateAction)) ||
       (hasBareTaskReference && hasTaskStateAction)
     ) {
       return true;
