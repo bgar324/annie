@@ -2048,7 +2048,7 @@ describe("production runtime", () => {
         .all(),
     ).toEqual([
       {
-        body: "I can't process voice messages or other attachments yet. Please send your request as text.",
+        body: "I can only process text messages right now. Please type your request.",
         purpose: "failure",
         reply_to_guid: "msg_media",
       },

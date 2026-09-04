@@ -48,7 +48,7 @@ export class FailureNotificationService {
         purpose: "failure",
         text:
           input.failureCode === "missing_text"
-            ? "I can't process voice messages or other attachments yet. Please send your request as text."
+            ? "I can only process text messages right now. Please type your request."
             : `I couldn't complete that request. Trace: ${input.traceId}`,
         ...(input.runId === undefined ? {} : { runId: input.runId }),
         ...(input.replyToGuid === undefined ? {} : { replyToGuid: input.replyToGuid }),
