@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import { newJobId, type JobId, type TraceId } from "../core/ids.js";
+import {
+  newJobId,
+  type EgressId,
+  type JobId,
+  type RunId,
+  type TraceId,
+} from "../core/ids.js";
 import type { TraceStore } from "../tracing/store.js";
 
 export type JobType =
@@ -175,6 +181,141 @@ export class QueueStore {
     return existing.id;
   }
 
+  blockPendingReplyWorkInTransaction(input: {
+    traceId: TraceId;
+    runId: RunId;
+    egressId: EgressId;
+    error: string;
+    occurredAtMs: number;
+  }): void {
+    const rows = this.#db
+      .prepare<
+        {
+          trace_id: string;
+          run_id: string;
+          egress_id: string;
+          error: string;
+          now_ms: number;
+        },
+        { id: JobId; type: JobType; run_id: string | null }
+      >(`
+        UPDATE jobs
+        SET status = 'blocked', lease_token = NULL, lease_expires_at_ms = NULL,
+            last_error = @error, updated_at_ms = @now_ms
+        WHERE trace_id = @trace_id
+          AND status = 'pending'
+          AND (
+            (type = 'egress_send' AND subject_id = @egress_id)
+            OR
+            (type = 'memory_maintenance' AND subject_id = @run_id)
+          )
+        RETURNING id, type, run_id
+      `)
+      .all({
+        trace_id: input.traceId,
+        run_id: input.runId,
+        egress_id: input.egressId,
+        error: input.error,
+        now_ms: input.occurredAtMs,
+      });
+    const active = this.#db
+      .prepare<
+        { trace_id: string; run_id: string; egress_id: string },
+        { count: number }
+      >(`
+        SELECT COUNT(*) AS count
+        FROM jobs
+        WHERE trace_id = @trace_id
+          AND status IN ('pending', 'running')
+          AND (
+            (type = 'egress_send' AND subject_id = @egress_id)
+            OR
+            (type = 'memory_maintenance' AND subject_id = @run_id)
+          )
+      `)
+      .get({
+        trace_id: input.traceId,
+        run_id: input.runId,
+        egress_id: input.egressId,
+      });
+    if ((active?.count ?? 0) !== 0) {
+      throw new Error(`Reply work for egress ${input.egressId} is already running`);
+    }
+    for (const row of rows) {
+      this.#traces.appendInTransaction({
+        traceId: input.traceId,
+        component: "queue",
+        event: "blocked",
+        outcome: row.type,
+        jobId: row.id,
+        runId: row.run_id ?? undefined,
+        data: { error: input.error },
+        occurredAtMs: input.occurredAtMs,
+      });
+    }
+  }
+
+  blockPendingMemoryWorkInTransaction(input: {
+    traceId: TraceId;
+    runId: RunId;
+    error: string;
+    occurredAtMs: number;
+  }): void {
+    const rows = this.#db
+      .prepare<
+        {
+          trace_id: string;
+          run_id: string;
+          error: string;
+          now_ms: number;
+        },
+        { id: JobId; run_id: string | null }
+      >(`
+        UPDATE jobs
+        SET status = 'blocked', lease_token = NULL, lease_expires_at_ms = NULL,
+            last_error = @error, updated_at_ms = @now_ms
+        WHERE trace_id = @trace_id
+          AND type = 'memory_maintenance'
+          AND subject_id = @run_id
+          AND status = 'pending'
+        RETURNING id, run_id
+      `)
+      .all({
+        trace_id: input.traceId,
+        run_id: input.runId,
+        error: input.error,
+        now_ms: input.occurredAtMs,
+      });
+    const active = this.#db
+      .prepare<
+        { trace_id: string; run_id: string },
+        { count: number }
+      >(`
+        SELECT COUNT(*) AS count
+        FROM jobs
+        WHERE trace_id = @trace_id
+          AND type = 'memory_maintenance'
+          AND subject_id = @run_id
+          AND status IN ('pending', 'running')
+      `)
+      .get({ trace_id: input.traceId, run_id: input.runId });
+    if ((active?.count ?? 0) !== 0) {
+      throw new Error(`Memory work for run ${input.runId} is already running`);
+    }
+    for (const row of rows) {
+      this.#traces.appendInTransaction({
+        traceId: input.traceId,
+        component: "queue",
+        event: "blocked",
+        outcome: "memory_maintenance",
+        jobId: row.id,
+        runId: row.run_id ?? undefined,
+        data: { error: input.error },
+        occurredAtMs: input.occurredAtMs,
+      });
+    }
+  }
+
   claim(nowMs = Date.now()): ClaimedJob | undefined {
     this.failExpiredFinalAttempts(nowMs);
     const leaseToken = randomUUID();
@@ -191,10 +332,23 @@ export class QueueStore {
           WITH candidate(id) AS MATERIALIZED (
             SELECT candidate.id
             FROM jobs AS candidate
-            WHERE candidate.attempts < CASE candidate.type
-              WHEN 'egress_reconcile' THEN @reconcile_max_attempts
-              ELSE @max_attempts
-            END
+            WHERE (
+              candidate.attempts < CASE candidate.type
+                WHEN 'egress_reconcile' THEN @reconcile_max_attempts
+                ELSE @max_attempts
+              END
+              OR (
+                candidate.type = 'inbound'
+                AND EXISTS (
+                  SELECT 1
+                  FROM inbound_messages AS inbound
+                  JOIN agent_runs AS runs ON runs.inbound_id = inbound.id
+                  WHERE inbound.id = candidate.subject_id
+                    AND inbound.state = 'done'
+                    AND runs.phase = 'completed'
+                )
+              )
+            )
               AND (
                 (
                   candidate.status = 'running'
@@ -470,6 +624,17 @@ export class QueueStore {
             WHEN 'egress_reconcile' THEN @reconcile_max_attempts
             ELSE @max_attempts
           END
+          AND NOT (
+            jobs.type = 'inbound'
+            AND EXISTS (
+              SELECT 1
+              FROM inbound_messages AS inbound
+              JOIN agent_runs AS runs ON runs.inbound_id = inbound.id
+              WHERE inbound.id = jobs.subject_id
+                AND inbound.state = 'done'
+                AND runs.phase = 'completed'
+            )
+          )
         RETURNING id, trace_id, run_id, type
       `)
       .all({

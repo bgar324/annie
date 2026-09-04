@@ -201,13 +201,13 @@ export class InboundTurnService {
           completed.finalResponse,
         );
         if (completionRejection !== undefined) {
-          this.#failures.plan({
-            traceId: inbound.trace_id,
-            failureCode: completionRejection,
-            runId: completed.id,
-            replyToGuid: inbound.guid,
-          });
-          this.#runs.quarantineCompleted(completed.id, completionRejection);
+          this.#quarantineRejectedCompletion(
+            inbound,
+            completed.id,
+            completionRejection,
+            job,
+            context,
+          );
           return;
         }
         this.#finishCompletedTurn(
@@ -315,6 +315,42 @@ export class InboundTurnService {
         replyToGuid: inbound.guid,
       });
     }
+  }
+
+  #quarantineRejectedCompletion(
+    inbound: InboundTurnRow,
+    runId: RunId,
+    failureCode: string,
+    job: ClaimedJob,
+    context: JobContext,
+  ): void {
+    context.assertLease();
+    const nowMs = context.nowMs();
+    const transaction = this.#db.transaction(() => {
+      const suppression = this.#egress.suppressPreparedReplyInTransaction({
+        traceId: inbound.trace_id,
+        runId,
+        reason: failureCode,
+        job,
+        nowMs,
+      });
+      this.#runs.quarantineCompletedInTransaction(runId, failureCode);
+      const failure = {
+        traceId: inbound.trace_id,
+        failureCode,
+        runId,
+        replyToGuid: inbound.guid,
+      };
+      if (suppression.kind === "absent") {
+        this.#failures.planInTransaction(failure);
+      } else if (suppression.kind === "suppressed") {
+        this.#failures.replaceSuppressedReplyInTransaction(
+          failure,
+          suppression.egressId,
+        );
+      }
+    });
+    transaction.immediate();
   }
 
   #finishCompletedTurn(

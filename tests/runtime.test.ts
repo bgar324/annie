@@ -31,6 +31,7 @@ import type { NotionClientProvider, NotionSession } from "../src/notion/client.j
 import type { ClaimedJob, JobType } from "../src/queue/store.js";
 import type { JobContext } from "../src/queue/worker.js";
 import { buildSafeReplay } from "../src/replay.js";
+import { MessageEgressService } from "../src/messages/egress.js";
 import { createRuntime, type AssistantModel, type AssistantRuntime } from "../src/runtime.js";
 import {
   MessagingProviderError,
@@ -40,6 +41,7 @@ import {
   type InboundWakeStream,
   type MessageGateway,
 } from "../src/messages/types.js";
+import { WriteStore } from "../src/writes/store.js";
 import { CredentialVault } from "../src/security/vault.js";
 
 const lineNumber = "+15551112222";
@@ -3422,6 +3424,246 @@ describe("production runtime", () => {
     ).loadBefore(asInboundId(nextInbound.id));
     expect(history).not.toContainEqual({ role: "assistant", content: falseResponse });
     expect(history).not.toContainEqual({ role: "user", content: "Mark restroom done" });
+  });
+
+  it("suppresses a prepared false-success reply after a final-attempt crash", async () => {
+    const falseResponse = "✅ done — clean restroom is checked off.";
+    const model = new FakeModel();
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway);
+    gateway.inbox.push(
+      inboundMessage("msg_prepared_false_reply", { text: "Mark restroom done" }),
+    );
+
+    await sweep(item);
+    const firstJob = requiredJob(item.runtime.queue.claim(Date.now() + 10));
+    const inbound = item.runtime.database.db
+      .prepare<
+        [],
+        { id: string; trace_id: string; guid: string; sequence: number }
+      >("SELECT id, trace_id, guid, sequence FROM inbound_messages")
+      .get();
+    if (inbound === undefined) {
+      throw new Error("Expected prepared-reply crash-gap inbound");
+    }
+    const traceId = asTraceId(inbound.trace_id);
+    const runs = new AgentRunStore(item.runtime.database.db, item.runtime.traces);
+    const run = runs.startOrResume({
+      source: { kind: "inbound", inboundId: asInboundId(inbound.id) },
+      traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    runs.appendInitialMessages(run.id, [
+      { role: "user", content: "Mark restroom done" },
+    ]);
+    runs.complete(run.id, falseResponse);
+    const egress = new MessageEgressService({
+      db: item.runtime.database.db,
+      gateway,
+      queue: item.runtime.queue,
+      traces: item.runtime.traces,
+      writes: new WriteStore(item.runtime.database.db, item.runtime.traces),
+      lineNumber,
+    });
+    egress.planReply({
+      traceId,
+      recipient: userNumber,
+      text: falseResponse,
+      runId: run.id,
+      replyToGuid: inbound.guid,
+      inboundSequence: inbound.sequence,
+    });
+    item.runtime.database.db
+      .prepare<{ id: string; attempts: number }>(
+        "UPDATE jobs SET attempts = @attempts WHERE id = @id",
+      )
+      .run({ id: firstJob.id, attempts: 5 });
+
+    const recoveryAtMs = firstJob.leaseExpiresAtMs + 1;
+    const recoveredJob = requiredJob(item.runtime.queue.claim(recoveryAtMs));
+    expect(recoveredJob.id).toBe(firstJob.id);
+    const context: JobContext = {
+      signal: new AbortController().signal,
+      nowMs: () => recoveryAtMs,
+      assertLease: () => item.runtime.queue.assertLease(recoveredJob, recoveryAtMs),
+    };
+    await item.runtime.handlers.inbound(recoveredJob, context);
+    item.runtime.queue.complete(recoveredJob);
+
+    expect(
+      item.runtime.database.db
+        .prepare<
+          [],
+          { purpose: string; body: string; state: string; last_error: string | null }
+        >(`
+          SELECT purpose, body, state, last_error
+          FROM egress_messages
+          ORDER BY CASE purpose WHEN 'reply' THEN 0 ELSE 1 END
+        `)
+        .all(),
+    ).toEqual([
+      {
+        purpose: "reply",
+        body: falseResponse,
+        state: "provider_failed",
+        last_error: "unverified_write_claim",
+      },
+      {
+        purpose: "failure",
+        body: expect.not.stringContaining(falseResponse),
+        state: "prepared",
+        last_error: null,
+      },
+    ]);
+    expect(
+      item.runtime.database.db
+        .prepare<
+          [],
+          { type: string; status: string; purpose: string | null }
+        >(`
+          SELECT jobs.type, jobs.status, egress.purpose
+          FROM jobs
+          LEFT JOIN egress_messages AS egress ON egress.id = jobs.subject_id
+          WHERE jobs.type IN ('egress_send', 'memory_maintenance')
+          ORDER BY CASE
+            WHEN egress.purpose = 'reply' THEN 0
+            WHEN jobs.type = 'memory_maintenance' THEN 1
+            ELSE 2
+          END
+        `)
+        .all(),
+    ).toEqual([
+      { type: "egress_send", status: "blocked", purpose: "reply" },
+      { type: "memory_maintenance", status: "blocked", purpose: null },
+      { type: "egress_send", status: "pending", purpose: "failure" },
+    ]);
+
+    await runNextJob(item.runtime, recoveryAtMs + 1);
+
+    expect(gateway.sends).toHaveLength(1);
+    expect(gateway.sends[0]?.text).not.toBe(falseResponse);
+    expect(gateway.sends[0]?.text).toContain("didn't confirm");
+    expect(model.maintenanceRequests).toHaveLength(0);
+  });
+
+  it("quarantines an ambiguous false reply without modifying or replaying it", async () => {
+    const falseResponse = "✅ done — clean restroom is checked off.";
+    const model = new FakeModel();
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway);
+    gateway.inbox.push(
+      inboundMessage("msg_ambiguous_false_reply", { text: "Mark restroom done" }),
+    );
+
+    await sweep(item);
+    const job = requiredJob(item.runtime.queue.claim(Date.now() + 10));
+    const inbound = item.runtime.database.db
+      .prepare<
+        [],
+        { id: string; trace_id: string; guid: string; sequence: number }
+      >("SELECT id, trace_id, guid, sequence FROM inbound_messages")
+      .get();
+    if (inbound === undefined) {
+      throw new Error("Expected ambiguous-reply inbound");
+    }
+    const traceId = asTraceId(inbound.trace_id);
+    const runs = new AgentRunStore(item.runtime.database.db, item.runtime.traces);
+    const run = runs.startOrResume({
+      source: { kind: "inbound", inboundId: asInboundId(inbound.id) },
+      traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    runs.appendInitialMessages(run.id, [
+      { role: "user", content: "Mark restroom done" },
+    ]);
+    runs.complete(run.id, falseResponse);
+    const egress = new MessageEgressService({
+      db: item.runtime.database.db,
+      gateway,
+      queue: item.runtime.queue,
+      traces: item.runtime.traces,
+      writes: new WriteStore(item.runtime.database.db, item.runtime.traces),
+      lineNumber,
+    });
+    const replyId = egress.planReply({
+      traceId,
+      recipient: userNumber,
+      text: falseResponse,
+      runId: run.id,
+      replyToGuid: inbound.guid,
+      inboundSequence: inbound.sequence,
+    });
+    item.runtime.database.db
+      .prepare<{ id: string }>(`
+        UPDATE egress_messages
+        SET state = 'acceptance_unknown', attempt_count = 1, last_error = 'timeout'
+        WHERE id = @id
+      `)
+      .run({ id: replyId });
+    item.runtime.database.db
+      .prepare<{ id: string }>(`
+        UPDATE write_intents
+        SET state = 'ambiguous'
+        WHERE egress_id = @id
+      `)
+      .run({ id: replyId });
+    item.runtime.database.db
+      .prepare<{ id: string }>(`
+        UPDATE jobs
+        SET status = 'succeeded'
+        WHERE type = 'egress_send' AND subject_id = @id
+      `)
+      .run({ id: replyId });
+
+    const context: JobContext = {
+      signal: new AbortController().signal,
+      nowMs: () => Date.now(),
+      assertLease: () => item.runtime.queue.assertLease(job),
+    };
+    await item.runtime.handlers.inbound(job, context);
+    item.runtime.queue.complete(job);
+
+    expect(
+      item.runtime.database.db
+        .prepare<
+          { id: string },
+          { body: string; state: string; last_error: string | null }
+        >("SELECT body, state, last_error FROM egress_messages WHERE id = @id")
+        .get({ id: replyId }),
+    ).toEqual({
+      body: falseResponse,
+      state: "acceptance_unknown",
+      last_error: "timeout",
+    });
+    expect(
+      item.runtime.database.db
+        .prepare<{ id: string }, { state: string }>(
+          "SELECT state FROM write_intents WHERE egress_id = @id",
+        )
+        .get({ id: replyId })?.state,
+    ).toBe("ambiguous");
+    expect(
+      item.runtime.database.db
+        .prepare<[], { status: string }>(
+          "SELECT status FROM jobs WHERE type = 'memory_maintenance'",
+        )
+        .get()?.status,
+    ).toBe("blocked");
+    expect(
+      item.runtime.database.db
+        .prepare<[], { phase: string; final_response: string | null }>(
+          "SELECT phase, final_response FROM agent_runs",
+        )
+        .get(),
+    ).toEqual({ phase: "blocked", final_response: null });
+    expect(
+      item.runtime.database.db
+        .prepare<[], { count: number }>(
+          "SELECT COUNT(*) AS count FROM egress_messages WHERE purpose = 'failure'",
+        )
+        .get()?.count,
+    ).toBe(0);
+    expect(gateway.sends).toHaveLength(0);
   });
 
   it("recovers the ingress cursor and accepted work after a process restart", async () => {

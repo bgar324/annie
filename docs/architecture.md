@@ -177,6 +177,7 @@ For Notion updates, a non-error MCP envelope is not sufficient evidence of accep
 
 
 If the process stops while a write is `attempting`, startup changes it to `ambiguous`. The service never automatically repeats an ambiguous write. The related agent run blocks and reports its trace ID.
+Recovery revalidates a completed response before resuming its reply. Completed inbound finalization remains reclaimable beyond the ordinary job-attempt cap because it performs only local idempotent state transitions. If a prior crash left an invalid reply prepared, one transaction cancels that send intent, blocks its send and memory jobs, quarantines the run, and prepares the failure notice. Once reply dispatch has begun, recovery leaves the reply and write intent unchanged, blocks pending memory work, and removes the false response from conversation history.
 
 Sendblue reply sending uses the same rule. One `POST` send carries the reply, and its returned message handle is the only identifier the service keeps. If the send may have been accepted, the egress row becomes `acceptance_unknown` and the write intent becomes `ambiguous`; the service never issues a second send. A send whose acceptance is known but whose delivery is not is reconciled with bounded `GET` status polls, at most twelve within a 30-minute deadline, ending as `delivered`, `provider_failed`, or `delivery_unknown`.
 

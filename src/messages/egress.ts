@@ -1,5 +1,11 @@
 import type Database from "better-sqlite3";
-import { newEgressId, type EgressId, type TraceId, type WriteIntentId } from "../core/ids.js";
+import {
+  newEgressId,
+  type EgressId,
+  type RunId,
+  type TraceId,
+  type WriteIntentId,
+} from "../core/ids.js";
 import type { ClaimedJob, QueueStore } from "../queue/store.js";
 import type { TraceStore } from "../tracing/store.js";
 import type { WriteStore } from "../writes/store.js";
@@ -25,6 +31,11 @@ export interface EgressSendPolicy {
   kind: "daily_brief";
   expiresAtMs: number;
 }
+
+export type PreparedReplySuppression =
+  | { kind: "absent" }
+  | { kind: "suppressed"; egressId: EgressId }
+  | { kind: "not_suppressible"; egressId: EgressId };
 
 export interface EgressSendConstraint {
   policy: EgressSendPolicy;
@@ -99,7 +110,7 @@ export class MessageEgressService {
         .get({ trace_id: input.traceId });
       const egressId =
         existing?.id ??
-        this.prepare({
+        this.prepareInTransaction({
           traceId: input.traceId,
           recipient: input.recipient,
           text: input.text,
@@ -149,6 +160,18 @@ export class MessageEgressService {
     runId?: string;
     replyToGuid?: string;
   }): EgressId {
+    const transaction = this.#db.transaction(() => this.prepareInTransaction(input));
+    return transaction.immediate();
+  }
+
+  prepareInTransaction(input: {
+    traceId: TraceId;
+    recipient: string;
+    text: string;
+    purpose: EgressPurpose;
+    runId?: string;
+    replyToGuid?: string;
+  }): EgressId {
     const text = input.text.trim();
     if (text.length === 0 || text.length > maximumMessageTextCharacters) {
       throw new Error(
@@ -157,69 +180,148 @@ export class MessageEgressService {
     }
     const egressId = newEgressId();
     const now = Date.now();
-    const transaction = this.#db.transaction(() => {
-      this.#db
-        .prepare<{
-          id: string;
-          run_id: string | null;
-          trace_id: string;
-          recipient_handle: string;
-          line_handle: string;
-          reply_to_guid: string | null;
-          body: string;
-          purpose: EgressPurpose;
-          now_ms: number;
-        }>(`
-          INSERT INTO egress_messages(
-            id, run_id, trace_id, recipient_handle, line_handle, reply_to_guid,
-            body, purpose, state, attempt_count, outbox_id, request_id,
-            provider_message_id, poll_count, poll_deadline_at_ms, last_error,
-            created_at_ms, updated_at_ms
-          ) VALUES (
-            @id, @run_id, @trace_id, @recipient_handle, @line_handle, @reply_to_guid,
-            @body, @purpose, 'prepared', 0, NULL, NULL,
-            NULL, 0, NULL, NULL, @now_ms, @now_ms
-          )
-        `)
-        .run({
-          id: egressId,
-          run_id: input.runId ?? null,
-          trace_id: input.traceId,
-          recipient_handle: input.recipient,
-          line_handle: this.#lineNumber,
-          reply_to_guid: input.replyToGuid ?? null,
-          body: text,
-          purpose: input.purpose,
-          now_ms: now,
-        });
-      this.#writes.prepareInTransaction({
-        traceId: input.traceId,
-        kind: "sendblue_send_message",
+    this.#db
+      .prepare<{
+        id: string;
+        run_id: string | null;
+        trace_id: string;
+        recipient_handle: string;
+        line_handle: string;
+        reply_to_guid: string | null;
+        body: string;
+        purpose: EgressPurpose;
+        now_ms: number;
+      }>(`
+        INSERT INTO egress_messages(
+          id, run_id, trace_id, recipient_handle, line_handle, reply_to_guid,
+          body, purpose, state, attempt_count, outbox_id, request_id,
+          provider_message_id, poll_count, poll_deadline_at_ms, last_error,
+          created_at_ms, updated_at_ms
+        ) VALUES (
+          @id, @run_id, @trace_id, @recipient_handle, @line_handle, @reply_to_guid,
+          @body, @purpose, 'prepared', 0, NULL, NULL,
+          NULL, 0, NULL, NULL, @now_ms, @now_ms
+        )
+      `)
+      .run({
+        id: egressId,
+        run_id: input.runId ?? null,
+        trace_id: input.traceId,
+        recipient_handle: input.recipient,
+        line_handle: this.#lineNumber,
+        reply_to_guid: input.replyToGuid ?? null,
+        body: text,
+        purpose: input.purpose,
+        now_ms: now,
+      });
+    this.#writes.prepareInTransaction({
+      traceId: input.traceId,
+      kind: "sendblue_send_message",
+      egressId,
+      request: {
+        to: input.recipient,
+        text,
+        ...(input.replyToGuid === undefined ? {} : { replyTo: input.replyToGuid }),
+      },
+      safeSummary: {
         egressId,
-        request: {
-          to: input.recipient,
-          text,
-          ...(input.replyToGuid === undefined ? {} : { replyTo: input.replyToGuid }),
-        },
-        safeSummary: {
-          egressId,
-          purpose: input.purpose,
-          textBytes: Buffer.byteLength(text),
-        },
-        ...(input.runId === undefined ? {} : { runId: input.runId }),
-      });
-      this.#traces.appendInTransaction({
-        traceId: input.traceId,
-        component: "egress",
-        event: "prepared",
-        outcome: input.purpose,
-        runId: input.runId,
-        data: { egressId, textBytes: Buffer.byteLength(text) },
-        occurredAtMs: now,
-      });
+        purpose: input.purpose,
+        textBytes: Buffer.byteLength(text),
+      },
+      ...(input.runId === undefined ? {} : { runId: input.runId }),
     });
-    transaction.immediate();
+    this.#traces.appendInTransaction({
+      traceId: input.traceId,
+      component: "egress",
+      event: "prepared",
+      outcome: input.purpose,
+      runId: input.runId,
+      data: { egressId, textBytes: Buffer.byteLength(text) },
+      occurredAtMs: now,
+    });
     return egressId;
+  }
+
+  suppressPreparedReplyInTransaction(input: {
+    traceId: TraceId;
+    runId: RunId;
+    reason: string;
+    job: ClaimedJob;
+    nowMs: number;
+  }): PreparedReplySuppression {
+    this.#queue.assertLease(input.job, input.nowMs);
+    const existing = this.#db
+      .prepare<
+        { trace_id: string; run_id: string },
+        { id: EgressId }
+      >(`
+        SELECT id
+        FROM egress_messages
+        WHERE trace_id = @trace_id AND run_id = @run_id AND purpose = 'reply'
+        LIMIT 1
+      `)
+      .get({ trace_id: input.traceId, run_id: input.runId });
+    if (existing === undefined) {
+      return { kind: "absent" };
+    }
+    const egress = this.#get(existing.id);
+    if (egress.state !== "prepared") {
+      this.#queue.blockPendingMemoryWorkInTransaction({
+        traceId: input.traceId,
+        runId: input.runId,
+        error: input.reason,
+        occurredAtMs: input.nowMs,
+      });
+      return { kind: "not_suppressible", egressId: egress.id };
+    }
+    const result = {
+      ok: false,
+      error: {
+        code: input.reason,
+        message: "The reply was suppressed before provider dispatch",
+      },
+    };
+    this.#writes.cancelPreparedInTransaction({
+      writeId: egress.write_id,
+      traceId: egress.trace_id,
+      normalizedResult: result,
+      jobLease: {
+        jobId: input.job.id,
+        leaseToken: input.job.leaseToken,
+        nowMs: input.nowMs,
+      },
+    });
+    const updated = this.#db
+      .prepare<{ id: string; reason: string; now_ms: number }>(`
+        UPDATE egress_messages
+        SET state = 'provider_failed', last_error = @reason, updated_at_ms = @now_ms
+        WHERE id = @id AND state = 'prepared' AND attempt_count = 0
+      `)
+      .run({
+        id: egress.id,
+        reason: input.reason,
+        now_ms: input.nowMs,
+      });
+    if (updated.changes !== 1) {
+      throw new Error(`Egress ${egress.id} is not suppressible`);
+    }
+    this.#queue.blockPendingReplyWorkInTransaction({
+      traceId: input.traceId,
+      runId: input.runId,
+      egressId: egress.id,
+      error: input.reason,
+      occurredAtMs: input.nowMs,
+    });
+    this.#traces.appendInTransaction({
+      traceId: input.traceId,
+      component: "egress",
+      event: "canceled",
+      outcome: input.reason,
+      runId: input.runId,
+      data: { egressId: egress.id },
+      occurredAtMs: input.nowMs,
+    });
+    return { kind: "suppressed", egressId: egress.id };
   }
 
   async sendPrepared(

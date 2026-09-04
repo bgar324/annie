@@ -5,6 +5,14 @@ import type { QueueStore } from "../queue/store.js";
 import type { TraceStore } from "../tracing/store.js";
 import { MessageEgressService, type EgressSendPolicy } from "./egress.js";
 
+interface FailurePlanInput {
+  traceId: TraceId;
+  failureCode: string;
+  runId?: string;
+  replyToGuid?: string;
+  sendPolicy?: EgressSendPolicy;
+}
+
 export class FailureNotificationService {
   readonly #db: Database.Database;
   readonly #egress: MessageEgressService;
@@ -26,64 +34,102 @@ export class FailureNotificationService {
     this.#recipient = input.config.userPhoneNumber;
   }
 
-  plan(input: {
-    traceId: TraceId;
-    failureCode: string;
-    runId?: string;
-    replyToGuid?: string;
-    sendPolicy?: EgressSendPolicy;
-  }): EgressId {
-    const existing = this.#findExisting(input.traceId);
-    if (existing !== undefined) {
-      return existing;
-    }
-    const transaction = this.#db.transaction(() => {
-      const concurrent = this.#findExisting(input.traceId);
-      if (concurrent !== undefined) {
-        return concurrent;
-      }
-      const egressId = this.#egress.prepare({
-        traceId: input.traceId,
-        recipient: this.#recipient,
-        purpose: "failure",
-        text: failureNotificationText(input.failureCode, input.traceId),
-        ...(input.runId === undefined ? {} : { runId: input.runId }),
-        ...(input.replyToGuid === undefined ? {} : { replyToGuid: input.replyToGuid }),
-      });
-      this.#queue.enqueueInTransaction({
-        chatId: this.#recipient,
-        type: "egress_send",
-        subjectId: egressId,
-        payload: {
-          egressId,
-          ...(input.sendPolicy === undefined ? {} : { sendPolicy: input.sendPolicy }),
-        },
-        traceId: input.traceId,
-        capacityExempt: true,
-        ...(input.runId === undefined ? {} : { runId: input.runId }),
-      });
-      this.#traces.appendInTransaction({
-        traceId: input.traceId,
-        component: "failure_notification",
-        event: "planned",
-        outcome: "failure",
-        runId: input.runId,
-        data: { egressId, failureCode: input.failureCode },
-      });
-      return egressId;
-    });
+  plan(input: FailurePlanInput): EgressId {
+    const transaction = this.#db.transaction(() => this.planInTransaction(input));
     return transaction.immediate();
   }
 
-  #findExisting(traceId: TraceId): EgressId | undefined {
+  planInTransaction(input: FailurePlanInput): EgressId {
+    return this.#planInTransaction(input);
+  }
+
+  replaceSuppressedReplyInTransaction(
+    input: FailurePlanInput,
+    suppressedReplyId: EgressId,
+  ): EgressId {
+    const suppressed = this.#db
+      .prepare<
+        { id: string; trace_id: string; reason: string },
+        { suppressed: 1 }
+      >(`
+        SELECT 1 AS suppressed
+        FROM egress_messages
+        WHERE id = @id
+          AND trace_id = @trace_id
+          AND purpose = 'reply'
+          AND state = 'provider_failed'
+          AND last_error = @reason
+      `)
+      .get({
+        id: suppressedReplyId,
+        trace_id: input.traceId,
+        reason: input.failureCode,
+      });
+    if (suppressed === undefined) {
+      throw new Error(`Reply ${suppressedReplyId} was not safely suppressed`);
+    }
+    return this.#planInTransaction(input, suppressedReplyId);
+  }
+
+  #planInTransaction(
+    input: FailurePlanInput,
+    ignoredEgressId?: EgressId,
+  ): EgressId {
+    const existing = this.#findExisting(input.traceId, ignoredEgressId);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const egressId = this.#egress.prepareInTransaction({
+      traceId: input.traceId,
+      recipient: this.#recipient,
+      purpose: "failure",
+      text: failureNotificationText(input.failureCode, input.traceId),
+      ...(input.runId === undefined ? {} : { runId: input.runId }),
+      ...(input.replyToGuid === undefined ? {} : { replyToGuid: input.replyToGuid }),
+    });
+    this.#queue.enqueueInTransaction({
+      chatId: this.#recipient,
+      type: "egress_send",
+      subjectId: egressId,
+      payload: {
+        egressId,
+        ...(input.sendPolicy === undefined ? {} : { sendPolicy: input.sendPolicy }),
+      },
+      traceId: input.traceId,
+      capacityExempt: true,
+      ...(input.runId === undefined ? {} : { runId: input.runId }),
+    });
+    this.#traces.appendInTransaction({
+      traceId: input.traceId,
+      component: "failure_notification",
+      event: "planned",
+      outcome: "failure",
+      runId: input.runId,
+      data: { egressId, failureCode: input.failureCode },
+    });
+    return egressId;
+  }
+
+  #findExisting(
+    traceId: TraceId,
+    ignoredEgressId?: EgressId,
+  ): EgressId | undefined {
     return this.#db
-      .prepare<{ trace_id: string }, { id: EgressId }>(`
+      .prepare<
+        { trace_id: string; ignored_id: string | null },
+        { id: EgressId }
+      >(`
         SELECT id FROM egress_messages
-        WHERE trace_id = @trace_id AND purpose IN ('reply', 'failure')
+        WHERE trace_id = @trace_id
+          AND purpose IN ('reply', 'failure')
+          AND (@ignored_id IS NULL OR id <> @ignored_id)
         ORDER BY created_at_ms
         LIMIT 1
       `)
-      .get({ trace_id: traceId })?.id;
+      .get({
+        trace_id: traceId,
+        ignored_id: ignoredEgressId ?? null,
+      })?.id;
   }
 }
 
