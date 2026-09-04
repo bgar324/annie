@@ -12,6 +12,7 @@ import { ConversationHistoryStore } from "../src/agent/history.js";
 import { assistantResponseFormatReminder } from "../src/agent/prompt.js";
 import { AgentRunStore } from "../src/agent/store.js";
 import { ConnectionStore } from "../src/connections/store.js";
+import type { ConnectionCapability } from "../src/connections/types.js";
 import { loadRuntimeConfig, type RuntimeConfig } from "../src/config.js";
 import {
   asInboundId,
@@ -841,6 +842,51 @@ describe("production runtime", () => {
     await runNextJob(item.runtime, Date.now() + 10);
 
     expect(inboundState(item.runtime)).toBe("blocked");
+    expect(notionClients.writes).toHaveLength(0);
+    expect(
+      item.runtime.database.db
+        .prepare<[], { count: number }>(
+          "SELECT COUNT(*) AS count FROM write_intents WHERE kind = 'notion_update_page'",
+        )
+        .get()?.count,
+    ).toBe(0);
+  });
+
+  it("rejects an unscoped update that omits the fetched workspace", async () => {
+    const model = new FakeModel();
+    model.responses.push(
+      toolCallResponse("split_capability_fetch", {
+        id: "call_split_capability_fetch",
+        name: "notion.fetch",
+        argumentsJson: JSON.stringify({ workspace: "Reader", id: "page_1" }),
+      }),
+      toolCallResponse("split_capability_write", {
+        id: "call_split_capability_write",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          pageId: "page_1",
+          command: "update_content",
+          updates: [
+            {
+              oldText: "- [ ] Clean restroom",
+              newText: "- [x] Clean restroom",
+            },
+          ],
+        }),
+      }),
+    );
+    const notionClients = new FakeNotionClients(true, "- [ ] Clean restroom");
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item, "Reader", ["notion.fetch"]);
+    connectNotion(item, "Writer", ["notion.update_page"]);
+    gateway.inbox.push(inboundMessage("msg_split_capability", { text: "Mark restroom done" }));
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("blocked");
+    expect(notionClients.fetches).toEqual([{ id: "page_1" }]);
     expect(notionClients.writes).toHaveLength(0);
     expect(
       item.runtime.database.db
@@ -3499,7 +3545,16 @@ async function newRuntime(
   return item;
 }
 
-function connectNotion(item: TrackedRuntime, label = "Work"): void {
+function connectNotion(
+  item: TrackedRuntime,
+  label = "Work",
+  capabilities: readonly ConnectionCapability[] = [
+    "notion.search",
+    "notion.fetch",
+    "notion.create_page",
+    "notion.update_page",
+  ],
+): void {
   const connections = new ConnectionStore(
     item.runtime.database.db,
     new CredentialVault(item.config.credentialEncryptionKey),
@@ -3512,12 +3567,7 @@ function connectNotion(item: TrackedRuntime, label = "Work"): void {
     safeLabel: label,
     safeMetadata: { workspaceName: label },
     providerState: { scopes: ["user", "workspace"] },
-    capabilities: [
-      "notion.search",
-      "notion.fetch",
-      "notion.create_page",
-      "notion.update_page",
-    ],
+    capabilities,
     credentials: { accessToken: "notion_access" },
   });
 }

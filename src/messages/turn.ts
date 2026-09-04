@@ -600,8 +600,9 @@ export class InboundTurnService {
       const workspace = argumentsValue.workspace;
       const fetchedWorkspace = asRecord(fetchResult?.workspace)?.label;
       if (
-        workspace !== undefined &&
-        (typeof workspace !== "string" || fetchedWorkspace !== workspace.trim())
+        typeof workspace !== "string" ||
+        typeof fetchedWorkspace !== "string" ||
+        fetchedWorkspace !== workspace.trim()
       ) {
         continue;
       }
