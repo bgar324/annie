@@ -105,6 +105,7 @@ describe("Notion read tools", () => {
         title: "Safe title",
         url: "https://notion.so/page-8",
         content: "Safe body",
+        truncated: true,
         workspace_id: "must-not-cross",
         owner: { id: "must-not-cross" },
       },
@@ -123,7 +124,7 @@ describe("Notion read tools", () => {
         title: "Safe title",
         url: "https://notion.so/page-8",
         text: "Safe body",
-        truncated: false,
+        truncated: true,
       },
     });
     expect(JSON.stringify(result)).not.toContain("must-not-cross");
@@ -189,7 +190,11 @@ describe("Notion writes", () => {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ object: "page", id: argumentsValue.page_id }),
+            text: JSON.stringify({
+              object: "page_markdown",
+              id: argumentsValue.page_id,
+              truncated: false,
+            }),
           },
         ],
       };
@@ -337,12 +342,54 @@ describe("Notion writes", () => {
     expect(fixture.call).toHaveBeenCalledTimes(1);
     expect(writeStates(harness)).toEqual(["ambiguous"]);
   });
-  it("does not fabricate update success from an unacknowledged result", async () => {
+  it.each([
+    {
+      label: "missing page identity",
+      result: { content: [{ type: "text", text: "updated" }] },
+    },
+    {
+      label: "mismatched page identity",
+      result: {
+        structuredContent: {
+          object: "page_markdown",
+          id: "different_page",
+          markdown: "- [x] Task",
+          truncated: false,
+          unknown_block_ids: [],
+        },
+      },
+    },
+    {
+      label: "provider-truncated acknowledgement",
+      result: {
+        structuredContent: {
+          object: "page_markdown",
+          id: "page_unacknowledged",
+          markdown: "- [x] Task",
+          truncated: true,
+          unknown_block_ids: [],
+        },
+      },
+    },
+    {
+      label: "truncated acknowledgement",
+      result: {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              object: "page_markdown",
+              id: "page_unacknowledged",
+              padding: "x".repeat(131_072),
+            }),
+          },
+        ],
+      },
+    },
+  ])("keeps a $label acceptance-unknown", async ({ result }) => {
     const harness = notionHarness();
     addNotionConnection(harness, "workspace_unacknowledged", "Unacknowledged");
-    const fixture = sessionFixture(async () => ({
-      content: [{ type: "text", text: "updated" }],
-    }));
+    const fixture = sessionFixture(async () => result);
     const service = notionService(harness, fixedSessionProvider(fixture.session));
 
     await expect(

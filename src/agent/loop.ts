@@ -15,6 +15,17 @@ import { ToolRegistry, ToolRegistryError, type ToolOperationClass } from "./tool
 import type { WriteStore } from "../writes/store.js";
 
 const maximumToolCallsPerResponse = 4;
+type ToolCallGuard = (
+  call: ModelToolCall,
+  operationClass: ToolOperationClass,
+) => string | undefined;
+type ToolCallBatchGuard = (
+  calls: readonly {
+    call: ModelToolCall;
+    operationClass: ToolOperationClass;
+  }[],
+) => string | undefined;
+
 
 export interface AgentLoopLimits {
   maxToolRounds: number;
@@ -55,7 +66,8 @@ export class AgentLoop {
     traceId: TraceId;
     initialMessages: readonly ModelMessage[];
     allowedToolNames?: readonly string[];
-    toolCallGuard?: (call: ModelToolCall, operationClass: ToolOperationClass) => string | undefined;
+    toolCallGuard?: ToolCallGuard;
+    toolCallBatchGuard?: ToolCallBatchGuard;
     completionGuard?: (
       candidate: { runId: RunId; response: string },
     ) => string | undefined;
@@ -114,6 +126,7 @@ export class AgentLoop {
             input.jobLease,
             allowedToolNames,
             input.toolCallGuard,
+            input.toolCallBatchGuard,
             runSignal,
           );
           continue;
@@ -193,13 +206,23 @@ export class AgentLoop {
     replay: boolean,
     jobLease: { jobId: string; leaseToken: string } | undefined,
     allowedToolNames: ReadonlySet<string> | undefined,
-    toolCallGuard:
-      | ((call: ModelToolCall, operationClass: ToolOperationClass) => string | undefined)
-      | undefined,
+    toolCallGuard: ToolCallGuard | undefined,
+    toolCallBatchGuard: ToolCallBatchGuard | undefined,
     signal: AbortSignal,
   ): Promise<void> {
     const answered = answeredToolCalls(messages);
     const pending = calls.filter((call) => !answered.has(call.id));
+    if (toolCallBatchGuard !== undefined) {
+      const rejection = toolCallBatchGuard(
+        pending.map((call) => ({
+          call,
+          operationClass: this.#tools.operationClass(call.name),
+        })),
+      );
+      if (rejection !== undefined) {
+        throw new AgentLimitError("tool_not_allowed", rejection);
+      }
+    }
     const parallel =
       pending.length > 1 &&
       pending.every((call) => this.#tools.canRunInParallel(call.name));

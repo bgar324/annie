@@ -92,6 +92,31 @@ class FakeModel implements AssistantModel {
   }
 }
 
+function toolCallResponse(
+  id: string,
+  call: ModelResponse["toolCalls"][number],
+): ModelResponse {
+  return {
+    id,
+    content: "",
+    providerState: null,
+    toolCalls: [call],
+    finishReason: "tool_calls",
+    usage: { promptTokens: 10, completionTokens: 20, totalTokens: 30 },
+  };
+}
+
+function finalModelResponse(id: string, content: string): ModelResponse {
+  return {
+    id,
+    content,
+    providerState: null,
+    toolCalls: [],
+    finishReason: "stop",
+    usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 },
+  };
+}
+
 class FakeGmailClients implements GmailClientProvider {
   readonly selected: ConnectionId[] = [];
   readonly searches: { query: string; maxResults: number }[] = [];
@@ -174,9 +199,13 @@ class FakeGoogleWorkspaceClients implements GoogleWorkspaceClientProvider {
 class FakeNotionClients implements NotionClientProvider {
   readonly selected: ConnectionId[] = [];
   readonly searches: Record<string, unknown>[] = [];
+  readonly fetches: Record<string, unknown>[] = [];
   readonly writes: Array<{ name: string; argumentsValue: Record<string, unknown> }> = [];
 
-  constructor(readonly allowWrites = false) {}
+  constructor(
+    readonly allowWrites = false,
+    readonly fetchText = "",
+  ) {}
 
   async withSession<T>(
     connectionId: ConnectionId,
@@ -199,6 +228,10 @@ class FakeNotionClients implements NotionClientProvider {
               },
             ],
           };
+        }
+        if (name === "notion-fetch") {
+          this.fetches.push(argumentsValue);
+          return { content: [{ type: "text", text: this.fetchText }] };
         }
         if (name !== "notion-search") {
           throw new Error(`Daily brief made an unexpected Notion call: ${name}`);
@@ -524,6 +557,11 @@ describe("production runtime", () => {
       response: "Yes — I did update the Notion doc.",
     },
     {
+      label: "a passive follow-up confirmation",
+      request: "Are you updating the notion doc?",
+      response: "The page is updated.",
+    },
+    {
       label: "a passive provider-write success claim",
       request: "Update Status to Done",
       response: "The page has been updated.",
@@ -605,9 +643,60 @@ describe("production runtime", () => {
     ).toEqual({ body: response, purpose: "reply" });
   });
 
-  it("allows an explicitly requested Notion mutation to confirm after its write succeeds", async () => {
+  it.each([
+    "I couldn't update the page, so nothing changed.",
+    "I didn't update the Notion doc.",
+    "Nothing changed.",
+    "I'm done reviewing the results.",
+  ])("preserves the truthful non-success response %s", async (response) => {
+    const model = new FakeModel();
+    model.responses.push(finalModelResponse("truthful_non_success", response));
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway);
+    gateway.inbox.push(
+      inboundMessage("msg_truthful_non_success", {
+        text: "Tell me what happened with that request",
+      }),
+    );
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("done");
+    expect(
+      item.runtime.database.db
+        .prepare<[], { body: string; purpose: string }>(
+          "SELECT body, purpose FROM egress_messages",
+        )
+        .get(),
+    ).toEqual({ body: response, purpose: "reply" });
+  });
+
+  it("confirms one checkbox update anchored to an exact current fetch", async () => {
+    const fetchedPage = [
+      "## Day 90: Wednesday, September 2",
+      "- [ ] Clean restroom",
+      "## Day 91: Thursday, September 3",
+      "- [ ] Clean restroom",
+    ].join("\n");
+    const oldText = "## Day 91: Thursday, September 3\n- [ ] Clean restroom";
+    const newText = "## Day 91: Thursday, September 3\n- [x] Clean restroom";
     const model = new FakeModel();
     model.responses.push(
+      {
+        id: "authorized_target_fetch",
+        content: "",
+        providerState: null,
+        toolCalls: [
+          {
+            id: "call_authorized_target_fetch",
+            name: "notion.fetch",
+            argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+          },
+        ],
+        finishReason: "tool_calls",
+        usage: { promptTokens: 10, completionTokens: 20, totalTokens: 30 },
+      },
       {
         id: "authorized_write_call",
         content: "",
@@ -620,12 +709,7 @@ describe("production runtime", () => {
               workspace: "Work",
               pageId: "page_1",
               command: "update_content",
-              updates: [
-                {
-                  oldText: "- [ ] Clean restroom",
-                  newText: "- [x] Clean restroom",
-                },
-              ],
+              updates: [{ oldText, newText }],
             }),
           },
         ],
@@ -641,7 +725,7 @@ describe("production runtime", () => {
         usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 },
       },
     );
-    const notionClients = new FakeNotionClients(true);
+    const notionClients = new FakeNotionClients(true, fetchedPage);
     const gateway = new FakeGateway();
     const item = await newRuntime(model, gateway, { notionClients });
     connectNotion(item);
@@ -653,6 +737,7 @@ describe("production runtime", () => {
     await runNextJob(item.runtime, Date.now() + 10);
 
     expect(inboundState(item.runtime)).toBe("done");
+    expect(notionClients.fetches).toEqual([{ id: "page_1" }]);
     expect(notionClients.writes).toEqual([
       {
         name: "notion-update-page",
@@ -661,8 +746,8 @@ describe("production runtime", () => {
           command: "update_content",
           content_updates: [
             {
-              old_str: "- [ ] Clean restroom",
-              new_str: "- [x] Clean restroom",
+              old_str: oldText,
+              new_str: newText,
               replace_all_matches: false,
             },
           ],
@@ -686,6 +771,177 @@ describe("production runtime", () => {
       body: "✅ done — clean restroom is checked off.",
       purpose: "reply",
     });
+  });
+
+  it.each([
+    {
+      label: "an unanchored duplicate task",
+      fetchedPage: [
+        "## Day 90",
+        "- [ ] Clean restroom",
+        "## Day 91",
+        "- [ ] Clean restroom",
+      ].join("\n"),
+      pageId: "page_1",
+    },
+    {
+      label: "a different page than the one fetched",
+      fetchedPage: "## Day 91\n- [ ] Clean restroom",
+      pageId: "page_2",
+    },
+  ])("rejects $label before preparing the checkbox write", async ({ fetchedPage, pageId }) => {
+    const model = new FakeModel();
+    model.responses.push(
+      {
+        id: "target_fetch",
+        content: "",
+        providerState: null,
+        toolCalls: [
+          {
+            id: "call_target_fetch",
+            name: "notion.fetch",
+            argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+          },
+        ],
+        finishReason: "tool_calls",
+        usage: { promptTokens: 10, completionTokens: 20, totalTokens: 30 },
+      },
+      {
+        id: "unsafe_target_write",
+        content: "",
+        providerState: null,
+        toolCalls: [
+          {
+            id: "call_unsafe_target_write",
+            name: "notion.update_page",
+            argumentsJson: JSON.stringify({
+              workspace: "Work",
+              pageId,
+              command: "update_content",
+              updates: [
+                {
+                  oldText: "- [ ] Clean restroom",
+                  newText: "- [x] Clean restroom",
+                },
+              ],
+            }),
+          },
+        ],
+        finishReason: "tool_calls",
+        usage: { promptTokens: 10, completionTokens: 20, totalTokens: 30 },
+      },
+    );
+    const notionClients = new FakeNotionClients(true, fetchedPage);
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item);
+    gateway.inbox.push(inboundMessage("msg_unsafe_target", { text: "Mark restroom done" }));
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("blocked");
+    expect(notionClients.writes).toHaveLength(0);
+    expect(
+      item.runtime.database.db
+        .prepare<[], { count: number }>(
+          "SELECT COUNT(*) AS count FROM write_intents WHERE kind = 'notion_update_page'",
+        )
+        .get()?.count,
+    ).toBe(0);
+  });
+
+  it.each([
+    {
+      request: "Mark feature flags done",
+      task: "Pull feature flags",
+    },
+    {
+      request: "Mark compiler 0.8 done",
+      task: "Finish policyc compiler 0.8",
+    },
+  ])("accepts the production shorthand $request for its exact task", async ({ request, task }) => {
+    const oldText = `- [ ] ${task}`;
+    const newText = `- [x] ${task}`;
+    const model = new FakeModel();
+    model.responses.push(
+      toolCallResponse("shorthand_fetch", {
+        id: "call_shorthand_fetch",
+        name: "notion.fetch",
+        argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+      }),
+      toolCallResponse("shorthand_write", {
+        id: "call_shorthand_write",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "update_content",
+          updates: [{ oldText, newText }],
+        }),
+      }),
+      finalModelResponse("shorthand_done", "✅ done — the requested task is checked off."),
+    );
+    const notionClients = new FakeNotionClients(true, `${oldText}\n- [ ] Neighboring task`);
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item);
+    gateway.inbox.push(inboundMessage("msg_shorthand", { text: request }));
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("done");
+    expect(notionClients.writes).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      label: "the neighboring feature-flags task",
+      request: "Mark feature flags done",
+      task: "Pull production flags",
+    },
+    {
+      label: "the neighboring compiler version",
+      request: "Mark compiler 0.8 done",
+      task: "Finish policyc compiler 0.9",
+    },
+    {
+      label: "a different action sharing the restroom noun",
+      request: "Mark buy restroom done",
+      task: "Clean restroom",
+    },
+  ])("rejects $label despite a matching fetched page", async ({ request, task }) => {
+    const oldText = `- [ ] ${task}`;
+    const model = new FakeModel();
+    model.responses.push(
+      toolCallResponse("wrong_task_fetch", {
+        id: "call_wrong_task_fetch",
+        name: "notion.fetch",
+        argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+      }),
+      toolCallResponse("wrong_task_write", {
+        id: "call_wrong_task_write",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "update_content",
+          updates: [{ oldText, newText: `- [x] ${task}` }],
+        }),
+      }),
+    );
+    const notionClients = new FakeNotionClients(true, oldText);
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item);
+    gateway.inbox.push(inboundMessage("msg_wrong_task", { text: request }));
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("blocked");
+    expect(notionClients.writes).toHaveLength(0);
   });
 
   it("consumes one create-page authorization only once", async () => {
@@ -721,8 +977,8 @@ describe("production runtime", () => {
     await runNextJob(item.runtime, Date.now() + 10);
 
     expect(inboundState(item.runtime)).toBe("blocked");
-    expect(notionClients.writes).toHaveLength(1);
-    expect(count(item.runtime, "tool_executions")).toBe(1);
+    expect(notionClients.writes).toHaveLength(0);
+    expect(count(item.runtime, "tool_executions")).toBe(0);
     expect(
       item.runtime.database.db
         .prepare<[], { phase: string; failure_code: string | null }>(
@@ -732,6 +988,72 @@ describe("production runtime", () => {
     ).toEqual({ phase: "blocked", failure_code: "tool_not_allowed" });
   });
 
+  it("recreates the single-use write guard from durable executions on resume", async () => {
+    const request = "Create a Notion page called Launch plan in Notion workspace Work";
+    const createCall = (id: string) => ({
+      id,
+      name: "notion.create_page",
+      argumentsJson: JSON.stringify({
+        workspace: "Work",
+        properties: { title: "Launch plan" },
+      }),
+    });
+    const model = new FakeModel();
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, {
+      notionClients: new FakeNotionClients(true),
+    });
+    gateway.inbox.push(inboundMessage("msg_durable_single_use", { text: request }));
+    await sweep(item);
+    const job = requiredJob(item.runtime.queue.claim(Date.now() + 10));
+    const inbound = item.runtime.database.db
+      .prepare<[], { id: string; trace_id: string }>(
+        "SELECT id, trace_id FROM inbound_messages",
+      )
+      .get();
+    if (inbound === undefined) {
+      throw new Error("Expected durable single-use inbound");
+    }
+    const runs = new AgentRunStore(item.runtime.database.db, item.runtime.traces);
+    const run = runs.startOrResume({
+      source: { kind: "inbound", inboundId: asInboundId(inbound.id) },
+      traceId: asTraceId(inbound.trace_id),
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    runs.bindJob(run.id, job.id, job.leaseToken);
+    runs.appendInitialMessages(run.id, [{ role: "user", content: request }]);
+    const firstCall = createCall("call_create_before_resume");
+    runs.appendAssistant(run.id, toolCallResponse("first_write_response", firstCall));
+    const firstExecution = runs.prepareTool({
+      runId: run.id,
+      call: firstCall,
+      operationClass: "write",
+      maximumToolCalls: 16,
+    });
+    runs.markToolRunning(firstExecution.id);
+    runs.finishTool(firstExecution.id, "succeeded", { ok: true });
+    runs.appendToolMessage(run.id, firstCall.id, '{"ok":true}');
+    runs.appendAssistant(
+      run.id,
+      toolCallResponse("second_write_response", createCall("call_create_after_resume")),
+    );
+    const context: JobContext = {
+      signal: new AbortController().signal,
+      nowMs: () => Date.now(),
+      assertLease: () => item.runtime.queue.assertLease(job),
+    };
+
+    await item.runtime.handlers.inbound(job, context);
+    item.runtime.queue.complete(job);
+
+    expect(runs.getRequired(run.id)).toMatchObject({
+      phase: "blocked",
+      failureCode: "tool_not_allowed",
+    });
+    expect(count(item.runtime, "tool_executions")).toBe(1);
+    expect(model.requests).toHaveLength(0);
+  });
+
   it.each([
     { label: "neutral", heading: "🗂️ workspace:", expectedState: "done" },
     { label: "false-success", heading: "✅ done:", expectedState: "blocked" },
@@ -739,7 +1061,7 @@ describe("production runtime", () => {
     "handles a $label pre-intent workspace clarification",
     async ({ heading, expectedState }) => {
       const clarification =
-        `${heading}\n› Which Notion workspace should I use—"Work" or "Personal"—and will you repeat the full request ending with "in Notion workspace <label>"?`;
+        `${heading}\n› Which Notion workspace should I use: "Work" or "Personal"? Repeat the full request ending with in Notion workspace <label>.`;
       const model = new FakeModel();
       model.responses.push(
         {
@@ -806,6 +1128,61 @@ describe("production runtime", () => {
     },
   );
 
+  it("allows the exact multi-workspace clarification before any write call", async () => {
+    const clarification =
+      '🗂️ workspace:\n› Which Notion workspace should I use: "Work" or "Personal"? Repeat the full request ending with in Notion workspace <label>.';
+    const model = new FakeModel();
+    model.responses.push(finalModelResponse("preflight_workspace_question", clarification));
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, {
+      notionClients: new FakeNotionClients(),
+    });
+    connectNotion(item);
+    connectNotion(item, "Personal");
+    gateway.inbox.push(
+      inboundMessage("msg_preflight_workspace", {
+        text: "Create a Notion page called Launch plan",
+      }),
+    );
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("done");
+    expect(count(item.runtime, "tool_executions")).toBe(0);
+    expect(
+      item.runtime.database.db
+        .prepare<[], { body: string; purpose: string }>(
+          "SELECT body, purpose FROM egress_messages",
+        )
+        .get(),
+    ).toEqual({ body: clarification, purpose: "reply" });
+  });
+
+  it("rejects a clarification that omits one exact eligible label", async () => {
+    const clarification =
+      '🗂️ workspace:\n› Which Notion workspace should I use: "Personal"? Repeat the full request ending with in Notion workspace <label>.';
+    const model = new FakeModel();
+    model.responses.push(finalModelResponse("incomplete_workspace_question", clarification));
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, {
+      notionClients: new FakeNotionClients(),
+    });
+    connectNotion(item);
+    connectNotion(item, "Personal");
+    gateway.inbox.push(
+      inboundMessage("msg_incomplete_workspace", {
+        text: "Create a Notion page called Launch plan",
+      }),
+    );
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("blocked");
+    expect(count(item.runtime, "tool_executions")).toBe(0);
+  });
+
   it("rejects a model-selected workspace on an unscoped write", async () => {
     const model = new FakeModel();
     model.responses.push({
@@ -842,6 +1219,187 @@ describe("production runtime", () => {
     expect(inboundState(item.runtime)).toBe("blocked");
     expect(notionClients.writes).toHaveLength(0);
     expect(count(item.runtime, "tool_executions")).toBe(0);
+  });
+
+  it.each([
+    {
+      label: "create-page title with preserved case",
+      request: "Create a Notion page called API Plan in Notion workspace Work",
+      fetchText: "",
+      call: {
+        id: "call_create_api_plan",
+        name: "notion.create_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          properties: { title: "API Plan" },
+        }),
+      },
+    },
+    {
+      label: "one scalar property",
+      request: "Update Status to SDK in Notion workspace Work",
+      fetchText: "Project page",
+      call: {
+        id: "call_update_status",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "update_properties",
+          properties: { Status: "SDK" },
+        }),
+      },
+    },
+    {
+      label: "full content replacement with preserved case",
+      request:
+        'Replace the Notion page content with "API Notes" in Notion workspace Work',
+      fetchText: "Old notes",
+      call: {
+        id: "call_replace_content",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "replace_content",
+          newContent: "API Notes",
+        }),
+      },
+    },
+    {
+      label: "quoted exact-text replacement with preserved case",
+      request: 'Replace "API" with "SDK" in Notion workspace Work',
+      fetchText: "API docs",
+      call: {
+        id: "call_replace_text",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "update_content",
+          updates: [{ oldText: "API", newText: "SDK" }],
+        }),
+      },
+    },
+  ])("allows an exact $label", async ({ request, fetchText, call }) => {
+    const model = new FakeModel();
+    if (call.name === "notion.update_page") {
+      model.responses.push(
+        toolCallResponse("generic_target_fetch", {
+          id: "call_generic_target_fetch",
+          name: "notion.fetch",
+          argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+        }),
+      );
+    }
+    model.responses.push(
+      toolCallResponse("generic_authorized_write", call),
+      finalModelResponse("generic_authorized_done", "✅ done — the requested change is complete."),
+    );
+    const notionClients = new FakeNotionClients(true, fetchText);
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item);
+    gateway.inbox.push(inboundMessage("msg_generic_authorized", { text: request }));
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("done");
+    expect(notionClients.writes).toHaveLength(1);
+    expect(
+      item.runtime.database.db
+        .prepare<[], { state: string }>(
+          "SELECT state FROM write_intents WHERE kind LIKE 'notion_%'",
+        )
+        .get()?.state,
+    ).toBe("succeeded");
+  });
+
+  it.each([
+    {
+      label: "non-scalar property value",
+      request: "Update Status to SDK in Notion workspace Work",
+      fetchText: "Project page",
+      call: {
+        id: "call_non_scalar_property",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "update_properties",
+          properties: { Status: ["SDK"] },
+        }),
+      },
+    },
+    {
+      label: "property value with different case",
+      request: "Update Status to SDK in Notion workspace Work",
+      fetchText: "Project page",
+      call: {
+        id: "call_lowercase_property",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "update_properties",
+          properties: { Status: "sdk" },
+        }),
+      },
+    },
+    {
+      label: "replacement content with different case",
+      request:
+        'Replace the Notion page content with "API Notes" in Notion workspace Work',
+      fetchText: "Old notes",
+      call: {
+        id: "call_lowercase_content",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "replace_content",
+          newContent: "api notes",
+        }),
+      },
+    },
+    {
+      label: "quoted source text with different case",
+      request: 'Replace "API" with "SDK" in Notion workspace Work',
+      fetchText: "api docs",
+      call: {
+        id: "call_lowercase_source",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "update_content",
+          updates: [{ oldText: "api", newText: "SDK" }],
+        }),
+      },
+    },
+  ])("rejects an exact-value mismatch: $label", async ({ request, fetchText, call }) => {
+    const model = new FakeModel();
+    model.responses.push(
+      toolCallResponse("mismatch_target_fetch", {
+        id: "call_mismatch_target_fetch",
+        name: "notion.fetch",
+        argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+      }),
+      toolCallResponse("mismatch_write", call),
+    );
+    const notionClients = new FakeNotionClients(true, fetchText);
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item);
+    gateway.inbox.push(inboundMessage("msg_value_mismatch", { text: request }));
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("blocked");
+    expect(notionClients.writes).toHaveLength(0);
+    expect(count(item.runtime, "tool_executions")).toBe(1);
   });
   it.each([
     {
@@ -2954,7 +3512,12 @@ function connectNotion(item: TrackedRuntime, label = "Work"): void {
     safeLabel: label,
     safeMetadata: { workspaceName: label },
     providerState: { scopes: ["user", "workspace"] },
-    capabilities: ["notion.create_page", "notion.update_page"],
+    capabilities: [
+      "notion.search",
+      "notion.fetch",
+      "notion.create_page",
+      "notion.update_page",
+    ],
     credentials: { accessToken: "notion_access" },
   });
 }

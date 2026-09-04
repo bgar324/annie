@@ -625,7 +625,7 @@ function normalizeNotionResult(
       ...(parsed.url === undefined ? {} : { url: parsed.url }),
       ...(parsed.type === undefined ? {} : { type: parsed.type }),
       ...(text === undefined ? {} : { text }),
-      truncated: false,
+      truncated: payload.truncated,
     };
   }
 
@@ -648,7 +648,10 @@ function normalizedNotionPayload(
   result: z.infer<typeof toolResultSchema>,
 ): { value: unknown; truncated: boolean } {
   if (result.structuredContent !== undefined) {
-    return { value: result.structuredContent, truncated: false };
+    return {
+      value: result.structuredContent,
+      truncated: notionPayloadTruncated(result.structuredContent),
+    };
   }
   const text = (result.content ?? [])
     .filter((block) => block.type === "text" && block.text !== undefined)
@@ -656,10 +659,26 @@ function normalizedNotionPayload(
     .join("\n");
   const bounded = truncateUtf8(text, maximumResultBytes);
   try {
-    return { value: JSON.parse(bounded.value) as unknown, truncated: bounded.truncated };
+    const value: unknown = JSON.parse(bounded.value);
+    return {
+      value,
+      truncated: bounded.truncated || notionPayloadTruncated(value),
+    };
   } catch {
     return { value: bounded.value, truncated: bounded.truncated };
   }
+}
+
+function notionPayloadTruncated(value: unknown): boolean {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    !("truncated" in value)
+  ) {
+    return false;
+  }
+  return z.boolean().parse(value.truncated);
 }
 
 function truncateUtf8(value: string, maximumBytes: number): { value: string; truncated: boolean } {
