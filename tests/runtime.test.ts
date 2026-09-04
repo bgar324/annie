@@ -641,6 +641,12 @@ describe("production runtime", () => {
       request: "Create a Notion page called Launch plan",
       response: "Your new page is ready.",
     },
+    {
+      label: "an unproved already-set checkbox response",
+      request: "Mark clean and organize room done",
+      response:
+        '"clean and organize room" was already checked off, so no change was made.',
+    },
   ])("blocks $label when no provider write succeeded", async ({ request, response }) => {
     const model = new FakeModel();
     model.responses.push({
@@ -1074,6 +1080,161 @@ describe("production runtime", () => {
       },
     ]);
   });
+
+  it.each([
+    {
+      label: "one matching checked item",
+      selectedLines: ["- [x] Clean and organize room"],
+      responsePrefix: "",
+      request: "Can you mark clean room done?",
+      secondWorkspace: false,
+      expectedState: "done",
+      expectedPurpose: "reply",
+    },
+    {
+      label: "one matching unchecked item",
+      selectedLines: ["- [ ] Clean and organize room"],
+      responsePrefix: "",
+      request: "Can you mark clean room done?",
+      secondWorkspace: false,
+      expectedState: "blocked",
+      expectedPurpose: "failure",
+    },
+    {
+      label: "duplicate matching checked items",
+      selectedLines: [
+        "- [x] Clean and organize room",
+        "- [x] Clean and organize room",
+      ],
+      responsePrefix: "",
+      request: "Can you mark clean room done?",
+      secondWorkspace: false,
+      expectedState: "blocked",
+      expectedPurpose: "failure",
+    },
+    {
+      label: "a first-person checked claim",
+      selectedLines: ["- [x] Clean and organize room"],
+      responsePrefix: "I checked it. ",
+      request: "Can you mark clean room done?",
+      secondWorkspace: false,
+      expectedState: "blocked",
+      expectedPurpose: "failure",
+    },
+    {
+      label: "an explicit matching workspace among two",
+      selectedLines: ["- [x] Clean and organize room"],
+      responsePrefix: "",
+      request: "Can you mark clean room done in Notion workspace Work",
+      secondWorkspace: true,
+      expectedState: "done",
+      expectedPurpose: "reply",
+    },
+    {
+      label: "an explicit mismatched workspace",
+      selectedLines: ["- [x] Clean and organize room"],
+      responsePrefix: "",
+      request: "Can you mark clean room done in Notion workspace Personal",
+      secondWorkspace: true,
+      expectedState: "blocked",
+      expectedPurpose: "failure",
+    },
+    {
+      label: "multiple eligible workspaces without explicit scope",
+      selectedLines: ["- [x] Clean and organize room"],
+      responsePrefix: "",
+      request: "Can you mark clean room done?",
+      secondWorkspace: true,
+      expectedState: "blocked",
+      expectedPurpose: "failure",
+    },
+  ])(
+    "requires $label for a read-only no-op",
+    async ({
+      selectedLines,
+      responsePrefix,
+      request,
+      secondWorkspace,
+      expectedState,
+      expectedPurpose,
+    }) => {
+      const response = `${responsePrefix}🧐 checked the page: "clean and organize room" is already checked off, so no change was needed. did you mean the older "organize and clean room" item?`;
+      const fetchedPage = [
+        "## Day 90",
+        "- [ ] Organize and clean room",
+        "## Day 91",
+        ...selectedLines,
+      ].join("\n");
+      const target = {
+        id: "page_1",
+        title: "Jadyn and Ben’s TO-DO’s!!!",
+        highlight: "Clean and organize room",
+      };
+      const broadResults = [
+        target,
+        ...Array.from({ length: 9 }, (_, index) => ({
+          id: `other_${index}`,
+          title: `Other page ${index}`,
+        })),
+      ];
+      const model = new FakeModel();
+      model.responses.push(
+        toolCallResponse("noop_task_search", {
+          id: "call_noop_task_search",
+          name: "notion.search",
+          argumentsJson: JSON.stringify({ workspace: "Work", query: "clean room" }),
+        }),
+        toolCallResponse("noop_title_search", {
+          id: "call_noop_title_search",
+          name: "notion.search",
+          argumentsJson: JSON.stringify({
+            workspace: "Work",
+            query: "Jadyn and Ben's TO-DO's",
+          }),
+        }),
+        toolCallResponse("noop_fetch", {
+          id: "call_noop_fetch",
+          name: "notion.fetch",
+          argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+        }),
+        finalModelResponse("noop_response", response),
+      );
+      const notionClients = new FakeNotionClients(
+        false,
+        fetchedPage,
+        broadResults,
+        false,
+        {
+          omitReadTruncationFlags: true,
+          pageScopedSearchResults: [target],
+          structuredFetch: true,
+        },
+      );
+      const gateway = new FakeGateway();
+      const item = await newRuntime(model, gateway, { notionClients });
+      connectNotion(item);
+      if (secondWorkspace) {
+        connectNotion(item, "Personal");
+      }
+      gateway.inbox.push(inboundMessage("msg_validated_noop", { text: request }));
+
+      await sweep(item);
+      await runNextJob(item.runtime, Date.now() + 10);
+
+      expect(inboundState(item.runtime)).toBe(expectedState);
+      expect(notionClients.writes).toHaveLength(0);
+      expect(
+        item.runtime.database.db
+          .prepare<[], { body: string; purpose: string }>(
+            "SELECT body, purpose FROM egress_messages",
+          )
+          .get(),
+      ).toMatchObject({
+        purpose: expectedPurpose,
+        ...(expectedPurpose === "reply" ? { body: response } : {}),
+      });
+    },
+  );
 
   it("rejects a checkbox page absent from current search results", async () => {
     const model = new FakeModel();

@@ -786,6 +786,18 @@ export class InboundTurnService {
     if (typeof workspace !== "string") {
       return "The provider write exceeds the authorized account scope";
     }
+    return this.#notionWriteWorkspaceMatches(authorization, workspace)
+      ? undefined
+      : "An unscoped provider write cannot select among multiple accounts";
+  }
+
+  #notionWriteWorkspaceMatches(
+    authorization: ProviderWriteAuthorization,
+    workspace: string,
+  ): boolean {
+    if (authorization.workspace !== undefined) {
+      return workspace.trim() === authorization.workspace;
+    }
     const capability = notionWriteCapability(authorization);
     const eligible = this.#connections
       .list()
@@ -795,10 +807,7 @@ export class InboundTurnService {
           connection.status === "healthy" &&
           connection.capabilities.includes(capability),
       );
-    return eligible.length === 1 &&
-      workspace.trim() === eligible[0]?.safeLabel
-      ? undefined
-      : "An unscoped provider write cannot select among multiple accounts";
+    return eligible.length === 1 && workspace.trim() === eligible[0]?.safeLabel;
   }
 
   #providerWriteCompletionRejection(
@@ -816,9 +825,73 @@ export class InboundTurnService {
     ) {
       return undefined;
     }
-    return authorization !== undefined || claimsUnrequestedProviderWrite(userMessage, response)
-      ? "unverified_write_claim"
-      : undefined;
+    const claimsWrite = claimsUnrequestedProviderWrite(userMessage, response);
+    if (
+      authorization !== undefined &&
+      !claimsWrite &&
+      this.#isValidatedNotionCheckboxNoOp(runId, authorization, response)
+    ) {
+      return undefined;
+    }
+    return authorization !== undefined || claimsWrite ? "unverified_write_claim" : undefined;
+  }
+
+  #isValidatedNotionCheckboxNoOp(
+    runId: RunId,
+    authorization: ProviderWriteAuthorization,
+    response: string,
+  ): boolean {
+    if (
+      authorization.kind !== "notion_task_checkbox" ||
+      !responseExplicitlyDescribesCheckboxNoOp(response, authorization.checked)
+    ) {
+      return false;
+    }
+    const preparedWrite = this.#db
+      .prepare<{ run_id: string }, { found: number }>(`
+        SELECT 1 AS found FROM tool_executions
+        WHERE run_id = @run_id AND operation_class = 'write'
+        LIMIT 1
+      `)
+      .get({ run_id: runId });
+    if (preparedWrite !== undefined) {
+      return false;
+    }
+    const fetches = this.#db
+      .prepare<
+        { run_id: string },
+        { arguments_json: string; result_json: string }
+      >(`
+        SELECT arguments_json, result_json
+        FROM tool_executions
+        WHERE run_id = @run_id
+          AND tool_name = 'notion.fetch'
+          AND status = 'succeeded'
+          AND result_json IS NOT NULL
+        ORDER BY created_at_ms DESC, id DESC
+      `)
+      .all({ run_id: runId });
+    for (const fetch of fetches) {
+      const fetchArguments = jsonRecord(fetch.arguments_json);
+      const pageId = fetchArguments?.id;
+      const fetchResult = jsonRecord(fetch.result_json);
+      const workspace = asRecord(fetchResult?.workspace)?.label;
+      const result = asRecord(fetchResult?.result);
+      if (
+        typeof pageId !== "string" ||
+        typeof workspace !== "string" ||
+        !this.#notionWriteWorkspaceMatches(authorization, workspace) ||
+        result?.truncated !== false ||
+        typeof result.text !== "string" ||
+        !this.#notionPageWasDiscovered(runId, pageId, workspace, undefined)
+      ) {
+        continue;
+      }
+      if (checkboxNoOpIsProved(result.text, authorization, response)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   #isValidatedConnectionClarification(
@@ -1553,6 +1626,101 @@ function taskTokens(value: string): readonly string[] {
   return (value.toLowerCase().match(/[a-z0-9]+/gu) ?? []).filter(
     (token) => !taskTargetStopWords.has(token),
   );
+}
+
+function responseExplicitlyDescribesCheckboxNoOp(response: string, checked: boolean): boolean {
+  const normalized = response.toLowerCase().replaceAll("’", "'");
+  const alreadySet = checked
+    ? /\balready\s+(?:marked\s+)?(?:done|complete|completed|checked(?:\s+off)?)\b/u.test(
+        normalized,
+      )
+    : /\balready\s+(?:marked\s+)?(?:not\s+done|incomplete|unchecked)\b/u.test(normalized);
+  const noChange =
+    /\bno\s+change\s+(?:was\s+)?(?:made|needed)\b/u.test(normalized) ||
+    /\bnothing\s+(?:was\s+)?changed\b/u.test(normalized);
+  const firstPersonCheckboxWrite =
+    /\b(?:i|we)(?:'ve| have| just)?\s+checked\s+(?:it|that|the\s+(?:task|box|checkbox|item))(?:\s+off)?\b/u.test(
+      normalized,
+    );
+  return alreadySet && noChange && !firstPersonCheckboxWrite;
+}
+
+function checkboxNoOpIsProved(
+  text: string,
+  authorization: Extract<ProviderWriteAuthorization, { kind: "notion_task_checkbox" }>,
+  response: string,
+): boolean {
+  const authorizedStates = taskCheckboxStates(text, (_labelTokens, line) =>
+    taskLabelMatches(authorization.targetTokens, line),
+  );
+  if (authorizedStates.length === 1 && authorizedStates[0] === authorization.checked) {
+    return true;
+  }
+  const selectedTokens = quotedAlreadySetTaskTokens(response, authorization.checked);
+  if (
+    selectedTokens === undefined ||
+    !tokensAppearInOrder(authorization.targetTokens, selectedTokens)
+  ) {
+    return false;
+  }
+  const selectedStates = taskCheckboxStates(text, (labelTokens) =>
+    sameTokens(selectedTokens, labelTokens),
+  );
+  if (selectedStates.length !== 1 || selectedStates[0] !== authorization.checked) {
+    return false;
+  }
+  const relatedCount = taskCheckboxStates(text, (labelTokens) =>
+    tokensAppearInOrder(authorization.targetTokens, labelTokens),
+  ).length;
+  return relatedCount <= 1 || response.includes("?");
+}
+
+function quotedAlreadySetTaskTokens(
+  response: string,
+  checked: boolean,
+): readonly string[] | undefined {
+  const selected = (
+    checked
+      ? /["“]([^"”\r\n]{1,200})["”]\s+(?:is|was)\s+already\s+(?:marked\s+)?(?:done|complete|completed|checked(?:\s+off)?)\b/iu
+      : /["“]([^"”\r\n]{1,200})["”]\s+(?:is|was)\s+already\s+(?:marked\s+)?(?:not\s+done|incomplete|unchecked)\b/iu
+  ).exec(response)?.[1];
+  if (selected === undefined) {
+    return undefined;
+  }
+  const tokens = taskTokens(selected);
+  return tokens.length === 0 ? undefined : tokens;
+}
+
+function taskCheckboxStates(
+  text: string,
+  matches: (labelTokens: readonly string[], line: string) => boolean,
+): readonly boolean[] {
+  const states: boolean[] = [];
+  for (const line of text.split(/\r?\n/u)) {
+    const marker = /\[([ xX])\]/u.exec(line);
+    const state = marker?.[1];
+    if (marker === null || state === undefined) {
+      continue;
+    }
+    const labelTokens = taskLabelTokens(line);
+    if (matches(labelTokens, line)) {
+      states.push(state.toLowerCase() === "x");
+    }
+  }
+  return states;
+}
+
+function tokensAppearInOrder(
+  targetTokens: readonly string[],
+  labelTokens: readonly string[],
+): boolean {
+  let targetIndex = 0;
+  for (const token of labelTokens) {
+    if (token === targetTokens[targetIndex]) {
+      targetIndex += 1;
+    }
+  }
+  return targetTokens.length > 0 && targetIndex === targetTokens.length;
 }
 
 
