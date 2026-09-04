@@ -791,6 +791,75 @@ describe("SQLite foundation", () => {
     }
   });
 
+  it("adds a checked request scope without rewriting earlier runs", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    runMigrations(db, 8);
+    db.exec(`
+      INSERT INTO webhook_deliveries(
+        id, provider_delivery_id, provider_message_id, event_kind, line_id,
+        line_handle, outbox_id, normalized_json, trace_id, received_at_ms
+      ) VALUES (
+        'delivery_v8', 'provider_delivery_v8', 'provider_message_v8',
+        'message.received', 'line_v8', '+15550000001', NULL, '{}',
+        'trace_scope_v8', 1
+      );
+      INSERT INTO inbound_messages(
+        id, delivery_id, provider_message_id, chat_id, guid, sender, line_id,
+        line_handle, sequence, state, text, is_audio, attachment_json,
+        trace_id, created_at_ms, updated_at_ms
+      ) VALUES (
+        'in_scope_v8', 'delivery_v8', 'provider_message_v8',
+        '+15550000002', 'guid_scope_v8', '+15550000002', 'line_v8',
+        '+15550000001', 1, 'done', 'mark car wash done', 0, '{}',
+        'trace_scope_v8', 1, 1
+      );
+      INSERT INTO agent_runs(
+        id, inbound_id, scheduled_job_id, trace_id, phase, model_requests,
+        maintenance_requests, tool_calls, provider_writes, deadline_at_ms,
+        transcript_bytes, memory_maintenance_status, memory_before_digest,
+        memory_after_digest, ambiguous_write_id, final_response, failure_code,
+        created_at_ms, updated_at_ms
+      ) VALUES (
+        'run_scope_v8', 'in_scope_v8', NULL, 'trace_scope_v8', 'completed', 2, 0,
+        1, 1, 1000, 24, 'unchanged', NULL, NULL, NULL, 'done', NULL, 1, 1
+      );
+    `);
+
+    try {
+      runMigrations(db);
+
+      // A run that predates classification has no scope, and nothing invents one.
+      expect(
+        db
+          .prepare<[], { phase: string; request_scope: string | null }>(
+            "SELECT phase, request_scope FROM agent_runs WHERE id = 'run_scope_v8'",
+          )
+          .get(),
+      ).toEqual({ phase: "completed", request_scope: null });
+      db.prepare(
+        "UPDATE agent_runs SET request_scope = 'notion_write' WHERE id = 'run_scope_v8'",
+      ).run();
+      expect(
+        db
+          .prepare<[], { request_scope: string | null }>(
+            "SELECT request_scope FROM agent_runs WHERE id = 'run_scope_v8'",
+          )
+          .get(),
+      ).toEqual({ request_scope: "notion_write" });
+      expect(() =>
+        db
+          .prepare(
+            "UPDATE agent_runs SET request_scope = 'admin_write' WHERE id = 'run_scope_v8'",
+          )
+          .run(),
+      ).toThrow(/CHECK constraint failed/u);
+      expect(db.pragma("foreign_key_check")).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
 
 });
 

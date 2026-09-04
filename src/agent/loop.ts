@@ -19,13 +19,6 @@ type ToolCallGuard = (
   call: ModelToolCall,
   operationClass: ToolOperationClass,
 ) => string | undefined;
-type ToolCallBatchGuard = (
-  calls: readonly {
-    call: ModelToolCall;
-    operationClass: ToolOperationClass;
-  }[],
-) => string | undefined;
-
 
 export interface AgentLoopLimits {
   maxToolRounds: number;
@@ -67,7 +60,6 @@ export class AgentLoop {
     initialMessages: readonly ModelMessage[];
     allowedToolNames?: readonly string[];
     toolCallGuard?: ToolCallGuard;
-    toolCallBatchGuard?: ToolCallBatchGuard;
     completionGuard?: (
       candidate: { runId: RunId; response: string },
     ) => string | undefined;
@@ -126,7 +118,6 @@ export class AgentLoop {
             input.jobLease,
             allowedToolNames,
             input.toolCallGuard,
-            input.toolCallBatchGuard,
             runSignal,
           );
           continue;
@@ -161,7 +152,10 @@ export class AgentLoop {
                 ...messages,
                 { role: "system", content: assistantResponseFormatReminder },
               ];
-        this.#runs.beginModelRequest(run.id, this.#limits.maxToolRounds + 1);
+        this.#runs.beginModelRequest(
+          run.id,
+          this.#limits.maxToolRounds + 1 + Number(run.requestScope !== null),
+        );
         let response;
         try {
           response = await this.#model.complete({
@@ -207,33 +201,32 @@ export class AgentLoop {
     jobLease: { jobId: string; leaseToken: string } | undefined,
     allowedToolNames: ReadonlySet<string> | undefined,
     toolCallGuard: ToolCallGuard | undefined,
-    toolCallBatchGuard: ToolCallBatchGuard | undefined,
     signal: AbortSignal,
   ): Promise<void> {
     const answered = answeredToolCalls(messages);
     const pending = calls.filter((call) => !answered.has(call.id));
-    if (toolCallBatchGuard !== undefined) {
-      const rejection = toolCallBatchGuard(
-        pending.map((call) => ({
-          call,
-          operationClass: this.#tools.operationClass(call.name),
-        })),
-      );
-      if (rejection !== undefined) {
-        throw new AgentLimitError("tool_not_allowed", rejection);
+    for (const call of pending) {
+      if (allowedToolNames !== undefined && !allowedToolNames.has(call.name)) {
+        throw new AgentLimitError(
+          "tool_not_allowed",
+          `Tool ${call.name} is not allowed for this agent run`,
+        );
       }
+    }
+    const writeCalls = pending.filter(
+      (call) => this.#tools.operationClass(call.name) === "write",
+    ).length;
+    if (writeCalls > 1) {
+      throw new AgentLimitError(
+        "tool_not_allowed",
+        "One response may request at most one provider write",
+      );
     }
     const parallel =
       pending.length > 1 &&
       pending.every((call) => this.#tools.canRunInParallel(call.name));
     if (parallel) {
       for (const call of pending) {
-        if (allowedToolNames !== undefined && !allowedToolNames.has(call.name)) {
-          throw new AgentLimitError(
-            "tool_not_allowed",
-            `Tool ${call.name} is not allowed for this agent run`,
-          );
-        }
         const toolCallRejection = toolCallGuard?.(call, this.#tools.operationClass(call.name));
         if (toolCallRejection !== undefined) {
           throw new AgentLimitError("tool_not_allowed", toolCallRejection);
@@ -244,12 +237,6 @@ export class AgentLoop {
     }
     for (const call of pending) {
       this.#assertWithinDeadline(run, signal);
-      if (allowedToolNames !== undefined && !allowedToolNames.has(call.name)) {
-        throw new AgentLimitError(
-          "tool_not_allowed",
-          `Tool ${call.name} is not allowed for this agent run`,
-        );
-      }
       const operationClass = this.#tools.operationClass(call.name);
       const toolCallRejection = toolCallGuard?.(call, operationClass);
       if (toolCallRejection !== undefined) {
@@ -300,7 +287,10 @@ export class AgentLoop {
       }
       if (
         operationClass === "write" &&
-        this.#runs.getRequired(run.id).providerWrites >= this.#limits.maxProviderWrites
+        this.#runs.getRequired(run.id).providerWrites >=
+          (run.source.kind === "inbound"
+            ? Math.min(1, this.#limits.maxProviderWrites)
+            : this.#limits.maxProviderWrites)
       ) {
         const result = { ok: false, error: { code: "write_limit", message: "Provider write limit reached" } };
         this.#runs.finishTool(execution.id, "not_executed", result);

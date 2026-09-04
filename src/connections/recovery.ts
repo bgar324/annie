@@ -143,6 +143,14 @@ export class ConnectionRecoveryService {
       if (existing !== undefined) {
         return existing.id;
       }
+      const run = this.#db
+        .prepare<{ run_id: string }, { request_scope: string | null }>(`
+          SELECT request_scope FROM agent_runs WHERE id = @run_id
+        `)
+        .get({ run_id: runId });
+      if (run?.request_scope !== `connect_${provider}`) {
+        throw new Error("Connection link requires matching current-request permission");
+      }
       const link = this.#links.issue({ provider, purpose: "connect", traceId });
       const egressId = this.#egress.prepare({
         traceId,

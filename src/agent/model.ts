@@ -44,6 +44,9 @@ export interface ModelRequest {
   runId: RunId;
   messages: readonly ModelMessage[];
   tools: readonly ModelToolDefinition[];
+  responseFormat?: "json";
+  reasoningEffort?: "low";
+  maxOutputTokens?: number;
   signal?: AbortSignal;
 }
 

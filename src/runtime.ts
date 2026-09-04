@@ -227,6 +227,7 @@ export async function createRuntime(
       db: database.db,
       config,
       agent,
+      model,
       runs,
       history: new ConversationHistoryStore(
         database.db,

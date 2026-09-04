@@ -34,6 +34,10 @@ Startup does not contact Sendblue, Google Workspace, Notion, or DeepSeek. An unh
 
 The process handles `SIGTERM` by failing health checks, closing the HTTP listener, and stopping the receiver, the scheduler, and the worker after in-flight work returns. It then projects remaining trace events and closes SQLite.
 
+Before deploying a change to write policy, let current inbound work and prepared or attempting provider/message writes settle. Do not replay blocked requests or ambiguous writes during the cutover. Verify the deployed commit and `/health` after startup without issuing test provider mutations.
+
+After schema 9 is installed, use `eed1f38` as the safe pre-repair rollback build. It retains the old write protections and understands schema 9. Earlier binaries expect schema 8 and fail readiness against the upgraded database.
+
 ## Open the control UI
 
 From the linked repository checkout, run:

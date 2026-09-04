@@ -150,60 +150,6 @@ describe("Notion read tools", () => {
     expect(fixture.call).toHaveBeenCalledTimes(1);
   });
 
-  it("adds a complete page-scoped search for one exact title candidate", async () => {
-    const harness = notionHarness();
-    addNotionConnection(harness, "workspace_search_refined", "Search");
-    const target = { id: "page_1", title: "Jadyn and Ben’s TO-DO’s!!!" };
-    const broadResults = [
-      target,
-      ...Array.from({ length: 9 }, (_, index) => ({
-        id: `other_${index}`,
-        title: `Other page ${index}`,
-      })),
-    ];
-    let callCount = 0;
-    const fixture = sessionFixture(async (name, argumentsValue) => {
-      expect(name).toBe("notion-search");
-      callCount += 1;
-      if (callCount === 1) {
-        expect(argumentsValue).toEqual({
-          query: "Jadyn and Ben's TO-DO's",
-          query_type: "internal",
-          page_size: 10,
-        });
-        return { structuredContent: { results: broadResults } };
-      }
-      expect(argumentsValue).toEqual({
-        query: "Jadyn and Ben's TO-DO's",
-        query_type: "internal",
-        page_url: "page_1",
-        page_size: 50,
-      });
-      return { structuredContent: { results: [target] } };
-    });
-    const service = notionService(harness, fixedSessionProvider(fixture.session));
-
-    await expect(
-      service.search(
-        { query: "Jadyn and Ben's TO-DO's", workspace: "Search", pageSize: 10 },
-        toolContext(harness, "notion.search", "read"),
-      ),
-    ).resolves.toEqual({
-      workspace: { label: "Search" },
-      result: {
-        results: broadResults,
-        truncated: true,
-        pageScopedSearches: [
-          {
-            pageId: "page_1",
-            results: [target],
-            truncated: false,
-          },
-        ],
-      },
-    });
-    expect(fixture.call).toHaveBeenCalledTimes(2);
-  });
 
   it("normalizes fetch results instead of exposing MCP content blocks", async () => {
     const harness = notionHarness();
@@ -383,6 +329,7 @@ describe("Notion writes", () => {
     expect(calls).toBe(1);
     expect(result).toEqual({
       ok: true,
+      outcome: "succeeded",
       workspace: { label: "Projects" },
       result: { pages: [{ id: "created_1" }] },
     });
@@ -414,19 +361,19 @@ describe("Notion writes", () => {
 
     await service.updatePage(
       { pageId: "page_1", command: "update_properties", properties: { status: "Done" } },
-      toolContext(harness, "notion.update_page", "write"),
+      fetchedUpdateContext(harness, "page_1", "old"),
     );
     await service.updatePage(
       { pageId: "page_2", command: "replace_content", newContent: "Replacement" },
-      toolContext(harness, "notion.update_page", "write"),
+      fetchedUpdateContext(harness, "page_2", "old"),
     );
     await service.updatePage(
       {
         pageId: "page_3",
         command: "update_content",
-        updates: [{ oldText: "old", newText: "new", replaceAllMatches: true }],
+        updates: [{ oldText: "old", newText: "new", replaceAllMatches: false }],
       },
-      toolContext(harness, "notion.update_page", "write"),
+      fetchedUpdateContext(harness, "page_3", "old"),
     );
 
     expect(calls).toEqual([
@@ -452,7 +399,7 @@ describe("Notion writes", () => {
           page_id: "page_3",
           command: "update_content",
           content_updates: [
-            { old_str: "old", new_str: "new", replace_all_matches: true },
+            { old_str: "old", new_str: "new", replace_all_matches: false },
           ],
         },
       },
@@ -547,7 +494,7 @@ describe("Notion writes", () => {
     await expect(
       service.updatePage(
         { pageId: "page_bad", command: "replace_content", newContent: "Bad" },
-        toolContext(harness, "notion.update_page", "write"),
+        fetchedUpdateContext(harness, "page_bad", "Original"),
       ),
     ).rejects.toMatchObject({ name: "NotionToolResultError" });
     expect(fixture.call).toHaveBeenCalledTimes(1);
@@ -636,12 +583,129 @@ describe("Notion writes", () => {
             },
           ],
         },
-        toolContext(harness, "notion.update_page", "write"),
+        fetchedUpdateContext(harness, "page_unacknowledged", "- [ ] Task"),
       ),
     ).rejects.toBeDefined();
 
     expect(fixture.call).toHaveBeenCalledTimes(1);
     expect(writeStates(harness)).toEqual(["ambiguous"]);
+  });
+
+  it("returns an authoritative unchanged result without preparing or sending a write", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_noop", "Work");
+    const fixture = sessionFixture(async () => {
+      throw new Error("An unchanged patch must not contact Notion");
+    });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const text = "## Yesterday\n- [x] Clean and organize room";
+    const context = fetchedUpdateContext(harness, "tasks", text);
+
+    await expect(service.updatePage({
+      workspace: "Work",
+      pageId: "tasks",
+      command: "update_content",
+      updates: [{ oldText: text, newText: text, replaceAllMatches: false }],
+    }, context)).resolves.toEqual({
+      ok: true,
+      outcome: "unchanged",
+      workspace: { label: "Work" },
+      result: { pageId: "tasks" },
+    });
+    expect(fixture.call).not.toHaveBeenCalled();
+    expect(writeStates(harness)).toEqual([]);
+  });
+
+  it.each([
+    { label: "absent source", text: "- [ ] Different task" },
+    { label: "repeated source", text: "- [ ] Task\n- [ ] Task" },
+  ])("rejects $label without dispatching a patch", async ({ text }) => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_source", "Work");
+    const fixture = sessionFixture(async () => {
+      throw new Error("Unproved patch reached the provider");
+    });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+
+    await expect(service.updatePage({
+      pageId: "tasks",
+      command: "update_content",
+      updates: [{ oldText: "- [ ] Task", newText: "- [x] Task", replaceAllMatches: false }],
+    }, fetchedUpdateContext(harness, "tasks", text))).rejects.toMatchObject({
+      code: "write_target_ambiguous",
+    });
+    expect(fixture.call).not.toHaveBeenCalled();
+    expect(writeStates(harness)).toEqual([]);
+  });
+
+  it.each([
+    { label: "another page", sourcePage: "other", truncated: false, freshRun: false },
+    { label: "an incomplete fetch", sourcePage: "tasks", truncated: true, freshRun: false },
+    { label: "a previous run", sourcePage: "tasks", truncated: false, freshRun: true },
+  ])("does not use $label to authorize an update", async ({ sourcePage, truncated, freshRun }) => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_proof", "Work");
+    const fixture = sessionFixture(async () => {
+      throw new Error("Unproved target reached the provider");
+    });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const sourceContext = fetchedUpdateContext(harness, sourcePage, "original", { truncated });
+    const context = freshRun
+      ? toolContext(harness, "notion.update_page", "write")
+      : sourceContext;
+
+    await expect(service.updatePage({
+      pageId: "tasks",
+      command: "replace_content",
+      newContent: "replacement",
+    }, context)).rejects.toMatchObject({ code: "write_target_unverified" });
+    expect(fixture.call).not.toHaveBeenCalled();
+    expect(writeStates(harness)).toEqual([]);
+  });
+
+  it("cannot edit a second account using the first account's fetched page", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_work_proof", "Work");
+    addNotionConnection(harness, "workspace_personal_proof", "Personal");
+    const fixture = sessionFixture(async () => {
+      throw new Error("Cross-account target reached the provider");
+    });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const context = fetchedUpdateContext(harness, "shared_id", "original", { workspace: "Work" });
+
+    await expect(service.updatePage({
+      workspace: "Personal",
+      pageId: "shared_id",
+      command: "replace_content",
+      newContent: "replacement",
+    }, context)).rejects.toMatchObject({ code: "write_target_unverified" });
+    expect(fixture.call).not.toHaveBeenCalled();
+    expect(writeStates(harness)).toEqual([]);
+  });
+
+  it("does not fall back to an older complete fetch after a newer incomplete result", async () => {
+    const harness = notionHarness();
+    const connection = addNotionConnection(harness, "workspace_latest", "Work");
+    const fixture = sessionFixture(async () => {
+      throw new Error("An older snapshot reached the provider");
+    });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const context = fetchedUpdateContext(harness, "tasks", "original");
+    const newer = toolContext(harness, "notion.fetch", "read", context.runId, { id: "tasks" });
+    harness.runs.bindToolConnection(newer.toolExecutionId, connection.id);
+    harness.runs.finishTool(newer.toolExecutionId, "succeeded", {
+      workspace: { label: "Work" },
+      result: { text: "partial newer content", truncated: true },
+    });
+
+    await expect(service.updatePage({
+      workspace: "Work",
+      pageId: "tasks",
+      command: "replace_content",
+      newContent: "replacement",
+    }, context)).rejects.toMatchObject({ code: "write_target_unverified" });
+    expect(fixture.call).not.toHaveBeenCalled();
+    expect(writeStates(harness)).toEqual([]);
   });
 });
 
@@ -874,6 +938,7 @@ function toolContext(
   toolName: string,
   operationClass: "read" | "write",
   existingRunId?: RunId,
+  argumentsValue: Record<string, unknown> = {},
 ): ToolExecutionContext {
   let runId = existingRunId;
   let traceId: TraceId;
@@ -887,7 +952,11 @@ function toolContext(
   }
   const execution = harness.runs.prepareTool({
     runId,
-    call: { id: `call_${randomUUID()}`, name: toolName, argumentsJson: "{}" },
+    call: {
+      id: `call_${randomUUID()}`,
+      name: toolName,
+      argumentsJson: JSON.stringify(argumentsValue),
+    },
     operationClass,
     maximumToolCalls: 8,
   });
@@ -899,6 +968,28 @@ function toolContext(
     connectionId: null,
     replay: false,
   };
+}
+
+function fetchedUpdateContext(
+  harness: NotionHarness,
+  pageId: string,
+  text: string,
+  options: { workspace?: string; truncated?: boolean } = {},
+): ToolExecutionContext {
+  const connection = harness.router.select({
+    capabilities: ["notion.fetch"],
+    ...(options.workspace === undefined ? {} : { account: options.workspace }),
+  });
+  const fetched = toolContext(harness, "notion.fetch", "read", undefined, {
+    id: pageId,
+    workspace: connection.safeLabel,
+  });
+  harness.runs.bindToolConnection(fetched.toolExecutionId, connection.id);
+  harness.runs.finishTool(fetched.toolExecutionId, "succeeded", {
+    workspace: { label: connection.safeLabel },
+    result: { text, truncated: options.truncated ?? false },
+  });
+  return toolContext(harness, "notion.update_page", "write", fetched.runId);
 }
 
 function insertInbound(

@@ -8,6 +8,11 @@ import {
   assistantResponseFormatReminder,
   buildAssistantSystemPrompt,
 } from "../src/agent/prompt.js";
+import {
+  classifyRequestScope,
+  requestScopeTools,
+  type RequestScope,
+} from "../src/agent/request-scope.js";
 import { AgentRunStore } from "../src/agent/store.js";
 import { ToolRegistry, type RegisteredTool } from "../src/agent/tools.js";
 import { loadRuntimeConfig, type RuntimeConfig } from "../src/config.js";
@@ -19,6 +24,7 @@ import {
   type TraceId,
 } from "../src/core/ids.js";
 import type { ProviderFetch } from "../src/providers/fetch.js";
+import { QueueStore, type ClaimedJob } from "../src/queue/store.js";
 import { createTraceRedactor } from "../src/tracing/redaction.js";
 import { TraceStore } from "../src/tracing/store.js";
 import { WriteStore } from "../src/writes/store.js";
@@ -364,6 +370,41 @@ describe("DeepSeek model adapter", () => {
 
     expect(requestedBody).not.toHaveProperty("tools");
     expect(requestedBody).not.toHaveProperty("tool_choice");
+  });
+
+  it("asks DeepSeek for a JSON object only when the request wants one", async () => {
+    const harness = modelHarness();
+    const requestedBodies: Record<string, unknown>[] = [];
+    const model = new DeepSeekChatModel({
+      config: harness.config,
+      traces: harness.traces,
+      fetchImpl: async (input, init) => {
+        requestedBodies.push((await new Request(input, init).json()) as Record<string, unknown>);
+        return completionResponse({
+          finish_reason: "stop",
+          message: { role: "assistant", content: '{"scope":"read"}' },
+        });
+      },
+    });
+    const base = {
+      traceId: newTraceId(),
+      runId: newRunId(),
+      messages: [{ role: "user" as const, content: "Hey annie" }],
+      tools: ToolRegistry.empty().definitions(),
+    };
+
+    await model.complete(base);
+    await model.complete({
+      ...base, responseFormat: "json", reasoningEffort: "low", maxOutputTokens: 768,
+    });
+
+    expect(requestedBodies[0]).not.toHaveProperty("response_format");
+    expect(requestedBodies[1]?.response_format).toEqual({ type: "json_object" });
+    expect(requestedBodies[1]).not.toHaveProperty("tools");
+    expect(requestedBodies[0]?.reasoning_effort).toBe("high");
+    expect(requestedBodies[0]).not.toHaveProperty("max_tokens");
+    expect(requestedBodies[1]?.reasoning_effort).toBe("low");
+    expect(requestedBodies[1]?.max_tokens).toBe(768);
   });
 
   it("uses high reasoning without tools for memory maintenance", async () => {
@@ -1277,14 +1318,28 @@ describe("durable bounded agent loop", () => {
     expect(executions).toBe(0);
   });
 
-  it("loads only bounded completed history from the same chat", () => {
+  it("loads bounded delivered history from the same chat", () => {
     const harness = agentHarness();
     const first = insertInbound(harness.database, harness.traces, "First", 1);
     const firstRun = harness.runs.startOrResume({ source: { kind: "inbound", inboundId: first.inboundId }, traceId: first.traceId, deadlineAtMs: Date.now() + 60_000 });
     harness.runs.complete(firstRun.id, "First answer");
+    insertEgress(harness.database, {
+      runId: firstRun.id,
+      traceId: first.traceId,
+      purpose: "reply",
+      body: "First answer",
+      state: "delivered",
+    });
     const second = insertInbound(harness.database, harness.traces, "Second", 2);
     const secondRun = harness.runs.startOrResume({ source: { kind: "inbound", inboundId: second.inboundId }, traceId: second.traceId, deadlineAtMs: Date.now() + 60_000 });
     harness.runs.complete(secondRun.id, "Second answer");
+    insertEgress(harness.database, {
+      runId: secondRun.id,
+      traceId: second.traceId,
+      purpose: "reply",
+      body: "Second answer",
+      state: "delivered",
+    });
     const current = insertInbound(harness.database, harness.traces, "Current", 3);
 
     expect(
@@ -1302,39 +1357,59 @@ describe("durable bounded agent loop", () => {
     ).toEqual([]);
   });
 
-  it("keeps retired status-action JSON out of later conversation history", () => {
+  it("keeps a request whose reply never reached the user without an assistant turn", () => {
     const harness = agentHarness();
-    const prior = insertInbound(
-      harness.database,
-      harness.traces,
-      "What accounts do I have?",
-      1,
-    );
-    const priorRun = harness.runs.startOrResume({
-      source: { kind: "inbound", inboundId: prior.inboundId },
-      traceId: prior.traceId,
+    const unknown = insertInbound(harness.database, harness.traces, "Did it save?", 1);
+    const unknownRun = harness.runs.startOrResume({
+      source: { kind: "inbound", inboundId: unknown.inboundId },
+      traceId: unknown.traceId,
       deadlineAtMs: Date.now() + 60_000,
     });
-    harness.runs.complete(
-      priorRun.id,
-      '{"action":"connection_status","message":"let me check your connected accounts for you."}',
-    );
-    const current = insertInbound(harness.database, harness.traces, "Hello again", 2);
+    harness.runs.complete(unknownRun.id, "✅ saved it.");
+    insertEgress(harness.database, {
+      runId: unknownRun.id,
+      traceId: unknown.traceId,
+      purpose: "reply",
+      body: "✅ saved it.",
+      state: "acceptance_unknown",
+    });
+    const blocked = insertInbound(harness.database, harness.traces, "And the other one?", 2);
+    const blockedRun = harness.runs.startOrResume({
+      source: { kind: "inbound", inboundId: blocked.inboundId },
+      traceId: blocked.traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    harness.runs.block(blockedRun.id, "ambiguous_write");
+    const current = insertInbound(harness.database, harness.traces, "Hello again", 3);
 
     expect(
-      new ConversationHistoryStore(harness.database.handle.db, 2, 1_024).loadBefore(
+      new ConversationHistoryStore(harness.database.handle.db, 6, 1_024).loadBefore(
         current.inboundId,
       ),
     ).toEqual([
-      { role: "user", content: "What accounts do I have?" },
-      {
-        role: "assistant",
-        content: "let me check your connected accounts for you.",
-      },
+      { role: "user", content: "Did it save?" },
+      { role: "user", content: "And the other one?" },
     ]);
   });
 
-  it("keeps fenced retired connect actions out of conversation history", () => {
+  it.each([
+    {
+      label: "a plain URL-free preface",
+      finalResponse: "here's the link to connect your google account:",
+    },
+    {
+      label: "a retired fenced connect action",
+      finalResponse: [
+        "```json",
+        "{",
+        '  "action": "connect",',
+        '  "provider": "google",',
+        `  "message": "here's the link to connect your google account:"`,
+        "}",
+        "```",
+      ].join("\n"),
+    },
+  ])("carries $label from a delivered connect link without its URL", ({ finalResponse }) => {
     const harness = agentHarness();
     const prior = insertInbound(
       harness.database,
@@ -1347,18 +1422,14 @@ describe("durable bounded agent loop", () => {
       traceId: prior.traceId,
       deadlineAtMs: Date.now() + 60_000,
     });
-    harness.runs.complete(
-      priorRun.id,
-      [
-        "```json",
-        "{",
-        '  \"action\": \"connect\",',
-        '  \"provider\": \"google\",',
-        `  "message": "here's the link to connect your google account:"`,
-        "}",
-        "```",
-      ].join("\n"),
-    );
+    harness.runs.complete(priorRun.id, finalResponse);
+    insertEgress(harness.database, {
+      runId: priorRun.id,
+      traceId: prior.traceId,
+      purpose: "recovery",
+      body: "here's the link to connect your google account:\nhttps://assistant.example/connect/google?token=secret",
+      state: "delivered",
+    });
     const current = insertInbound(harness.database, harness.traces, "Hello again", 2);
 
     expect(
@@ -1377,80 +1448,37 @@ describe("durable bounded agent loop", () => {
     ]);
   });
 
-  it("omits unfulfilled connect runs but retains fulfilled replies in later history", () => {
+  it("omits a connect run whose link was never delivered", () => {
     const harness = agentHarness();
-    const unfulfilled = insertInbound(
-      harness.database,
-      harness.traces,
-      "Connect my Google account",
-      1,
-    );
-    const unfulfilledRun = harness.runs.startOrResume({
-      source: { kind: "inbound", inboundId: unfulfilled.inboundId },
-      traceId: unfulfilled.traceId,
-      deadlineAtMs: Date.now() + 60_000,
-    });
-    const unfulfilledExecution = harness.runs.prepareTool({
-      runId: unfulfilledRun.id,
-      call: {
-        id: "unfulfilled_connect",
-        name: "connections.connect",
-        argumentsJson: '{"provider":"google"}',
-      },
-      operationClass: "read",
-      maximumToolCalls: 4,
-    });
-    harness.runs.markToolRunning(unfulfilledExecution.id);
-    harness.runs.finishTool(unfulfilledExecution.id, "succeeded", {
-      provider: "google",
-      connectionLinkWillBeAppended: true,
-    });
-    harness.runs.complete(unfulfilledRun.id, "Use evil.example/connect instead.");
-
-    const fulfilled = insertInbound(
+    const prior = insertInbound(
       harness.database,
       harness.traces,
       "Connect my Notion account",
-      2,
+      1,
     );
-    const fulfilledRun = harness.runs.startOrResume({
-      source: { kind: "inbound", inboundId: fulfilled.inboundId },
-      traceId: fulfilled.traceId,
+    const priorRun = harness.runs.startOrResume({
+      source: { kind: "inbound", inboundId: prior.inboundId },
+      traceId: prior.traceId,
       deadlineAtMs: Date.now() + 60_000,
     });
-    const fulfilledExecution = harness.runs.prepareTool({
-      runId: fulfilledRun.id,
-      call: {
-        id: "fulfilled_connect",
-        name: "connections.connect",
-        argumentsJson: '{"provider":"notion"}',
-      },
-      operationClass: "read",
-      maximumToolCalls: 4,
+    harness.runs.complete(
+      priorRun.id,
+      "here's your notion connection link:",
+    );
+    insertEgress(harness.database, {
+      runId: priorRun.id,
+      traceId: prior.traceId,
+      purpose: "recovery",
+      body: "here's your notion connection link:\nhttps://assistant.example/connect/notion?token=secret",
+      state: "acceptance_unknown",
     });
-    harness.runs.markToolRunning(fulfilledExecution.id);
-    harness.runs.finishTool(fulfilledExecution.id, "succeeded", {
-      provider: "notion",
-      connectionLinkWillBeAppended: true,
-    });
-    harness.runs.complete(fulfilledRun.id, "Open the secure link below.");
-    harness.traces.append({
-      traceId: fulfilled.traceId,
-      component: "connection_control",
-      event: "connect_fulfilled",
-      outcome: "notion",
-      runId: fulfilledRun.id,
-    });
+    const current = insertInbound(harness.database, harness.traces, "Hello again", 2);
 
-    const current = insertInbound(harness.database, harness.traces, "Hello again", 3);
     expect(
       new ConversationHistoryStore(harness.database.handle.db, 6, 1_024).loadBefore(
         current.inboundId,
       ),
-    ).toEqual([
-      { role: "user", content: "Connect my Notion account" },
-      { role: "assistant", content: "Open the secure link below." },
-    ]);
+    ).toEqual([{ role: "user", content: "Connect my Notion account" }]);
   });
 
   it("keeps unexpected provider error details out of the model transcript", async () => {
@@ -1534,6 +1562,311 @@ describe("durable bounded agent loop", () => {
       }),
     ).rejects.toMatchObject({ code: "invalid_arguments" });
     expect(executions).toBe(0);
+  });
+});
+
+describe("current-request scope", () => {
+  it("classifies only the current message with no tools", async () => {
+    const requests: ModelRequest[] = [];
+    const model = scriptedModel(
+      [
+        {
+          id: "scope_write",
+          content: '{"scope":"notion_write"}',
+          providerState: null,
+          toolCalls: [],
+          finishReason: "stop",
+          usage: emptyUsage,
+        },
+      ],
+      requests,
+    );
+
+    const scope = await classifyRequestScope({
+      model,
+      traceId: newTraceId(),
+      runId: newRunId(),
+      userMessage: "add pull day to my to-do list",
+      signal: AbortSignal.timeout(5_000),
+    });
+
+    expect(scope).toBe("notion_write");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.responseFormat).toBe("json");
+    expect(requests[0]?.tools).toEqual([]);
+    expect(requests[0]?.messages).toHaveLength(2);
+    expect(requests[0]?.messages[0]?.role).toBe("system");
+    expect(requests[0]?.messages[1]).toEqual({
+      role: "user",
+      content: "add pull day to my to-do list",
+    });
+  });
+
+  it.each([
+    { label: "an unknown scope", content: '{"scope":"admin_write"}', toolCalls: [] },
+    {
+      label: "unexpected response keys",
+      content: '{"scope":"read","tool":"notion.update_page"}',
+      toolCalls: [],
+    },
+    { label: "prose instead of JSON", content: "notion_write", toolCalls: [] },
+    {
+      label: "a tool call",
+      content: '{"scope":"read"}',
+      toolCalls: [
+        { id: "call_classify", name: "notion.update_page", argumentsJson: "{}" },
+      ],
+    },
+  ])("fails closed on $label", async ({ content, toolCalls }) => {
+    const model = scriptedModel([
+      {
+        id: "scope_invalid",
+        content,
+        providerState: null,
+        toolCalls,
+        finishReason: "stop",
+        usage: emptyUsage,
+      },
+    ]);
+
+    await expect(
+      classifyRequestScope({
+        model,
+        traceId: newTraceId(),
+        runId: newRunId(),
+        userMessage: "Hey annie",
+        signal: AbortSignal.timeout(5_000),
+      }),
+    ).rejects.toThrow();
+  });
+
+  it("grants provider writes to the write scope alone", () => {
+    const writeTools = ["notion.create_page", "notion.update_page"];
+    const scopes: readonly RequestScope[] = [
+      "conversation",
+      "read",
+      "notion_write",
+      "connect_google",
+      "connect_notion",
+    ];
+    for (const scope of scopes) {
+      expect(requestScopeTools[scope].some((name) => writeTools.includes(name))).toBe(
+        scope === "notion_write",
+      );
+    }
+    expect(requestScopeTools.conversation).toEqual([]);
+    expect(requestScopeTools.connect_google).toEqual(["connections.connect"]);
+    expect(requestScopeTools.connect_notion).toEqual(["connections.connect"]);
+  });
+
+  it("assigns a scope once and refuses to widen it later", () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(
+      harness.database,
+      harness.traces,
+      "did that save?",
+    );
+    const { job } = claimInboundJob(harness, { inboundId, traceId });
+    const run = harness.runs.startOrResume({
+      source: { kind: "inbound", inboundId },
+      traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    harness.runs.bindJob(run.id, job.id, job.leaseToken);
+    const jobLease = { jobId: job.id, leaseToken: job.leaseToken };
+
+    expect(harness.runs.getRequired(run.id).requestScope).toBeNull();
+    harness.runs.setRequestScope(run.id, "read", jobLease);
+    // A retried attempt that re-persists the same decision stays idempotent.
+    harness.runs.setRequestScope(run.id, "read", jobLease);
+
+    expect(() => harness.runs.setRequestScope(run.id, "notion_write", jobLease)).toThrow(
+      /cannot change/u,
+    );
+    expect(harness.runs.getRequired(run.id).requestScope).toBe("read");
+    const scopeEvents = harness.traces
+      .list(traceId)
+      .filter((event) => event.component === "request_scope");
+    expect(scopeEvents.length).toBeGreaterThan(0);
+    expect(
+      scopeEvents.every((event) => event.event === "assigned" && event.outcome === "read"),
+    ).toBe(true);
+  });
+
+  it("refuses a scope assignment without the active job lease", () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(
+      harness.database,
+      harness.traces,
+      "mark car wash done",
+    );
+    const { queue, job } = claimInboundJob(harness, { inboundId, traceId });
+    const run = harness.runs.startOrResume({
+      source: { kind: "inbound", inboundId },
+      traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    harness.runs.bindJob(run.id, job.id, job.leaseToken);
+
+    expect(() =>
+      harness.runs.setRequestScope(run.id, "notion_write", {
+        jobId: job.id,
+        leaseToken: `${job.leaseToken}_stale`,
+      }),
+    ).toThrow(/without the active lease/u);
+    expect(harness.runs.getRequired(run.id).requestScope).toBeNull();
+
+    queue.complete(job);
+
+    expect(() =>
+      harness.runs.setRequestScope(run.id, "notion_write", {
+        jobId: job.id,
+        leaseToken: job.leaseToken,
+      }),
+    ).toThrow(/without the active lease/u);
+    expect(harness.runs.getRequired(run.id).requestScope).toBeNull();
+  });
+
+  it("rejects a tool outside the run scope before preparing it", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Hey annie");
+    let executions = 0;
+    const registry = new ToolRegistry([
+      {
+        ...echoTool,
+        async execute() {
+          executions += 1;
+          return { ok: true };
+        },
+      },
+    ]);
+    const requests: ModelRequest[] = [];
+    const model = scriptedModel([toolResponse("unavailable_tool", "call_unavailable")], requests);
+    const loop = createAgentLoop(harness.runs, harness.writes, model, registry);
+
+    const result = await loop.execute({
+      source: { kind: "inbound", inboundId },
+      traceId,
+      initialMessages: [{ role: "user", content: "Hey annie" }],
+      allowedToolNames: [],
+    });
+
+    expect(result.outcome).toBe("bounded");
+    expect(result.run).toMatchObject({ phase: "blocked", failureCode: "tool_not_allowed" });
+    expect(requests[0]?.tools).toEqual([]);
+    expect(executions).toBe(0);
+    expect(
+      harness.database.handle.db
+        .prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM tool_executions")
+        .get()?.count,
+    ).toBe(0);
+  });
+
+  it("grants a classified run the model request its classification spent", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(
+      harness.database,
+      harness.traces,
+      "what is on my list?",
+    );
+    const { job } = claimInboundJob(harness, { inboundId, traceId });
+    const run = harness.runs.startOrResume({
+      source: { kind: "inbound", inboundId },
+      traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    harness.runs.bindJob(run.id, job.id, job.leaseToken);
+    harness.runs.setRequestScope(run.id, "read", {
+      jobId: job.id,
+      leaseToken: job.leaseToken,
+    });
+    // Classification is one counted model request on this run.
+    harness.runs.beginModelRequest(run.id, 8);
+    const model = scriptedModel([
+      toolResponse("scoped_round", "call_scoped"),
+      {
+        id: "scoped_answer",
+        content: "nothing urgent.",
+        providerState: null,
+        toolCalls: [],
+        finishReason: "stop",
+        usage: emptyUsage,
+      },
+    ]);
+    const loop = new AgentLoop({
+      model,
+      tools: new ToolRegistry([echoTool]),
+      runs: harness.runs,
+      writes: harness.writes,
+      limits: { maxToolRounds: 1, maxToolCalls: 4, maxProviderWrites: 1, maxRunMs: 60_000 },
+    });
+
+    const result = await loop.execute({
+      source: { kind: "inbound", inboundId },
+      traceId,
+      initialMessages: [{ role: "user", content: "what is on my list?" }],
+      allowedToolNames: ["test.echo"],
+    });
+
+    expect(result.outcome).toBe("completed");
+    expect(result.response).toBe("nothing urgent.");
+    expect(harness.runs.getRequired(run.id).modelRequests).toBe(3);
+  });
+
+  it("keeps the ordinary model-request budget for a run with no persisted scope", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(
+      harness.database,
+      harness.traces,
+      "what is on my list?",
+    );
+    const run = harness.runs.startOrResume({
+      source: { kind: "inbound", inboundId },
+      traceId,
+      deadlineAtMs: Date.now() + 60_000,
+    });
+    // The classification request was spent but its decision never persisted.
+    harness.runs.beginModelRequest(run.id, 8);
+    let executions = 0;
+    const registry = new ToolRegistry([
+      {
+        ...echoTool,
+        async execute() {
+          executions += 1;
+          return { ok: true };
+        },
+      },
+    ]);
+    const model = scriptedModel([
+      toolResponse("unscoped_round", "call_unscoped"),
+      {
+        id: "unscoped_answer",
+        content: "nothing urgent.",
+        providerState: null,
+        toolCalls: [],
+        finishReason: "stop",
+        usage: emptyUsage,
+      },
+    ]);
+    const loop = new AgentLoop({
+      model,
+      tools: registry,
+      runs: harness.runs,
+      writes: harness.writes,
+      limits: { maxToolRounds: 1, maxToolCalls: 4, maxProviderWrites: 1, maxRunMs: 60_000 },
+    });
+
+    const result = await loop.execute({
+      source: { kind: "inbound", inboundId },
+      traceId,
+      initialMessages: [{ role: "user", content: "what is on my list?" }],
+      allowedToolNames: ["test.echo"],
+    });
+
+    expect(result.outcome).toBe("bounded");
+    expect(result.run).toMatchObject({ phase: "blocked", failureCode: "model_request_limit" });
+    expect(executions).toBe(1);
+    expect(harness.runs.getRequired(run.id).modelRequests).toBe(2);
   });
 });
 
@@ -1634,6 +1967,36 @@ function insertInbound(
   return { inboundId, traceId };
 }
 
+function insertEgress(
+  database: TestDatabase,
+  input: {
+    runId: string;
+    traceId: TraceId;
+    purpose: "reply" | "recovery";
+    body: string;
+    state: "delivered" | "acceptance_unknown";
+  },
+): void {
+  const now = Date.now();
+  database.handle.db
+    .prepare(`
+      INSERT INTO egress_messages(
+        id, run_id, trace_id, recipient_handle, line_handle, reply_to_guid, body,
+        purpose, state, attempt_count, created_at_ms, updated_at_ms
+      ) VALUES (?, ?, ?, '+15559990000', '+15551110000', NULL, ?, ?, ?, 1, ?, ?)
+    `)
+    .run(
+      `egress_${randomUUID()}`,
+      input.runId,
+      input.traceId,
+      input.body,
+      input.purpose,
+      input.state,
+      now,
+      now,
+    );
+}
+
 function scriptedModel(
   responses: readonly ModelResponse[],
   requests: ModelRequest[] = [],
@@ -1650,6 +2013,31 @@ function scriptedModel(
       return response;
     },
   };
+}
+
+function claimInboundJob(
+  harness: { database: TestDatabase; traces: TraceStore },
+  input: { inboundId: InboundId; traceId: TraceId },
+): { queue: QueueStore; job: ClaimedJob } {
+  const queue = new QueueStore({
+    db: harness.database.handle.db,
+    traces: harness.traces,
+    leaseMs: 60_000,
+    maxPending: 32,
+  });
+  queue.enqueue({
+    chatId: "chat_test",
+    type: "inbound",
+    subjectId: input.inboundId,
+    payload: { inboundId: input.inboundId },
+    traceId: input.traceId,
+    inboundSequence: 1,
+  });
+  const job = queue.claim();
+  if (job === undefined) {
+    throw new Error("Expected a claimed inbound job");
+  }
+  return { queue, job };
 }
 
 function createAgentLoop(

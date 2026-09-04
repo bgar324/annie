@@ -91,7 +91,9 @@ export class DeepSeekChatModel implements ChatModel, MemoryMaintenanceModel {
       body: {
         model: this.#config.deepseek.model,
         messages: request.messages.map(toDeepSeekMessage),
-        reasoning_effort: this.#config.deepseek.reasoningEffort,
+        reasoning_effort: request.reasoningEffort ?? this.#config.deepseek.reasoningEffort,
+        ...(request.maxOutputTokens === undefined ? {} : { max_tokens: request.maxOutputTokens }),
+        ...(request.responseFormat === "json" ? { response_format: { type: "json_object" } } : {}),
         ...(request.tools.length === 0
           ? {}
           : {
