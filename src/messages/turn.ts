@@ -1708,13 +1708,15 @@ function responseAsksTaskClarification(
     }
     const question = normalized.slice(cueIndex, questionEnd);
     const namesSelectedTask = tokensAppearInOrder(selectedTokens, taskTokens(question));
-    const hasTaskReference =
-      /\b(?:that|this|it|one|item|task|checkbox|those|them)\b/u.test(question);
-    const hasTaskAction =
-      /\b(?:mean|intend(?:ed)?|refer(?:ring|red)?|confirm(?:ing|ed)?|mark(?:ed|ing)?|check(?:ed|ing)?|done|complete(?:d)?)\b/u.test(
-        question,
-      );
-    if (namesSelectedTask || (hasTaskReference && hasTaskAction)) {
+    const namesTaskKind = /\b(?:item|task|checkbox)\b/u.test(question);
+    const hasBareTaskReference = /\b(?:that|this|it|one|those|them)\b/u.test(question);
+    const hasTaskStateAction =
+      /\b(?:mark(?:ed|ing)?|check(?:ed|ing)?|done|complete(?:d)?)\b/u.test(question);
+    if (
+      namesSelectedTask ||
+      namesTaskKind ||
+      (hasBareTaskReference && hasTaskStateAction)
+    ) {
       return true;
     }
   }
