@@ -10,7 +10,9 @@ interface CurrentInboundRow {
 
 interface HistoryRow {
   user_text: string;
-  assistant_text: string;
+  final_response: string | null;
+  delivered_reply_body: string | null;
+  delivered_link: number;
 }
 
 export class ConversationHistoryStore {
@@ -24,6 +26,14 @@ export class ConversationHistoryStore {
     this.#maxBytes = maxBytes;
   }
 
+  /**
+   * Every earlier accepted user request stays in history: the user said it regardless of
+   * what happened afterwards. An assistant turn appears only when that run's own message
+   * reached the user, and it carries what was actually delivered. A connection request
+   * instead contributes its stored URL-free message, never the signed one-time link that
+   * was sent. A reply that failed, was blocked, or whose delivery is unknown contributes
+   * no assistant turn and no claim about why.
+   */
   loadBefore(inboundId: InboundId): readonly ModelMessage[] {
     const current = this.#db
       .prepare<{ id: string }, CurrentInboundRow>(`
@@ -35,58 +45,69 @@ export class ConversationHistoryStore {
     }
     const rows = this.#db
       .prepare<
-        { chat_id: string; sequence: number; pair_limit: number },
+        { chat_id: string; sequence: number; row_limit: number },
         HistoryRow
       >(`
-        SELECT inbound.text AS user_text, runs.final_response AS assistant_text
+        SELECT
+          inbound.text AS user_text,
+          runs.final_response AS final_response,
+          (
+            SELECT reply.body
+            FROM egress_messages AS reply
+            WHERE reply.run_id = runs.id
+              AND reply.purpose = 'reply'
+              AND reply.state = 'delivered'
+            ORDER BY reply.created_at_ms, reply.id
+            LIMIT 1
+          ) AS delivered_reply_body,
+          EXISTS (
+            SELECT 1
+            FROM egress_messages AS link
+            WHERE link.run_id = runs.id
+              AND link.purpose IN ('recovery', 'oauth_result')
+              AND link.state = 'delivered'
+          ) AS delivered_link
         FROM inbound_messages AS inbound
-        JOIN agent_runs AS runs ON runs.inbound_id = inbound.id
+        LEFT JOIN agent_runs AS runs ON runs.inbound_id = inbound.id
         WHERE inbound.chat_id = @chat_id
           AND inbound.sequence < @sequence
-          AND inbound.state = 'done'
-          AND runs.phase = 'completed'
+          AND inbound.state <> 'rejected'
           AND inbound.text IS NOT NULL
-          AND runs.final_response IS NOT NULL
-          AND (
-            NOT EXISTS (
-              SELECT 1
-              FROM tool_executions AS connect_tools
-              WHERE connect_tools.run_id = runs.id
-                AND connect_tools.tool_name = 'connections.connect'
-                AND connect_tools.status = 'succeeded'
-            )
-            OR EXISTS (
-              SELECT 1
-              FROM trace_event_spool AS connect_events
-              WHERE connect_events.trace_id = runs.trace_id
-                AND connect_events.run_id = runs.id
-                AND connect_events.component = 'connection_control'
-                AND connect_events.event = 'connect_fulfilled'
-            )
-          )
         ORDER BY inbound.sequence DESC
-        LIMIT @pair_limit
+        LIMIT @row_limit
       `)
       .all({
         chat_id: current.chat_id,
         sequence: current.sequence,
-        pair_limit: Math.floor(this.#messageLimit / 2),
+        row_limit: this.#messageLimit,
       });
 
-    const selected: HistoryRow[] = [];
+    const turns: ModelMessage[][] = [];
     let bytes = 0;
+    let messages = 0;
     for (const row of rows) {
-      const assistantText = assistantHistoryText(row.assistant_text);
-      const pairBytes = Buffer.byteLength(row.user_text) + Buffer.byteLength(assistantText);
-      if (bytes + pairBytes > this.#maxBytes) {
+      const turn: ModelMessage[] = [{ role: "user", content: row.user_text }];
+      if (row.final_response !== null) {
+        const deliveredText =
+          row.delivered_reply_body ??
+          (row.delivered_link === 1 ? row.final_response : null);
+        const assistantText =
+          deliveredText === null ? null : assistantHistoryText(deliveredText);
+        if (assistantText !== null) {
+          turn.push({ role: "assistant", content: assistantText });
+        }
+      }
+      const turnBytes = turn.reduce(
+        (total, message) => total + Buffer.byteLength(message.content),
+        0,
+      );
+      if (bytes + turnBytes > this.#maxBytes || messages + turn.length > this.#messageLimit) {
         break;
       }
-      selected.push({ ...row, assistant_text: assistantText });
-      bytes += pairBytes;
+      turns.push(turn);
+      bytes += turnBytes;
+      messages += turn.length;
     }
-    return selected.reverse().flatMap((row) => [
-      { role: "user" as const, content: row.user_text },
-      { role: "assistant" as const, content: row.assistant_text },
-    ]);
+    return turns.reverse().flat();
   }
 }

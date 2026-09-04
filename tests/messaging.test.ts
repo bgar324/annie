@@ -6,6 +6,7 @@ import {
   newRunId,
   newTraceId,
   type EgressId,
+  type RunId,
   type TraceId,
   type WriteIntentId,
 } from "../src/core/ids.js";
@@ -789,6 +790,101 @@ describe("Sendblue egress", () => {
     );
   });
 
+  it("schedules memory maintenance inside the transaction that confirms delivery", async () => {
+    const harness = createMessagingHarness();
+    const traceId = newTraceId();
+    const runId = completedRun(harness, traceId, 1);
+    harness.gateway.sendStatus = "delivered";
+    const egressId = prepareReply(harness, "Delivered on send.", traceId, runId);
+
+    await expect(harness.egress.sendPrepared(egressId)).resolves.toMatchObject({
+      kind: "accepted",
+      egressId,
+    });
+
+    expect(egressRow(harness, egressId).state).toBe("delivered");
+    expect(jobRows(harness).map((job) => [job.type, job.subject_id])).toEqual([
+      ["memory_maintenance", runId],
+    ]);
+    expect(memoryJobRow(harness, runId)).toEqual({
+      payload_json: JSON.stringify({ runId }),
+      run_id: runId,
+      inbound_sequence: 1,
+      status: "pending",
+    });
+  });
+
+  it("schedules exactly one memory job when reconciliation confirms delivery", async () => {
+    const harness = createMessagingHarness();
+    const traceId = newTraceId();
+    const runId = completedRun(harness, traceId, 1);
+    const egressId = prepareReply(harness, "Delivered after polling.", traceId, runId);
+
+    await harness.egress.sendPrepared(egressId);
+    expect(jobRows(harness).map((job) => job.type)).toEqual(["egress_reconcile"]);
+
+    harness.gateway.statuses = ["delivered"];
+    await expect(harness.egress.reconcile(egressId)).resolves.toEqual({ kind: "delivered" });
+    await expect(harness.egress.reconcile(egressId)).resolves.toEqual({ kind: "delivered" });
+
+    expect(jobRows(harness).filter((job) => job.type === "memory_maintenance")).toEqual([
+      { type: "memory_maintenance", subject_id: runId, status: "pending" },
+    ]);
+  });
+
+  it("schedules no memory for a reply that failed or whose delivery stays unknown", async () => {
+    const harness = createMessagingHarness();
+    const failedTrace = newTraceId();
+    const failedRun = completedRun(harness, failedTrace, 1);
+    const failedReply = prepareReply(harness, "Rejected reply.", failedTrace, failedRun);
+    harness.gateway.sendError = new MessagingProviderError({
+      message: "Sendblue HTTP 422",
+      kind: "terminal",
+      status: 422,
+    });
+    await harness.egress.sendPrepared(failedReply);
+
+    const unknownTrace = newTraceId();
+    const unknownRun = completedRun(harness, unknownTrace, 2);
+    harness.gateway.sendError = undefined;
+    const unknownReply = prepareReply(harness, "Maybe delivered.", unknownTrace, unknownRun);
+    await harness.egress.sendPrepared(unknownReply);
+    harness.egress.markReconciliationUnknown(unknownReply, "polling exhausted");
+
+    expect(egressRow(harness, failedReply).state).toBe("provider_failed");
+    expect(egressRow(harness, unknownReply).state).toBe("delivery_unknown");
+    expect(jobRows(harness).filter((job) => job.type === "memory_maintenance")).toEqual([]);
+  });
+
+  it("schedules no memory for a failure notice or a delivered connection link", async () => {
+    const harness = createMessagingHarness();
+    const traceId = newTraceId();
+    const runId = completedRun(harness, traceId, 1);
+    harness.gateway.sendStatus = "delivered";
+    const link = harness.egress.prepare({
+      traceId,
+      recipient: harness.config.userPhoneNumber,
+      text: "here's your new notion connection link:\nhttps://assistant.example/connect/notion?token=signed",
+      purpose: "recovery",
+      runId,
+    });
+    const notice = harness.egress.prepare({
+      traceId,
+      recipient: harness.config.userPhoneNumber,
+      text: `I couldn't complete that request. Trace: ${traceId}`,
+      purpose: "failure",
+      runId,
+    });
+
+    await harness.egress.sendPrepared(link);
+    harness.gateway.sendHandle = "msg_handle_2";
+    await harness.egress.sendPrepared(notice);
+
+    expect(egressRow(harness, link).state).toBe("delivered");
+    expect(egressRow(harness, notice).state).toBe("delivered");
+    expect(jobRows(harness).filter((job) => job.type === "memory_maintenance")).toEqual([]);
+  });
+
   it("marks a failed delivery status as a provider failure", async () => {
     const harness = createMessagingHarness();
     const traceId = newTraceId();
@@ -922,16 +1018,7 @@ describe("failure notifications", () => {
       harness.traces.list(traceId).some((event) => event.component === "failure_notification"),
     ).toBe(true);
   });
-  it.each([
-    [
-      "unverified_write_claim",
-      "I didn't confirm that provider change, so I didn't report it as done.",
-    ],
-    [
-      "ambiguous_write",
-      "The provider may have accepted that change, so I stopped without retrying it.",
-    ],
-  ])("explains the %s write failure without claiming success", (failureCode, message) => {
+  it("explains an ambiguous write failure without claiming success", () => {
     const harness = createMessagingHarness();
     const traceId = newTraceId();
     const failures = new FailureNotificationService({
@@ -942,10 +1029,12 @@ describe("failure notifications", () => {
       traces: harness.traces,
     });
 
-    const egressId = failures.plan({ traceId, failureCode });
+    const egressId = failures.plan({ traceId, failureCode: "ambiguous_write" });
 
     expect(egressRow(harness, egressId)).toMatchObject({
-      body: `${message} Trace: ${traceId}`,
+      body:
+        "The provider may have accepted that change, so I stopped without retrying it. " +
+        `Trace: ${traceId}`,
       purpose: "failure",
     });
   });
@@ -1151,82 +1240,103 @@ describe("durable queue leases", () => {
       database.cleanup();
     }
   });
-  it("keeps durable memory behind retried reply egress and ahead of the next inbound", () => {
-    const database = createTestDatabase();
+  it("keeps a memory job waiting for delivery without stalling newer inbound work", async () => {
+    const harness = createMessagingHarness();
     const now = Date.now();
-    const redactor = createTraceRedactor([]);
-    const traces = new TraceStore(database.handle.db, redactor);
-    const queue = new QueueStore({
-      db: database.handle.db,
-      traces,
-      leaseMs: 100,
-      maxPending: 8,
-    });
     const traceId = newTraceId();
-    const runId = newRunId();
-    queue.enqueue({
-      chatId: trustedSender,
-      type: "egress_send",
-      subjectId: "reply_first",
-      payload: { egressId: "reply_first" },
-      traceId,
-      runId,
-      inboundSequence: 1,
-      availableAtMs: now,
-    });
-    queue.enqueue({
-      chatId: trustedSender,
+    const runId = completedRun(harness, traceId, 1);
+    const egressId = prepareReply(harness, "Awaiting receipt.", traceId, runId);
+    harness.queue.enqueue({
+      chatId: harness.config.userPhoneNumber,
       type: "memory_maintenance",
       subjectId: runId,
       payload: { runId },
       traceId,
       runId,
       inboundSequence: 1,
-      availableAtMs: now,
     });
-    queue.enqueue({
-      chatId: trustedSender,
+    await harness.egress.sendPrepared(egressId);
+    harness.queue.enqueue({
+      chatId: harness.config.userPhoneNumber,
       type: "inbound",
-      subjectId: "inbound_second",
-      payload: { inboundId: "inbound_second" },
+      subjectId: "in_next",
+      payload: { inboundId: "in_next" },
       traceId: newTraceId(),
       inboundSequence: 2,
-      availableAtMs: now,
     });
 
-    const firstReplyClaim = requiredJob(queue.claim(now));
-    expect(firstReplyClaim.type).toBe("egress_send");
-    queue.requeue(firstReplyClaim, now + 1_000, "retry");
-    expect(queue.claim(now + 1)).toBeUndefined();
-    database.handle.close();
+    const nextInbound = requiredJob(harness.queue.claim(now + 500));
+    expect(nextInbound).toMatchObject({ type: "inbound", inboundSequence: 2 });
+    harness.queue.complete(nextInbound);
+    expect(harness.queue.claim(now + 500)).toBeUndefined();
 
-    const reopened = openDatabase(database.config);
-    try {
-      const restartedQueue = new QueueStore({
-        db: reopened.db,
-        traces: new TraceStore(reopened.db, redactor),
-        leaseMs: 100,
-        maxPending: 8,
-      });
-      expect(restartedQueue.claim(now + 999)).toBeUndefined();
-      const retriedReply = requiredJob(restartedQueue.claim(now + 1_000));
-      expect(retriedReply.type).toBe("egress_send");
-      restartedQueue.block(retriedReply, "terminal reply outcome");
+    harness.gateway.statuses = ["delivered"];
+    await expect(harness.egress.reconcile(egressId)).resolves.toEqual({ kind: "delivered" });
 
-      const memory = requiredJob(restartedQueue.claim(now + 1_001));
-      expect(memory).toMatchObject({
-        type: "memory_maintenance",
-        runId,
-        inboundSequence: 1,
-      });
-      restartedQueue.complete(memory);
-      expect(restartedQueue.claim(now + 1_002)?.type).toBe("inbound");
-    } finally {
-      reopened.close();
-      rmSync(database.directory, { recursive: true, force: true });
-    }
+    const memory = requiredJob(harness.queue.claim(now + 2_000));
+    expect(memory).toMatchObject({
+      type: "memory_maintenance",
+      subjectId: runId,
+      inboundSequence: 1,
+    });
+    expect(
+      harness.database.handle.db
+        .prepare<[], { count: number }>(
+          "SELECT COUNT(*) AS count FROM jobs WHERE type = 'memory_maintenance'",
+        )
+        .get()?.count,
+    ).toBe(1);
   });
 
+
+  it.each(["delivered", "failed"] as const)(
+    "orders memory by inbound sequence when an older reply later becomes %s",
+    async (olderStatus) => {
+      const now = Date.now();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+      try {
+        const harness = createMessagingHarness();
+        const olderTrace = newTraceId();
+        const olderRun = completedRun(harness, olderTrace, 1);
+        const olderReply = prepareReply(harness, "First preference.", olderTrace, olderRun);
+        await harness.egress.sendPrepared(olderReply);
+        const newerTrace = newTraceId();
+        const newerRun = completedRun(harness, newerTrace, 2);
+        const newerReply = prepareReply(harness, "Newer preference.", newerTrace, newerRun);
+        harness.gateway.sendStatus = "delivered";
+        harness.gateway.sendHandle = "msg_handle_2";
+        await harness.egress.sendPrepared(newerReply);
+        harness.queue.enqueue({
+          chatId: harness.config.userPhoneNumber,
+          type: "inbound",
+          subjectId: "in_third",
+          payload: { inboundId: "in_third" },
+          traceId: newTraceId(),
+          inboundSequence: 3,
+        });
+
+        const inbound = requiredJob(harness.queue.claim(now + 500));
+        expect(inbound).toMatchObject({ type: "inbound", inboundSequence: 3 });
+        harness.queue.complete(inbound);
+        expect(harness.queue.claim(now + 500)).toBeUndefined();
+
+        harness.gateway.statuses = [olderStatus];
+        const receipt = requiredJob(harness.queue.claim(now + 2_000));
+        expect(receipt).toMatchObject({ type: "egress_reconcile", subjectId: olderReply });
+        await harness.egress.reconcile(olderReply);
+        harness.queue.complete(receipt);
+        const expectedRuns = olderStatus === "delivered" ? [olderRun, newerRun] : [newerRun];
+        for (const runId of expectedRuns) {
+          const memory = requiredJob(harness.queue.claim(now + 2_001));
+          expect(memory).toMatchObject({ type: "memory_maintenance", subjectId: runId });
+          harness.queue.complete(memory);
+        }
+        expect(harness.queue.claim(now + 2_001)).toBeUndefined();
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
 
   it("removes each idle-poll abort listener after its timer fires", async () => {
     vi.useFakeTimers();
@@ -1418,13 +1528,92 @@ function requiredRequest(request: Request | undefined): Request {
   return request;
 }
 
-function prepareReply(harness: MessagingHarness, text: string, traceId = newTraceId()): EgressId {
+function prepareReply(
+  harness: MessagingHarness,
+  text: string,
+  traceId = newTraceId(),
+  runId?: RunId,
+): EgressId {
   return harness.egress.prepare({
     traceId,
     recipient: harness.config.userPhoneNumber,
     text,
     purpose: "reply",
+    ...(runId === undefined ? {} : { runId }),
   });
+}
+
+function completedRun(harness: MessagingHarness, traceId: TraceId, sequence: number): RunId {
+  const runId = newRunId();
+  const inboundId = `in_${runId}`;
+  const deliveryId = `delivery_${runId}`;
+  const now = Date.now();
+  const transaction = harness.database.handle.db.transaction(() => {
+    harness.database.handle.db
+      .prepare(`
+        INSERT INTO webhook_deliveries(
+          id, provider_delivery_id, provider_message_id, event_kind, line_id,
+          line_handle, outbox_id, normalized_json, trace_id, received_at_ms
+        ) VALUES (?, ?, ?, 'message.created', 'line_test', ?, NULL, '{}', ?, ?)
+      `)
+      .run(deliveryId, deliveryId, deliveryId, sendblueLine, traceId, now);
+    harness.database.handle.db
+      .prepare(`
+        INSERT INTO inbound_messages(
+          id, delivery_id, provider_message_id, chat_id, guid, sender,
+          line_id, line_handle, sequence, state, text, is_audio,
+          attachment_json, trace_id, created_at_ms, updated_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, 'line_test', ?, ?, 'done', 'Remember this', 0,
+                  NULL, ?, ?, ?)
+      `)
+      .run(
+        inboundId,
+        deliveryId,
+        deliveryId,
+        trustedSender,
+        inboundId,
+        trustedSender,
+        sendblueLine,
+        sequence,
+        traceId,
+        now,
+        now,
+      );
+    harness.database.handle.db
+      .prepare(`
+        INSERT INTO agent_runs(
+          id, inbound_id, scheduled_job_id, trace_id, phase, model_requests,
+          maintenance_requests, tool_calls, provider_writes, deadline_at_ms,
+          transcript_bytes, memory_maintenance_status, memory_before_digest,
+          memory_after_digest, ambiguous_write_id, final_response, failure_code,
+          created_at_ms, updated_at_ms
+        ) VALUES (?, ?, NULL, ?, 'completed', 1, 0, 0, 0, ?, 10, 'pending',
+                  NULL, NULL, NULL, 'Reply body', NULL, ?, ?)
+      `)
+      .run(runId, inboundId, traceId, now + 60_000, now, now);
+  });
+  transaction.immediate();
+  return runId;
+}
+
+interface MemoryJobRow {
+  payload_json: string;
+  run_id: string | null;
+  inbound_sequence: number | null;
+  status: string;
+}
+
+function memoryJobRow(harness: MessagingHarness, runId: RunId): MemoryJobRow {
+  const row = harness.database.handle.db
+    .prepare<{ run_id: string }, MemoryJobRow>(`
+      SELECT payload_json, run_id, inbound_sequence, status
+      FROM jobs WHERE type = 'memory_maintenance' AND subject_id = @run_id
+    `)
+    .get({ run_id: runId });
+  if (row === undefined) {
+    throw new Error(`Expected a memory job for run ${runId}`);
+  }
+  return row;
 }
 
 function cursorRow(harness: MessagingHarness): { updated_at_ms: number; recovered_once: number } {

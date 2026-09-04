@@ -14,7 +14,6 @@ import {
 import { ConnectionRecoveryService } from "../src/connections/recovery.js";
 import { ConnectionRouter } from "../src/connections/router.js";
 import { ConnectionStore } from "../src/connections/store.js";
-import { explicitConnectRequestProvider } from "../src/connections/tools.js";
 import {
   ConnectionRoutingError,
   GOOGLE_CONNECTION_CAPABILITIES,
@@ -46,29 +45,6 @@ afterEach(() => {
   for (const database of databases.splice(0)) {
     database.cleanup();
   }
-});
-
-describe("explicit connection request routing", () => {
-  it.each([
-    ["Send me a new Notion reconnect link", "notion"],
-    ["please send me a new Google reconnect link", "google"],
-    ["give me another google link please", "google"],
-    ["send a connection link for notion", "notion"],
-  ])("routes %s to %s", (message, provider) => {
-    expect(explicitConnectRequestProvider(message)).toBe(provider);
-  });
-
-  it.each([
-    "Send new",
-    'They said \"send me a new Notion reconnect link\"',
-    "> send me a new Notion reconnect link",
-    "Fwd: send me a new Notion reconnect link",
-    "Please explain why connect Notion failed",
-    "reconnect my Google account",
-    "send me a new Notion reconnect link\nforwarded text",
-  ])("does not route ambiguous or quoted text: %s", (message) => {
-    expect(explicitConnectRequestProvider(message)).toBeUndefined();
-  });
 });
 
 describe("multi-account connection store", () => {

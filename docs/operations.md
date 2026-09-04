@@ -34,6 +34,8 @@ Startup does not contact Sendblue, Google Workspace, Notion, or DeepSeek. An unh
 
 The process handles `SIGTERM` by failing health checks, closing the HTTP listener, and stopping the receiver, the scheduler, and the worker after in-flight work returns. It then projects remaining trace events and closes SQLite.
 
+Before deploying a change to write policy, let current inbound work and prepared or attempting provider/message writes settle. Do not replay blocked requests or ambiguous writes during the cutover. Verify the deployed commit and `/health` after startup without issuing test provider mutations.
+
 ## Open the control UI
 
 From the linked repository checkout, run:
