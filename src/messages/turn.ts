@@ -1526,7 +1526,13 @@ function taskCheckboxCallMatches(
 }
 
 function taskLabelMatches(targetTokens: readonly string[], text: string): boolean {
-  const labelTokens = taskLabelTokens(text);
+  return taskLabelTokenMatches(targetTokens, taskLabelTokens(text));
+}
+
+function taskLabelTokenMatches(
+  targetTokens: readonly string[],
+  labelTokens: readonly string[],
+): boolean {
   if (sameTokens(targetTokens, labelTokens)) {
     return true;
   }
@@ -1650,8 +1656,8 @@ function checkboxNoOpIsProved(
   authorization: Extract<ProviderWriteAuthorization, { kind: "notion_task_checkbox" }>,
   response: string,
 ): boolean {
-  const authorizedStates = taskCheckboxStates(text, (_labelTokens, line) =>
-    taskLabelMatches(authorization.targetTokens, line),
+  const authorizedStates = taskCheckboxStates(text, (labelTokens) =>
+    taskLabelTokenMatches(authorization.targetTokens, labelTokens),
   );
   if (authorizedStates.length === 1 && authorizedStates[0] === authorization.checked) {
     return true;
@@ -1672,7 +1678,7 @@ function checkboxNoOpIsProved(
   const relatedCount = taskCheckboxStates(text, (labelTokens) =>
     tokensAppearInOrder(authorization.targetTokens, labelTokens),
   ).length;
-  return relatedCount <= 1 || response.includes("?");
+  return relatedCount <= 1 || responseAsksTaskClarification(response);
 }
 
 function quotedAlreadySetTaskTokens(
@@ -1691,9 +1697,13 @@ function quotedAlreadySetTaskTokens(
   return tokens.length === 0 ? undefined : tokens;
 }
 
+function responseAsksTaskClarification(response: string): boolean {
+  return /\b(?:did you mean|which|want me|were you)\b[^?]*\?/iu.test(response);
+}
+
 function taskCheckboxStates(
   text: string,
-  matches: (labelTokens: readonly string[], line: string) => boolean,
+  matches: (labelTokens: readonly string[]) => boolean,
 ): readonly boolean[] {
   const states: boolean[] = [];
   for (const line of text.split(/\r?\n/u)) {
@@ -1703,7 +1713,7 @@ function taskCheckboxStates(
       continue;
     }
     const labelTokens = taskLabelTokens(line);
-    if (matches(labelTokens, line)) {
+    if (matches(labelTokens)) {
       states.push(state.toLowerCase() === "x");
     }
   }

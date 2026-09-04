@@ -1081,70 +1081,145 @@ describe("production runtime", () => {
     ]);
   });
 
+  const exactCheckboxNoOpResponse =
+    "The requested checkbox is already checked off, so no change was needed.";
+  const productionCheckboxClarification = [
+    "🧐 checked the page:",
+    "",
+    '› "clean and organize room" is already checked off on day 91\'s list — so that one\'s good, no change needed',
+    "",
+    "📋 ben's to-do's for day 91 now:",
+    "› [x] everything done except pull day and car wash",
+    "",
+    '👀 heads up: there are still unchecked "organize and clean room" items on day 90 (wed sep 2) and day 89 (tue sep 1) — want me to mark one of those done instead, or were you just confirming today\'s?',
+  ].join("\n");
+
   it.each([
     {
-      label: "one matching checked item",
+      label: "one unique exact task already checked",
       selectedLines: ["- [x] Clean and organize room"],
-      responsePrefix: "",
-      request: "Can you mark clean room done?",
+      relatedLines: [],
+      response: exactCheckboxNoOpResponse,
+      request: "Mark clean and organize room done",
       secondWorkspace: false,
+      fetchTruncated: false,
       expectedState: "done",
       expectedPurpose: "reply",
     },
     {
-      label: "one matching unchecked item",
+      label: "one unique exact task still unchecked",
       selectedLines: ["- [ ] Clean and organize room"],
-      responsePrefix: "",
-      request: "Can you mark clean room done?",
+      relatedLines: [],
+      response: exactCheckboxNoOpResponse,
+      request: "Mark clean and organize room done",
       secondWorkspace: false,
+      fetchTruncated: false,
       expectedState: "blocked",
       expectedPurpose: "failure",
     },
     {
-      label: "duplicate matching checked items",
+      label: "duplicate exact checked tasks",
       selectedLines: [
         "- [x] Clean and organize room",
         "- [x] Clean and organize room",
       ],
-      responsePrefix: "",
-      request: "Can you mark clean room done?",
+      relatedLines: [],
+      response: exactCheckboxNoOpResponse,
+      request: "Mark clean and organize room done",
       secondWorkspace: false,
+      fetchTruncated: false,
       expectedState: "blocked",
       expectedPurpose: "failure",
     },
     {
       label: "a first-person checked claim",
       selectedLines: ["- [x] Clean and organize room"],
-      responsePrefix: "I checked it. ",
+      relatedLines: [],
+      response: `I checked it. ${exactCheckboxNoOpResponse}`,
+      request: "Mark clean and organize room done",
+      secondWorkspace: false,
+      fetchTruncated: false,
+      expectedState: "blocked",
+      expectedPurpose: "failure",
+    },
+    {
+      label: "the production shorthand clarification",
+      selectedLines: ["- [x] Clean and organize room"],
+      relatedLines: [
+        "## Day 89",
+        "- [ ] Organize and clean room",
+        "## Day 90",
+        "- [ ] Organize and clean room",
+      ],
+      response: productionCheckboxClarification,
       request: "Can you mark clean room done?",
       secondWorkspace: false,
+      fetchTruncated: false,
+      expectedState: "done",
+      expectedPurpose: "reply",
+    },
+    {
+      label: "ambiguous shorthand without a clarification question",
+      selectedLines: ["- [x] Clean and organize room"],
+      relatedLines: [
+        "## Day 89",
+        "- [ ] Organize and clean room",
+        "## Day 90",
+        "- [ ] Organize and clean room",
+      ],
+      response: productionCheckboxClarification.replace(/\?$/u, "."),
+      request: "Can you mark clean room done?",
+      secondWorkspace: false,
+      fetchTruncated: false,
+      expectedState: "blocked",
+      expectedPurpose: "failure",
+    },
+    {
+      label: "the production response with an incomplete fetch",
+      selectedLines: ["- [x] Clean and organize room"],
+      relatedLines: [
+        "## Day 89",
+        "- [ ] Organize and clean room",
+        "## Day 90",
+        "- [ ] Organize and clean room",
+      ],
+      response: productionCheckboxClarification,
+      request: "Can you mark clean room done?",
+      secondWorkspace: false,
+      fetchTruncated: true,
       expectedState: "blocked",
       expectedPurpose: "failure",
     },
     {
       label: "an explicit matching workspace among two",
       selectedLines: ["- [x] Clean and organize room"],
-      responsePrefix: "",
-      request: "Can you mark clean room done in Notion workspace Work",
+      relatedLines: [],
+      response: exactCheckboxNoOpResponse,
+      request: "Mark clean and organize room done in Notion workspace Work",
       secondWorkspace: true,
+      fetchTruncated: false,
       expectedState: "done",
       expectedPurpose: "reply",
     },
     {
       label: "an explicit mismatched workspace",
       selectedLines: ["- [x] Clean and organize room"],
-      responsePrefix: "",
-      request: "Can you mark clean room done in Notion workspace Personal",
+      relatedLines: [],
+      response: exactCheckboxNoOpResponse,
+      request: "Mark clean and organize room done in Notion workspace Personal",
       secondWorkspace: true,
+      fetchTruncated: false,
       expectedState: "blocked",
       expectedPurpose: "failure",
     },
     {
       label: "multiple eligible workspaces without explicit scope",
       selectedLines: ["- [x] Clean and organize room"],
-      responsePrefix: "",
-      request: "Can you mark clean room done?",
+      relatedLines: [],
+      response: exactCheckboxNoOpResponse,
+      request: "Mark clean and organize room done",
       secondWorkspace: true,
+      fetchTruncated: false,
       expectedState: "blocked",
       expectedPurpose: "failure",
     },
@@ -1152,19 +1227,15 @@ describe("production runtime", () => {
     "requires $label for a read-only no-op",
     async ({
       selectedLines,
-      responsePrefix,
+      relatedLines,
+      response,
       request,
       secondWorkspace,
+      fetchTruncated,
       expectedState,
       expectedPurpose,
     }) => {
-      const response = `${responsePrefix}🧐 checked the page: "clean and organize room" is already checked off, so no change was needed. did you mean the older "organize and clean room" item?`;
-      const fetchedPage = [
-        "## Day 90",
-        "- [ ] Organize and clean room",
-        "## Day 91",
-        ...selectedLines,
-      ].join("\n");
+      const fetchedPage = [...relatedLines, "## Day 91", ...selectedLines].join("\n");
       const target = {
         id: "page_1",
         title: "Jadyn and Ben’s TO-DO’s!!!",
@@ -1197,15 +1268,16 @@ describe("production runtime", () => {
           name: "notion.fetch",
           argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
         }),
-        finalModelResponse("noop_response", response),
       );
+      model.responses.push(finalModelResponse("noop_response", response));
       const notionClients = new FakeNotionClients(
         false,
         fetchedPage,
         broadResults,
         false,
         {
-          omitReadTruncationFlags: true,
+          omitReadTruncationFlags: !fetchTruncated,
+          fetchTruncated,
           pageScopedSearchResults: [target],
           structuredFetch: true,
         },
@@ -1223,6 +1295,13 @@ describe("production runtime", () => {
 
       expect(inboundState(item.runtime)).toBe(expectedState);
       expect(notionClients.writes).toHaveLength(0);
+      expect(
+        item.runtime.database.db
+          .prepare<[], { count: number }>(
+            "SELECT COUNT(*) AS count FROM tool_executions WHERE operation_class = 'write'",
+          )
+          .get()?.count,
+      ).toBe(0);
       expect(
         item.runtime.database.db
           .prepare<[], { body: string; purpose: string }>(
