@@ -161,8 +161,9 @@ The signed token contains a random identifier, provider, issue time, and expiry.
 Connection and callback routes suppress request logging, disable caching, and set a no-referrer policy so signed query values and OAuth codes do not enter routine logs or browser referrers.
 
 ## Provider writes and ambiguous acceptance
-Inbound writes are fail-closed before tool preparation. The current raw user message must identify the write action, and the proposed tool arguments must stay within it. A task-completion request authorizes one matching checkbox-marker transition only; it cannot authorize page creation, another similarly named task, `replace_all`, or bundled cleanup edits. A final response may claim a provider change only when the same run has a succeeded tool execution backed by a succeeded write intent.
-Conversation history contains past user text and final replies, not historical tool calls or results, so past success wording is never evidence for a current mutation. A Notion task update must also be anchored by a same-run fetch of the exact page and exact non-truncated source text. Repeated task text requires a uniquely matching contextual excerpt.
+Inbound writes fail closed before tool preparation. The current raw user message must identify the write action and its target. The proposed tool arguments must stay within both. A task-completion request authorizes one matching checkbox-marker transition only. It cannot authorize page creation, a different task label, `replace_all`, or bundled edits. A final response may claim a provider change only when the same run has a succeeded tool execution backed by a succeeded write intent.
+
+Every Notion update starts from a successful, non-truncated same-run `notion.search` result, then fetches the same page from the same workspace. Property updates, full-content replacements, and text replacements require an exact page title in the current request. That title must resolve to one page in the complete search results. A checkbox request can omit the page title when the fetched text contains one matching task label. A contextual replacement can distinguish repeated copies of that same label, but it must change exactly one checkbox marker. Exact-text replacements require the exact, non-truncated source text.
 
 One parsed authorization binds one provider-write tool call. A crash recovery may resume that same tool-call ID, but a second write call needs a new inbound request. An explicit Notion workspace must use the exact `in Notion workspace <safe label>` suffix and must match the tool argument. If an unscoped write has multiple eligible workspaces, the only no-write completion allowed is a pre-intent clarification that lists every eligible safe label and asks the user to repeat the full request with that suffix.
 
@@ -173,7 +174,7 @@ Every provider mutation follows a write-intent state machine:
 2. Verify the active job lease and connection credential generation.
 3. Persist `attempting` before the network call.
 4. Persist `succeeded`, `confirmed_failed`, or `ambiguous` after the result.
-For Notion updates, a non-error MCP envelope is not sufficient evidence of acceptance. The adapter also requires the returned provider payload to acknowledge the same page ID; missing, truncated, or mismatched acknowledgements remain acceptance-unknown.
+For Notion updates, a non-error MCP envelope does not prove acceptance. The adapter requires an explicit `truncated: false` and a returned page identity. Every returned `id` or `page_id` must equal the requested page ID. Missing, truncated, contradictory, or mismatched acknowledgements remain acceptance-unknown.
 
 
 If the process stops while a write is `attempting`, startup changes it to `ambiguous`. The service never automatically repeats an ambiguous write. The related agent run blocks and reports its trace ID.

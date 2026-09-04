@@ -143,6 +143,7 @@ const notionUpdateResponseSchema = z
   .object({
     id: z.string().min(1).max(2_048).optional(),
     page_id: z.string().min(1).max(2_048).optional(),
+    truncated: z.boolean(),
   })
   .loose()
   .refine((value) => value.id !== undefined || value.page_id !== undefined);
@@ -176,7 +177,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.search",
-          description: "Search internal content in one connected Notion workspace. For automatic multi-account reads, call once per exact safe label in connected account status.",
+          description: "Search internal content in one connected Notion workspace. For automatic multi-account reads, call once per exact safe label in connected account status. A truncated result cannot establish an update target; narrow the query and search again.",
           parameters: {
             type: "object",
             properties: {
@@ -268,7 +269,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.update_page",
-          description: "Narrowly update Notion page properties or text content. Text alone does not update it. Moving, deleting, and archiving are unavailable.",
+          description: "Update only a Notion page returned by a non-truncated notion.search and then fetched in this run, reusing its exact workspace label. Property, full-content, and text replacements require the current request to name the page; checkbox requests may instead name one unambiguous task. One replacement may include unchanged context, but a checkbox request must change exactly one marker. Text alone does not update it. Moving, deleting, and archiving are unavailable.",
           parameters: {
             type: "object",
             properties: {
@@ -307,7 +308,7 @@ export class NotionToolService {
                 },
               },
             },
-            required: ["pageId", "command"],
+            required: ["workspace", "pageId", "command"],
             allOf: [
               {
                 if: { properties: { command: { const: "update_properties" } } },
@@ -587,11 +588,14 @@ function normalizeNotionResult(
     const request = notionUpdateRequestSchema.parse(argumentsValue);
     const payload = normalizedNotionPayload(envelope);
     const response = notionUpdateResponseSchema.parse(payload.value);
-    const pageId = response.id ?? response.page_id;
-    if (payload.truncated || pageId !== request.page_id) {
+    if (
+      payload.truncated ||
+      (response.id !== undefined && response.id !== request.page_id) ||
+      (response.page_id !== undefined && response.page_id !== request.page_id)
+    ) {
       throw new NotionToolResultError();
     }
-    return { pageId, updated: true };
+    return { pageId: request.page_id, updated: true };
   }
 
   const payload = normalizedNotionPayload(envelope);
@@ -611,6 +615,7 @@ function normalizeNotionResult(
           : { highlight: result.highlight ?? result.text_snippet }),
         ...(result.timestamp === undefined ? {} : { timestamp: result.timestamp }),
       })),
+      truncated: payload.truncated,
     };
   }
   if (name === "notion-fetch") {
@@ -670,13 +675,11 @@ function normalizedNotionPayload(
 }
 
 function notionPayloadTruncated(value: unknown): boolean {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    Array.isArray(value) ||
-    !("truncated" in value)
-  ) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return false;
+  }
+  if (!("truncated" in value)) {
+    return true;
   }
   return z.boolean().parse(value.truncated);
 }

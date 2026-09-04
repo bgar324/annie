@@ -40,7 +40,8 @@ export class FailureNotificationService {
   }
 
   planInTransaction(input: FailurePlanInput): EgressId {
-    return this.#planInTransaction(input);
+    const existing = this.#findExisting(input.traceId);
+    return existing ?? this.#prepareInTransaction(input);
   }
 
   replaceSuppressedReplyInTransaction(
@@ -68,17 +69,11 @@ export class FailureNotificationService {
     if (suppressed === undefined) {
       throw new Error(`Reply ${suppressedReplyId} was not safely suppressed`);
     }
-    return this.#planInTransaction(input, suppressedReplyId);
+    const existing = this.#findExisting(input.traceId, suppressedReplyId);
+    return existing ?? this.#prepareInTransaction(input);
   }
 
-  #planInTransaction(
-    input: FailurePlanInput,
-    ignoredEgressId?: EgressId,
-  ): EgressId {
-    const existing = this.#findExisting(input.traceId, ignoredEgressId);
-    if (existing !== undefined) {
-      return existing;
-    }
+  #prepareInTransaction(input: FailurePlanInput): EgressId {
     const egressId = this.#egress.prepareInTransaction({
       traceId: input.traceId,
       recipient: this.#recipient,

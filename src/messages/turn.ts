@@ -28,13 +28,19 @@ type ProviderWriteAuthorization =
       kind: "notion_update_property";
       property: string;
       value: string;
+      pageTitle: string;
     })
-  | (ProviderWriteScope & { kind: "notion_replace_content"; content: string })
+  | (ProviderWriteScope & {
+      kind: "notion_replace_content";
+      content: string;
+      pageTitle: string;
+    })
   | (ProviderWriteScope & {
       kind: "notion_replace_text";
       oldText: string;
       newText: string;
       replaceAllMatches: boolean;
+      pageTitle: string;
     })
   | (ProviderWriteScope & {
       kind: "notion_task_checkbox";
@@ -83,6 +89,8 @@ const passiveWriteSuccessClaimPattern =
   /\b(?:(?:notion\s+)?(?:page|doc|document|task|checkbox|status)|(?:email\s+)?draft|message|event)\s+(?:has\s+been|was|is(?:\s+now)?)\s+(?:successfully\s+)?(?:updated|changed|edited|saved|created|added|sent|scheduled|rescheduled|cancelled|canceled|removed|deleted|archived|renamed|marked|checked)\b/u;
 const providerStateSuccessClaimPattern =
   /\b(?:status|task|checkbox|item)\s+(?:is|are)\s+now\s+(?:done|complete|completed|checked(?:\s+off)?)\b/u;
+const directProviderWriteRequestPattern =
+  /^(?:please\s+)?(?:update|change|edit|save|create|add|send|schedule|reschedule|cancel|remove|delete|archive|rename|mark|check)\b|\b(?:can|could|would|will|did|have)\s+(?:you|u)\s+(?:please\s+)?(?:update|change|edit|save|create|add|send|schedule|reschedule|cancel|remove|delete|archive|rename|mark|check)\b|\b(?:are|were)\s+(?:you|u)\s+(?:currently\s+)?(?:updating|changing|editing|saving|creating|adding|sending|scheduling|rescheduling|cancelling|canceling|removing|deleting|archiving|renaming|marking|checking)\b/u;
 
 interface InboundTurnRow {
   id: InboundId;
@@ -198,6 +206,7 @@ export class InboundTurnService {
         const completionRejection = this.#providerWriteCompletionRejection(
           completed.id,
           providerWriteAuthorization,
+          userMessage,
           completed.finalResponse,
         );
         if (completionRejection !== undefined) {
@@ -263,6 +272,7 @@ export class InboundTurnService {
           this.#providerWriteCompletionRejection(
             runId,
             providerWriteAuthorization,
+            userMessage,
             response,
           ),
         jobLease: { jobId: job.id, leaseToken: job.leaseToken },
@@ -606,7 +616,7 @@ export class InboundTurnService {
       argumentsValue === undefined ||
       typeof pageId !== "string"
     ) {
-      return "The provider write target was not established by a current read";
+      return "The provider write target was not established by a current search and fetch";
     }
     const run = this.#runForInbound(inboundId);
     if (run === undefined) {
@@ -642,6 +652,11 @@ export class InboundTurnService {
       ) {
         continue;
       }
+      const pageTitle =
+        authorization.kind === "notion_task_checkbox" ? undefined : authorization.pageTitle;
+      if (!this.#notionPageWasDiscovered(run.id, pageId, workspace, pageTitle)) {
+        continue;
+      }
       if (
         authorization.kind === "notion_task_checkbox" ||
         authorization.kind === "notion_replace_text"
@@ -660,19 +675,70 @@ export class InboundTurnService {
         }
         const occurrences = exactOccurrenceCount(fetchedText, oldText);
         if (
-          occurrences !== 1 &&
-          !(
-            authorization.kind === "notion_replace_text" &&
-            authorization.replaceAllMatches &&
-            occurrences > 0
-          )
+          (authorization.kind === "notion_task_checkbox" &&
+            matchingTaskCheckboxLabelCount(fetchedText, authorization.targetTokens) !== 1) ||
+          (occurrences !== 1 &&
+            !(
+              authorization.kind === "notion_replace_text" &&
+              authorization.replaceAllMatches &&
+              occurrences > 0
+            ))
         ) {
           continue;
         }
       }
       return undefined;
     }
-    return "The provider write target was not established by a current read";
+    return "The provider write target was not established by a current search and fetch";
+  }
+
+  #notionPageWasDiscovered(
+    runId: RunId,
+    pageId: string,
+    workspace: string,
+    expectedPageTitle?: string,
+  ): boolean {
+    const searches = this.#db
+      .prepare<{ run_id: string }, { result_json: string }>(`
+        SELECT result_json
+        FROM tool_executions
+        WHERE run_id = @run_id
+          AND tool_name = 'notion.search'
+          AND status = 'succeeded'
+          AND result_json IS NOT NULL
+        ORDER BY created_at_ms, id
+      `)
+      .all({ run_id: runId });
+    let pageDiscovered = false;
+    const titleMatches = new Set<string>();
+    for (const search of searches) {
+      const payload = jsonRecord(search.result_json);
+      if (asRecord(payload?.workspace)?.label !== workspace.trim()) {
+        continue;
+      }
+      const searchResult = asRecord(payload?.result);
+      const results = searchResult?.results;
+      if (searchResult?.truncated !== false || !Array.isArray(results)) {
+        continue;
+      }
+      for (const result of results) {
+        const reference = asRecord(result);
+        if (typeof reference?.id !== "string") {
+          continue;
+        }
+        pageDiscovered ||= reference.id === pageId;
+        if (
+          expectedPageTitle !== undefined &&
+          typeof reference.title === "string" &&
+          normalizeIdentifier(reference.title) === normalizeIdentifier(expectedPageTitle)
+        ) {
+          titleMatches.add(reference.id);
+        }
+      }
+    }
+    return expectedPageTitle === undefined
+      ? pageDiscovered
+      : titleMatches.size === 1 && titleMatches.has(pageId);
   }
 
 
@@ -709,6 +775,7 @@ export class InboundTurnService {
   #providerWriteCompletionRejection(
     runId: RunId,
     authorization: ProviderWriteAuthorization | undefined,
+    userMessage: string,
     response: string,
   ): string | undefined {
     if (this.#hasSucceededProviderWrite(runId)) {
@@ -720,7 +787,7 @@ export class InboundTurnService {
     ) {
       return undefined;
     }
-    return authorization !== undefined || claimsUnrequestedProviderWrite(response)
+    return authorization !== undefined || claimsUnrequestedProviderWrite(userMessage, response)
       ? "unverified_write_claim"
       : undefined;
   }
@@ -984,25 +1051,34 @@ function createPageAuthorization(
 function replaceContentAuthorization(
   request: string,
 ): Extract<ProviderWriteAuthorization, { kind: "notion_replace_content" }> | undefined {
-  const replacement =
-    /^replace\s+(?:the\s+)?(?:(?:notion\s+)?(?:page|doc(?:ument)?)\s+)?(?:content|body)\s+with\s+(.+)$/iu.exec(
+  const match =
+    /^replace\s+(?:the\s+)?(?:content|body)\s+(?:of|in|on)\s+(?:the\s+)?(?:notion\s+)?(?:page|doc(?:ument)?)\s+(?:(["'])(.+?)\1|(.+?))\s+with\s+(.+)$/iu.exec(
       request,
-    )?.[1] ??
-    /^replace\s+(?:the\s+)?(?:content|body)\s+(?:of|in|on)\s+(?:the\s+)?(?:notion\s+)?(?:page|doc(?:ument)?)\s+with\s+(.+)$/iu.exec(
-      request,
-    )?.[1];
-  const content = replacement === undefined ? undefined : mutationValue(replacement);
-  return content === undefined ? undefined : { kind: "notion_replace_content", content };
+    );
+  const pageTitleValue = match?.[2] ?? match?.[3];
+  const contentValue = match?.[4];
+  if (pageTitleValue === undefined || contentValue === undefined) {
+    return undefined;
+  }
+  const pageTitle = mutationValue(pageTitleValue);
+  const content = mutationValue(contentValue);
+  return pageTitle === undefined || content === undefined
+    ? undefined
+    : { kind: "notion_replace_content", pageTitle, content };
 }
 
 function replaceTextAuthorization(
   request: string,
 ): Extract<ProviderWriteAuthorization, { kind: "notion_replace_text" }> | undefined {
   const match =
-    /^(?:replace|change)\s+(?:all(?:\s+occurrences?\s+of)?\s+)?(["'])(.+?)\1\s+(?:with|to)\s+(["'])(.*?)\3(?:\s+(?:in|on)\b.*)?[.!?]*$/iu.exec(
+    /^(?:replace|change)\s+(?:all(?:\s+occurrences?\s+of)?\s+)?(["'])(.+?)\1\s+(?:with|to)\s+(["'])(.*?)\3\s+(?:in|on)\s+(?:the\s+)?(?:notion\s+)?(?:page|doc(?:ument)?)\s+(.+?)[.!?]*$/iu.exec(
       request,
     );
-  if (match?.[2] === undefined || match[4] === undefined) {
+  if (match?.[2] === undefined || match[4] === undefined || match[5] === undefined) {
+    return undefined;
+  }
+  const pageTitle = mutationValue(match[5]);
+  if (pageTitle === undefined) {
     return undefined;
   }
   return {
@@ -1012,6 +1088,7 @@ function replaceTextAuthorization(
     replaceAllMatches: /^(?:replace|change)\s+all(?:\s+occurrences?\s+of)?\s/iu.test(
       request,
     ),
+    pageTitle,
   };
 }
 
@@ -1019,31 +1096,30 @@ function updatePropertyAuthorization(
   request: string,
 ): Extract<ProviderWriteAuthorization, { kind: "notion_update_property" }> | undefined {
   const rename =
-    /^rename\s+(?:the\s+)?(?:notion\s+)?(?:page|doc(?:ument)?)\s+to\s+(.+)$/iu.exec(
+    /^rename\s+(?:the\s+)?(?:notion\s+)?(?:page|doc(?:ument)?)\s+(.+?)\s+to\s+(.+)$/iu.exec(
       request,
-    )?.[1];
-  if (rename !== undefined) {
-    const value = mutationValue(rename);
-    return value === undefined
+    );
+  if (rename?.[1] !== undefined && rename[2] !== undefined) {
+    const pageTitle = mutationValue(rename[1]);
+    const value = mutationValue(rename[2]);
+    return pageTitle === undefined || value === undefined
       ? undefined
-      : { kind: "notion_update_property", property: "title", value };
+      : { kind: "notion_update_property", property: "title", value, pageTitle };
   }
-  const match = /^(?:set|change|update)\s+(?:the\s+)?(.+?)\s+(?:to|as)\s+(.+)$/iu.exec(
-    request,
-  );
-  if (match?.[1] === undefined || match[2] === undefined) {
+  const match =
+    /^(?:set|change|update)\s+(?:the\s+)?(.+?)\s+(?:to|as)\s+(.+?)\s+(?:on|in)\s+(?:the\s+)?(?:notion\s+)?(?:page|doc(?:ument)?)\s+(.+?)[.!?]*$/iu.exec(
+      request,
+    );
+  if (match?.[1] === undefined || match[2] === undefined || match[3] === undefined) {
     return undefined;
   }
   const property = mutationValue(match[1]);
-  const value = mutationValue(
-    match[2].replace(
-      /\s+(?:on|in)\s+(?:the\s+)?(?:notion\s+)?(?:page|doc(?:ument)?|database|workspace)(?:\s+.*)?$/iu,
-      "",
-    ),
-  );
+  const value = mutationValue(match[2]);
+  const pageTitle = mutationValue(match[3]);
   if (
     property === undefined ||
     value === undefined ||
+    pageTitle === undefined ||
     (property.match(/[a-z0-9]+/giu)?.length ?? 0) > 4
   ) {
     return undefined;
@@ -1052,6 +1128,7 @@ function updatePropertyAuthorization(
     kind: "notion_update_property",
     property: normalizeIdentifier(property),
     value,
+    pageTitle,
   };
 }
 
@@ -1335,20 +1412,15 @@ function taskCheckboxCallMatches(
   ) {
     return false;
   }
-  const oldMarkers = update.oldText.match(checkboxMarkerPattern) ?? [];
-  const newMarkers = update.newText.match(checkboxMarkerPattern) ?? [];
-  if (
-    oldMarkers.length !== 1 ||
-    newMarkers.length !== 1 ||
-    (authorization.checked
-      ? oldMarkers[0] !== "[ ]" || newMarkers[0]?.toLowerCase() !== "[x]"
-      : oldMarkers[0]?.toLowerCase() !== "[x]" || newMarkers[0] !== "[ ]") ||
-    update.oldText.replace(checkboxMarkerPattern, "[?]") !==
-      update.newText.replace(checkboxMarkerPattern, "[?]")
-  ) {
-    return false;
-  }
-  return taskLabelMatches(authorization.targetTokens, update.oldText);
+  const changedLine = singleChangedCheckboxLine(
+    update.oldText,
+    update.newText,
+    authorization.checked,
+  );
+  return (
+    changedLine !== undefined &&
+    taskLabelMatches(authorization.targetTokens, changedLine)
+  );
 }
 
 function taskLabelMatches(targetTokens: readonly string[], text: string): boolean {
@@ -1374,6 +1446,67 @@ function taskLabelMatches(targetTokens: readonly string[], text: string): boolea
       shorthandLabel.length === targetTokens.length + 1 &&
       sameTokens(targetTokens, shorthandLabel.slice(1)))
   );
+}
+
+function singleChangedCheckboxLine(
+  oldText: string,
+  newText: string,
+  checked: boolean,
+): string | undefined {
+  const oldMarkers = [...oldText.matchAll(checkboxMarkerPattern)];
+  const newMarkers = [...newText.matchAll(checkboxMarkerPattern)];
+  if (
+    oldMarkers.length === 0 ||
+    oldMarkers.length !== newMarkers.length ||
+    oldText.replace(checkboxMarkerPattern, "[?]") !==
+      newText.replace(checkboxMarkerPattern, "[?]")
+  ) {
+    return undefined;
+  }
+  let changedOffset: number | undefined;
+  for (let index = 0; index < oldMarkers.length; index += 1) {
+    const oldMarker = oldMarkers[index];
+    const newMarker = newMarkers[index];
+    if (
+      oldMarker === undefined ||
+      newMarker === undefined ||
+      oldMarker.index !== newMarker.index
+    ) {
+      return undefined;
+    }
+    if (oldMarker[0] === newMarker[0]) {
+      continue;
+    }
+    if (
+      changedOffset !== undefined ||
+      (checked
+        ? oldMarker[0] !== "[ ]" || newMarker[0].toLowerCase() !== "[x]"
+        : oldMarker[0].toLowerCase() !== "[x]" || newMarker[0] !== "[ ]")
+    ) {
+      return undefined;
+    }
+    changedOffset = oldMarker.index;
+  }
+  if (changedOffset === undefined) {
+    return undefined;
+  }
+  const lineStart = oldText.lastIndexOf("\n", changedOffset - 1) + 1;
+  const followingBreak = oldText.indexOf("\n", changedOffset);
+  const lineEnd = followingBreak === -1 ? oldText.length : followingBreak;
+  return oldText.slice(lineStart, lineEnd);
+}
+
+function matchingTaskCheckboxLabelCount(
+  text: string,
+  targetTokens: readonly string[],
+): number {
+  const labels = new Set<string>();
+  for (const line of text.split(/\r?\n/u)) {
+    if (/\[(?: |x|X)\]/u.test(line) && taskLabelMatches(targetTokens, line)) {
+      labels.add(taskLabelTokens(line).join("\u0000"));
+    }
+  }
+  return labels.size;
 }
 
 function taskLabelTokens(text: string): readonly string[] {
@@ -1411,13 +1544,19 @@ function exactOccurrenceCount(text: string, target: string): number {
   return count;
 }
 
-function claimsUnrequestedProviderWrite(response: string): boolean {
+function claimsUnrequestedProviderWrite(userMessage: string, response: string): boolean {
   const normalized = response.trim().toLowerCase().replaceAll("’", "'");
-  return (
+  if (
     agentWriteSuccessClaimPattern.test(normalized) ||
-    agentDidWriteSuccessClaimPattern.test(normalized) ||
-    passiveWriteSuccessClaimPattern.test(normalized) ||
-    providerStateSuccessClaimPattern.test(normalized)
+    agentDidWriteSuccessClaimPattern.test(normalized)
+  ) {
+    return true;
+  }
+  const normalizedRequest = directRequestBody(userMessage).toLowerCase();
+  return (
+    directProviderWriteRequestPattern.test(normalizedRequest) &&
+    (passiveWriteSuccessClaimPattern.test(normalized) ||
+      providerStateSuccessClaimPattern.test(normalized))
   );
 }
 

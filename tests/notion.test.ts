@@ -49,6 +49,7 @@ describe("Notion read tools", () => {
             text: JSON.stringify({
               workspace_id: "must-not-cross",
               results: [{ title: "Plan", provider_account_id: "must-not-cross" }],
+              truncated: false,
             }),
           },
           { type: "image", data: "not model-visible" },
@@ -66,12 +67,37 @@ describe("Notion read tools", () => {
 
     expect(result).toEqual({
       workspace: { label: "Personal" },
-      result: { results: [{ title: "Plan" }] },
+      result: { results: [{ title: "Plan" }], truncated: false },
     });
     expect(provider.selected).toEqual([personal.id]);
     expect(provider.selected).not.toContain(work.id);
     expect(JSON.stringify(result)).not.toContain(personal.id);
     expect(harness.runs.getToolRequired(context.toolExecutionId).connectionId).toBe(personal.id);
+  });
+
+  it("preserves structured search truncation metadata", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_search_truncated", "Search");
+    const fixture = sessionFixture(async () => ({
+      structuredContent: {
+        results: [{ id: "page_1", title: "Plan" }],
+        truncated: true,
+      },
+    }));
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+
+    await expect(
+      service.search(
+        { query: "plan", workspace: "Search", pageSize: 5 },
+        toolContext(harness, "notion.search", "read"),
+      ),
+    ).resolves.toEqual({
+      workspace: { label: "Search" },
+      result: {
+        results: [{ id: "page_1", title: "Plan" }],
+        truncated: true,
+      },
+    });
   });
 
   it("normalizes fetch results instead of exposing MCP content blocks", async () => {
@@ -128,6 +154,32 @@ describe("Notion read tools", () => {
       },
     });
     expect(JSON.stringify(result)).not.toContain("must-not-cross");
+  });
+
+  it("fails closed when a structured fetch omits its completion flag", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_incomplete", "Incomplete");
+    const fixture = sessionFixture(async () => ({
+      structuredContent: {
+        id: "page_incomplete",
+        content: "Possibly incomplete body",
+      },
+    }));
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+
+    await expect(
+      service.fetch(
+        { id: "page_incomplete" },
+        toolContext(harness, "notion.fetch", "read"),
+      ),
+    ).resolves.toEqual({
+      workspace: { label: "Incomplete" },
+      result: {
+        id: "page_incomplete",
+        text: "Possibly incomplete body",
+        truncated: true,
+      },
+    });
   });
 });
 
@@ -360,6 +412,26 @@ describe("Notion writes", () => {
       },
     },
     {
+      label: "contradictory page identities",
+      result: {
+        structuredContent: {
+          object: "page_markdown",
+          id: "page_unacknowledged",
+          page_id: "different_page",
+          truncated: false,
+        },
+      },
+    },
+    {
+      label: "missing provider completion flag",
+      result: {
+        structuredContent: {
+          object: "page_markdown",
+          id: "page_unacknowledged",
+        },
+      },
+    },
+    {
       label: "provider-truncated acknowledgement",
       result: {
         structuredContent: {
@@ -421,7 +493,7 @@ describe("Notion MCP boundary", () => {
     const context = toolContext(harness, "notion.search", "read");
     const client = new Client({ name: "fixture", version: "1.0.0" });
     const call = vi.spyOn(client, "callTool").mockResolvedValue({
-      structuredContent: { results: [] },
+      structuredContent: { results: [], truncated: false },
       content: [],
     });
     const session = new NotionMcpSession({
@@ -455,7 +527,7 @@ describe("Notion MCP boundary", () => {
 
     await expect(service.search({ query: "x", pageSize: 1 }, context)).resolves.toEqual({
       workspace: { label: "Session" },
-      result: { results: [] },
+      result: { results: [], truncated: false },
     });
 
     expect(call).toHaveBeenCalledWith({

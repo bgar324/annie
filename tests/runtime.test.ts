@@ -208,6 +208,10 @@ class FakeNotionClients implements NotionClientProvider {
   constructor(
     readonly allowWrites = false,
     readonly fetchText = "",
+    readonly searchResults: readonly Record<string, unknown>[] = [
+      { id: "page_1", title: "Project page" },
+    ],
+    readonly searchTruncated = false,
   ) {}
 
   async withSession<T>(
@@ -227,7 +231,11 @@ class FakeNotionClients implements NotionClientProvider {
             content: [
               {
                 type: "text",
-                text: JSON.stringify({ object: "page", id: argumentsValue.page_id ?? "page_new" }),
+                text: JSON.stringify({
+                  object: "page",
+                  id: argumentsValue.page_id ?? "page_new",
+                  truncated: false,
+                }),
               },
             ],
           };
@@ -240,7 +248,17 @@ class FakeNotionClients implements NotionClientProvider {
           throw new Error(`Daily brief made an unexpected Notion call: ${name}`);
         }
         this.searches.push(argumentsValue);
-        return { content: [{ type: "text", text: JSON.stringify({ results: [] }) }] };
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                results: this.searchResults,
+                truncated: this.searchTruncated,
+              }),
+            },
+          ],
+        };
       },
     };
     return operation(session);
@@ -565,6 +583,11 @@ describe("production runtime", () => {
       response: "The page is updated.",
     },
     {
+      label: "an addressed passive write confirmation",
+      request: "Hey Annie, update the page",
+      response: "The page is updated.",
+    },
+    {
       label: "a passive provider-write success claim",
       request: "Update Status to Done",
       response: "The page has been updated.",
@@ -647,6 +670,39 @@ describe("production runtime", () => {
   });
 
   it.each([
+    {
+      request: "When was the message sent?",
+      response: "The message was sent yesterday.",
+    },
+    {
+      request: "What is the task status?",
+      response: "The task is now done.",
+    },
+  ])("preserves the read-only state report %s", async ({ request, response }) => {
+    const model = new FakeModel();
+    model.responses.push(finalModelResponse("read_only_state_report", response));
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway);
+    gateway.inbox.push(
+      inboundMessage("msg_read_only_state_report", {
+        text: request,
+      }),
+    );
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("done");
+    expect(
+      item.runtime.database.db
+        .prepare<[], { body: string; purpose: string }>(
+          "SELECT body, purpose FROM egress_messages",
+        )
+        .get(),
+    ).toEqual({ body: response, purpose: "reply" });
+  });
+
+  it.each([
     "I couldn't update the page, so nothing changed.",
     "I didn't update the Notion doc.",
     "Nothing changed.",
@@ -686,6 +742,11 @@ describe("production runtime", () => {
     const newText = "## Day 91: Thursday, September 3\n- [x] Clean restroom";
     const model = new FakeModel();
     model.responses.push(
+      toolCallResponse("authorized_target_search", {
+        id: "call_authorized_target_search",
+        name: "notion.search",
+        argumentsJson: JSON.stringify({ workspace: "Work", query: "restroom" }),
+      }),
       {
         id: "authorized_target_fetch",
         content: "",
@@ -776,6 +837,113 @@ describe("production runtime", () => {
     });
   });
 
+  it("accepts one changed checkbox with unchanged checkbox context", async () => {
+    const fetchedPage = [
+      "- [x] Buy restroom cleaning supplies",
+      "- [x] Clean restroom",
+      "- [ ] Clean and organize room",
+      "- [ ] Car wash",
+    ].join("\n");
+    const oldText = "- [ ] Clean and organize room\n- [ ] Car wash";
+    const newText = "- [x] Clean and organize room\n- [ ] Car wash";
+    const model = new FakeModel();
+    model.responses.push(
+      toolCallResponse("reported_target_search", {
+        id: "call_reported_target_search",
+        name: "notion.search",
+        argumentsJson: JSON.stringify({ workspace: "Work", query: "Jadyn and Ben TO-DO" }),
+      }),
+      toolCallResponse("reported_target_fetch", {
+        id: "call_reported_target_fetch",
+        name: "notion.fetch",
+        argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+      }),
+      toolCallResponse("reported_target_write", {
+        id: "call_reported_target_write",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "update_content",
+          updates: [{ oldText, newText }],
+        }),
+      }),
+      finalModelResponse("reported_target_done", "✅ done — clean and organize room is checked off."),
+    );
+    const notionClients = new FakeNotionClients(true, fetchedPage);
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item);
+    gateway.inbox.push(
+      inboundMessage("msg_reported_target", {
+        text: "Mark clean and organize room done",
+      }),
+    );
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("done");
+    expect(notionClients.writes).toHaveLength(1);
+    expect(notionClients.writes[0]?.argumentsValue).toMatchObject({
+      page_id: "page_1",
+      command: "update_content",
+      content_updates: [
+        {
+          old_str: oldText,
+          new_str: newText,
+          replace_all_matches: false,
+        },
+      ],
+    });
+  });
+
+  it("rejects a checkbox page absent from current search results", async () => {
+    const model = new FakeModel();
+    model.responses.push(
+      toolCallResponse("missing_target_search", {
+        id: "call_missing_target_search",
+        name: "notion.search",
+        argumentsJson: JSON.stringify({ workspace: "Work", query: "restroom" }),
+      }),
+      toolCallResponse("missing_target_fetch", {
+        id: "call_missing_target_fetch",
+        name: "notion.fetch",
+        argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+      }),
+      toolCallResponse("missing_target_write", {
+        id: "call_missing_target_write",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "update_content",
+          updates: [{ oldText: "- [ ] Clean restroom", newText: "- [x] Clean restroom" }],
+        }),
+      }),
+    );
+    const notionClients = new FakeNotionClients(true, "- [ ] Clean restroom", []);
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item);
+    gateway.inbox.push(
+      inboundMessage("msg_missing_target_search", { text: "Mark restroom done" }),
+    );
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("blocked");
+    expect(notionClients.writes).toHaveLength(0);
+    expect(
+      item.runtime.database.db
+        .prepare<[], { count: number }>(
+          "SELECT COUNT(*) AS count FROM write_intents WHERE kind = 'notion_update_page'",
+        )
+        .get()?.count,
+    ).toBe(0);
+  });
+
   it.each([
     {
       label: "an unanchored duplicate task",
@@ -788,6 +956,11 @@ describe("production runtime", () => {
       pageId: "page_1",
     },
     {
+      label: "ambiguous shorthand task labels",
+      fetchedPage: "- [ ] Clean restroom\n- [ ] Wash restroom",
+      pageId: "page_1",
+    },
+    {
       label: "a different page than the one fetched",
       fetchedPage: "## Day 91\n- [ ] Clean restroom",
       pageId: "page_2",
@@ -795,6 +968,11 @@ describe("production runtime", () => {
   ])("rejects $label before preparing the checkbox write", async ({ fetchedPage, pageId }) => {
     const model = new FakeModel();
     model.responses.push(
+      toolCallResponse("target_search", {
+        id: "call_target_search",
+        name: "notion.search",
+        argumentsJson: JSON.stringify({ workspace: "Work", query: "restroom" }),
+      }),
       {
         id: "target_fetch",
         content: "",
@@ -857,6 +1035,11 @@ describe("production runtime", () => {
   it("rejects an unscoped update that omits the fetched workspace", async () => {
     const model = new FakeModel();
     model.responses.push(
+      toolCallResponse("split_capability_search", {
+        id: "call_split_capability_search",
+        name: "notion.search",
+        argumentsJson: JSON.stringify({ workspace: "Reader", query: "restroom" }),
+      }),
       toolCallResponse("split_capability_fetch", {
         id: "call_split_capability_fetch",
         name: "notion.fetch",
@@ -880,7 +1063,7 @@ describe("production runtime", () => {
     const notionClients = new FakeNotionClients(true, "- [ ] Clean restroom");
     const gateway = new FakeGateway();
     const item = await newRuntime(model, gateway, { notionClients });
-    connectNotion(item, "Reader", ["notion.fetch"]);
+    connectNotion(item, "Reader", ["notion.search", "notion.fetch"]);
     connectNotion(item, "Writer", ["notion.update_page"]);
     gateway.inbox.push(inboundMessage("msg_split_capability", { text: "Mark restroom done" }));
 
@@ -913,6 +1096,11 @@ describe("production runtime", () => {
     const newText = `- [x] ${task}`;
     const model = new FakeModel();
     model.responses.push(
+      toolCallResponse("shorthand_search", {
+        id: "call_shorthand_search",
+        name: "notion.search",
+        argumentsJson: JSON.stringify({ workspace: "Work", query: task }),
+      }),
       toolCallResponse("shorthand_fetch", {
         id: "call_shorthand_fetch",
         name: "notion.fetch",
@@ -963,6 +1151,11 @@ describe("production runtime", () => {
     const oldText = `- [ ] ${task}`;
     const model = new FakeModel();
     model.responses.push(
+      toolCallResponse("wrong_task_search", {
+        id: "call_wrong_task_search",
+        name: "notion.search",
+        argumentsJson: JSON.stringify({ workspace: "Work", query: task }),
+      }),
       toolCallResponse("wrong_task_fetch", {
         id: "call_wrong_task_fetch",
         name: "notion.fetch",
@@ -1051,6 +1244,7 @@ describe("production runtime", () => {
     const item = await newRuntime(model, gateway, {
       notionClients: new FakeNotionClients(true),
     });
+    connectNotion(item);
     gateway.inbox.push(inboundMessage("msg_durable_single_use", { text: request }));
     await sweep(item);
     const job = requiredJob(item.runtime.queue.claim(Date.now() + 10));
@@ -1079,8 +1273,47 @@ describe("production runtime", () => {
       maximumToolCalls: 16,
     });
     runs.markToolRunning(firstExecution.id);
-    runs.finishTool(firstExecution.id, "succeeded", { ok: true });
-    runs.appendToolMessage(run.id, firstCall.id, '{"ok":true}');
+    const connection = item.runtime.database.db
+      .prepare<[], { id: ConnectionId; credential_generation: number }>(
+        "SELECT id, credential_generation FROM connections WHERE provider = 'notion'",
+      )
+      .get();
+    if (connection === undefined) {
+      throw new Error("Expected durable single-use Notion connection");
+    }
+    const writeResult = {
+      ok: true,
+      workspace: { label: "Work" },
+      result: { pages: [{ id: "created_1" }] },
+    };
+    const writes = new WriteStore(item.runtime.database.db, item.runtime.traces);
+    const write = writes.prepare({
+      traceId: run.traceId,
+      kind: "notion_create_page",
+      request: { pages: [{ properties: { title: "Launch plan" } }] },
+      safeSummary: { propertyCount: 1, contentBytes: 0 },
+      runId: run.id,
+      toolExecutionId: firstExecution.id,
+      connectionId: connection.id,
+      connectionGeneration: connection.credential_generation,
+    });
+    writes.beginAttempt({
+      writeId: write.id,
+      traceId: run.traceId,
+      jobLease: {
+        jobId: job.id,
+        leaseToken: job.leaseToken,
+        nowMs: Date.now(),
+      },
+    });
+    writes.complete({
+      writeId: write.id,
+      traceId: run.traceId,
+      state: "succeeded",
+      normalizedResult: writeResult,
+      providerReference: { id: "created_1" },
+    });
+    runs.appendToolMessage(run.id, firstCall.id, JSON.stringify(writeResult));
     runs.appendAssistant(
       run.id,
       toolCallResponse("second_write_response", createCall("call_create_after_resume")),
@@ -1285,7 +1518,8 @@ describe("production runtime", () => {
     },
     {
       label: "one scalar property",
-      request: "Update Status to SDK in Notion workspace Work",
+      request:
+        'Update Status to SDK on Notion page "Project page" in Notion workspace Work',
       fetchText: "Project page",
       call: {
         id: "call_update_status",
@@ -1299,9 +1533,25 @@ describe("production runtime", () => {
       },
     },
     {
+      label: "named page rename",
+      request:
+        'Rename Notion page "Project page" to "Launch plan" in Notion workspace Work',
+      fetchText: "Project page",
+      call: {
+        id: "call_rename_page",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "update_properties",
+          properties: { title: "Launch plan" },
+        }),
+      },
+    },
+    {
       label: "full content replacement with preserved case",
       request:
-        'Replace the Notion page content with "API Notes" in Notion workspace Work',
+        'Replace the content of Notion page "Project page" with "API Notes" in Notion workspace Work',
       fetchText: "Old notes",
       call: {
         id: "call_replace_content",
@@ -1316,7 +1566,8 @@ describe("production runtime", () => {
     },
     {
       label: "quoted exact-text replacement with preserved case",
-      request: 'Replace "API" with "SDK" in Notion workspace Work',
+      request:
+        'Replace "API" with "SDK" in Notion page "Project page" in Notion workspace Work',
       fetchText: "API docs",
       call: {
         id: "call_replace_text",
@@ -1333,6 +1584,11 @@ describe("production runtime", () => {
     const model = new FakeModel();
     if (call.name === "notion.update_page") {
       model.responses.push(
+        toolCallResponse("generic_target_search", {
+          id: "call_generic_target_search",
+          name: "notion.search",
+          argumentsJson: JSON.stringify({ workspace: "Work", query: "Project page" }),
+        }),
         toolCallResponse("generic_target_fetch", {
           id: "call_generic_target_fetch",
           name: "notion.fetch",
@@ -1364,10 +1620,226 @@ describe("production runtime", () => {
     ).toBe("succeeded");
   });
 
+  it('accepts a quoted page title containing "with"', async () => {
+    const model = new FakeModel();
+    model.responses.push(
+      toolCallResponse("with_title_search", {
+        id: "call_with_title_search",
+        name: "notion.search",
+        argumentsJson: JSON.stringify({ workspace: "Work", query: "Notes with API" }),
+      }),
+      toolCallResponse("with_title_fetch", {
+        id: "call_with_title_fetch",
+        name: "notion.fetch",
+        argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+      }),
+      toolCallResponse("with_title_write", {
+        id: "call_with_title_write",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "replace_content",
+          newContent: "New body",
+        }),
+      }),
+      finalModelResponse("with_title_done", "✅ done — the requested change is complete."),
+    );
+    const notionClients = new FakeNotionClients(true, "Old body", [
+      { id: "page_1", title: "Notes with API" },
+    ]);
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item);
+    gateway.inbox.push(
+      inboundMessage("msg_with_title", {
+        text: 'Replace the content of Notion page "Notes with API" with "New body" in Notion workspace Work',
+      }),
+    );
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("done");
+    expect(notionClients.writes).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      label: "property update",
+      request: "Update Status to SDK in Notion workspace Work",
+      argumentsValue: {
+        workspace: "Work",
+        pageId: "page_1",
+        command: "update_properties",
+        properties: { Status: "SDK" },
+      },
+    },
+    {
+      label: "full content replacement",
+      request: 'Replace the Notion page content with "API Notes" in Notion workspace Work',
+      argumentsValue: {
+        workspace: "Work",
+        pageId: "page_1",
+        command: "replace_content",
+        newContent: "API Notes",
+      },
+    },
+    {
+      label: "exact-text replacement",
+      request: 'Replace "API" with "SDK" in Notion workspace Work',
+      argumentsValue: {
+        workspace: "Work",
+        pageId: "page_1",
+        command: "update_content",
+        updates: [{ oldText: "API", newText: "SDK" }],
+      },
+    },
+    {
+      label: "page rename",
+      request: "Rename the Notion page to Launch plan in Notion workspace Work",
+      argumentsValue: {
+        workspace: "Work",
+        pageId: "page_1",
+        command: "update_properties",
+        properties: { title: "Launch plan" },
+      },
+    },
+  ])("rejects a $label without a named page target", async ({ request, argumentsValue }) => {
+    const model = new FakeModel();
+    model.responses.push(
+      toolCallResponse("vague_target_search", {
+        id: "call_vague_target_search",
+        name: "notion.search",
+        argumentsJson: JSON.stringify({ workspace: "Work", query: "Project page" }),
+      }),
+      toolCallResponse("vague_target_fetch", {
+        id: "call_vague_target_fetch",
+        name: "notion.fetch",
+        argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+      }),
+      toolCallResponse("vague_target_write", {
+        id: "call_vague_target_write",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify(argumentsValue),
+      }),
+      finalModelResponse("vague_target_done", "✅ done — the requested change is complete."),
+    );
+    const notionClients = new FakeNotionClients(true, "API docs");
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item);
+    gateway.inbox.push(inboundMessage("msg_vague_target", { text: request }));
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("blocked");
+    expect(notionClients.writes).toHaveLength(0);
+    expect(
+      item.runtime.database.db
+        .prepare<[], { count: number }>(
+          "SELECT COUNT(*) AS count FROM write_intents WHERE kind = 'notion_update_page'",
+        )
+        .get()?.count,
+    ).toBe(0);
+  });
+
+  it("rejects a named page title that resolves to multiple pages", async () => {
+    const model = new FakeModel();
+    model.responses.push(
+      toolCallResponse("ambiguous_page_search", {
+        id: "call_ambiguous_page_search",
+        name: "notion.search",
+        argumentsJson: JSON.stringify({ workspace: "Work", query: "Project page" }),
+      }),
+      toolCallResponse("ambiguous_page_fetch", {
+        id: "call_ambiguous_page_fetch",
+        name: "notion.fetch",
+        argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+      }),
+      toolCallResponse("ambiguous_page_write", {
+        id: "call_ambiguous_page_write",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "update_properties",
+          properties: { Status: "SDK" },
+        }),
+      }),
+    );
+    const notionClients = new FakeNotionClients(true, "Project page", [
+      { id: "page_1", title: "Project page" },
+      { id: "page_2", title: "Project page" },
+    ]);
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item);
+    gateway.inbox.push(
+      inboundMessage("msg_ambiguous_page_title", {
+        text: 'Update Status to SDK on Notion page "Project page" in Notion workspace Work',
+      }),
+    );
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("blocked");
+    expect(notionClients.writes).toHaveLength(0);
+  });
+
+  it("rejects a named page from truncated search results", async () => {
+    const model = new FakeModel();
+    model.responses.push(
+      toolCallResponse("truncated_page_search", {
+        id: "call_truncated_page_search",
+        name: "notion.search",
+        argumentsJson: JSON.stringify({ workspace: "Work", query: "Project page" }),
+      }),
+      toolCallResponse("truncated_page_fetch", {
+        id: "call_truncated_page_fetch",
+        name: "notion.fetch",
+        argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+      }),
+      toolCallResponse("truncated_page_write", {
+        id: "call_truncated_page_write",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "update_properties",
+          properties: { Status: "SDK" },
+        }),
+      }),
+    );
+    const notionClients = new FakeNotionClients(
+      true,
+      "Project page",
+      [{ id: "page_1", title: "Project page" }],
+      true,
+    );
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item);
+    gateway.inbox.push(
+      inboundMessage("msg_truncated_page_search", {
+        text: 'Update Status to SDK on Notion page "Project page" in Notion workspace Work',
+      }),
+    );
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("blocked");
+    expect(notionClients.writes).toHaveLength(0);
+  });
+
   it.each([
     {
       label: "non-scalar property value",
-      request: "Update Status to SDK in Notion workspace Work",
+      request:
+        'Update Status to SDK on Notion page "Project page" in Notion workspace Work',
       fetchText: "Project page",
       call: {
         id: "call_non_scalar_property",
@@ -1382,7 +1854,8 @@ describe("production runtime", () => {
     },
     {
       label: "property value with different case",
-      request: "Update Status to SDK in Notion workspace Work",
+      request:
+        'Update Status to SDK on Notion page "Project page" in Notion workspace Work',
       fetchText: "Project page",
       call: {
         id: "call_lowercase_property",
@@ -1398,7 +1871,7 @@ describe("production runtime", () => {
     {
       label: "replacement content with different case",
       request:
-        'Replace the Notion page content with "API Notes" in Notion workspace Work',
+        'Replace the content of Notion page "Project page" with "API Notes" in Notion workspace Work',
       fetchText: "Old notes",
       call: {
         id: "call_lowercase_content",
@@ -1413,7 +1886,8 @@ describe("production runtime", () => {
     },
     {
       label: "quoted source text with different case",
-      request: 'Replace "API" with "SDK" in Notion workspace Work',
+      request:
+        'Replace "API" with "SDK" in Notion page "Project page" in Notion workspace Work',
       fetchText: "api docs",
       call: {
         id: "call_lowercase_source",
@@ -1429,6 +1903,11 @@ describe("production runtime", () => {
   ])("rejects an exact-value mismatch: $label", async ({ request, fetchText, call }) => {
     const model = new FakeModel();
     model.responses.push(
+      toolCallResponse("mismatch_target_search", {
+        id: "call_mismatch_target_search",
+        name: "notion.search",
+        argumentsJson: JSON.stringify({ workspace: "Work", query: "Project page" }),
+      }),
       toolCallResponse("mismatch_target_fetch", {
         id: "call_mismatch_target_fetch",
         name: "notion.fetch",
@@ -1447,7 +1926,7 @@ describe("production runtime", () => {
 
     expect(inboundState(item.runtime)).toBe("blocked");
     expect(notionClients.writes).toHaveLength(0);
-    expect(count(item.runtime, "tool_executions")).toBe(1);
+    expect(count(item.runtime, "tool_executions")).toBe(2);
   });
   it.each([
     {
@@ -1522,7 +2001,7 @@ describe("production runtime", () => {
     },
     {
       label: "body replacement authorized only as a rename",
-      request: "Rename the Notion page to Launch plan",
+      request: 'Rename Notion page "Project page" to "Launch plan"',
       call: {
         id: "call_rename_as_body_replacement",
         name: "notion.update_page",
@@ -1536,7 +2015,7 @@ describe("production runtime", () => {
     },
     {
       label: "an extra property whose words occur in the request",
-      request: "Update Status to Done in Project Alpha",
+      request: 'Update Status to Done on Notion page "Project Alpha"',
       call: {
         id: "call_extra_property",
         name: "notion.update_page",
@@ -1550,7 +2029,7 @@ describe("production runtime", () => {
     },
     {
       label: "structural whitespace absent from the replacement request",
-      request: 'Replace "alpha" with "beta gamma"',
+      request: 'Replace "alpha" with "beta gamma" in Notion page "Project page"',
       call: {
         id: "call_structural_whitespace",
         name: "notion.update_page",
