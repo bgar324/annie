@@ -640,7 +640,11 @@ export class InboundTurnService {
       const fetchArguments = jsonRecord(fetch.arguments_json);
       const fetchResult = jsonRecord(fetch.result_json);
       const result = asRecord(fetchResult?.result);
-      if (fetchArguments?.id !== pageId || result === undefined) {
+      if (
+        fetchArguments?.id !== pageId ||
+        result === undefined ||
+        result.truncated !== false
+      ) {
         continue;
       }
       const workspace = argumentsValue.workspace;
@@ -666,11 +670,7 @@ export class InboundTurnService {
           : undefined;
         const oldText = update?.oldText;
         const fetchedText = result.text;
-        if (
-          typeof oldText !== "string" ||
-          typeof fetchedText !== "string" ||
-          result.truncated !== false
-        ) {
+        if (typeof oldText !== "string" || typeof fetchedText !== "string") {
           continue;
         }
         const occurrences = exactOccurrenceCount(fetchedText, oldText);
@@ -699,8 +699,11 @@ export class InboundTurnService {
     expectedPageTitle?: string,
   ): boolean {
     const searches = this.#db
-      .prepare<{ run_id: string }, { result_json: string }>(`
-        SELECT result_json
+      .prepare<
+        { run_id: string },
+        { arguments_json: string; result_json: string }
+      >(`
+        SELECT arguments_json, result_json
         FROM tool_executions
         WHERE run_id = @run_id
           AND tool_name = 'notion.search'
@@ -717,6 +720,32 @@ export class InboundTurnService {
         continue;
       }
       const searchResult = asRecord(payload?.result);
+      if (expectedPageTitle === undefined) {
+        const pageScopedSearches = searchResult?.pageScopedSearches;
+        if (Array.isArray(pageScopedSearches)) {
+          for (const candidate of pageScopedSearches) {
+            const scoped = asRecord(candidate);
+            const scopedResults = scoped?.results;
+            if (
+              scoped?.pageId === pageId &&
+              scoped.truncated === false &&
+              Array.isArray(scopedResults) &&
+              scopedResults.some((result) => asRecord(result)?.id === pageId)
+            ) {
+              pageDiscovered = true;
+            }
+          }
+        }
+      }
+      if (expectedPageTitle !== undefined) {
+        const searchArguments = jsonRecord(search.arguments_json);
+        if (
+          typeof searchArguments?.query !== "string" ||
+          normalizeIdentifier(searchArguments.query) !== normalizeIdentifier(expectedPageTitle)
+        ) {
+          continue;
+        }
+      }
       const results = searchResult?.results;
       if (searchResult?.truncated !== false || !Array.isArray(results)) {
         continue;

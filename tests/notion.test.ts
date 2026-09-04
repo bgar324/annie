@@ -100,6 +100,111 @@ describe("Notion read tools", () => {
     });
   });
 
+  it("treats an omitted search truncation marker as complete below the requested limit", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_search_complete", "Search");
+    const fixture = sessionFixture(async () => ({
+      structuredContent: {
+        results: [{ id: "page_1", title: "Plan" }],
+      },
+    }));
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+
+    await expect(
+      service.search(
+        { query: "quarterly", workspace: "Search", pageSize: 5 },
+        toolContext(harness, "notion.search", "read"),
+      ),
+    ).resolves.toEqual({
+      workspace: { label: "Search" },
+      result: {
+        results: [{ id: "page_1", title: "Plan" }],
+        truncated: false,
+      },
+    });
+  });
+
+  it("honors an explicit complete search at the requested result limit", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_search_exact_limit", "Search");
+    const fixture = sessionFixture(async () => ({
+      structuredContent: {
+        results: [{ id: "page_1", title: "Plan" }],
+        truncated: false,
+      },
+    }));
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+
+    await expect(
+      service.search(
+        { query: "plan", workspace: "Search", pageSize: 1 },
+        toolContext(harness, "notion.search", "read"),
+      ),
+    ).resolves.toEqual({
+      workspace: { label: "Search" },
+      result: {
+        results: [{ id: "page_1", title: "Plan" }],
+        truncated: false,
+      },
+    });
+    expect(fixture.call).toHaveBeenCalledTimes(1);
+  });
+
+  it("adds a complete page-scoped search for one exact title candidate", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_search_refined", "Search");
+    const target = { id: "page_1", title: "Jadyn and Ben’s TO-DO’s!!!" };
+    const broadResults = [
+      target,
+      ...Array.from({ length: 9 }, (_, index) => ({
+        id: `other_${index}`,
+        title: `Other page ${index}`,
+      })),
+    ];
+    let callCount = 0;
+    const fixture = sessionFixture(async (name, argumentsValue) => {
+      expect(name).toBe("notion-search");
+      callCount += 1;
+      if (callCount === 1) {
+        expect(argumentsValue).toEqual({
+          query: "Jadyn and Ben's TO-DO's",
+          query_type: "internal",
+          page_size: 10,
+        });
+        return { structuredContent: { results: broadResults } };
+      }
+      expect(argumentsValue).toEqual({
+        query: "Jadyn and Ben's TO-DO's",
+        query_type: "internal",
+        page_url: "page_1",
+        page_size: 50,
+      });
+      return { structuredContent: { results: [target] } };
+    });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+
+    await expect(
+      service.search(
+        { query: "Jadyn and Ben's TO-DO's", workspace: "Search", pageSize: 10 },
+        toolContext(harness, "notion.search", "read"),
+      ),
+    ).resolves.toEqual({
+      workspace: { label: "Search" },
+      result: {
+        results: broadResults,
+        truncated: true,
+        pageScopedSearches: [
+          {
+            pageId: "page_1",
+            results: [target],
+            truncated: false,
+          },
+        ],
+      },
+    });
+    expect(fixture.call).toHaveBeenCalledTimes(2);
+  });
+
   it("normalizes fetch results instead of exposing MCP content blocks", async () => {
     const harness = notionHarness();
     const connection = addNotionConnection(harness, "workspace_fetch", "Docs");
@@ -156,23 +261,76 @@ describe("Notion read tools", () => {
     expect(JSON.stringify(result)).not.toContain("must-not-cross");
   });
 
-  it("fails closed when a structured fetch omits its completion flag", async () => {
+  it("treats an omitted fetch truncation marker as complete without omitted blocks", async () => {
     const harness = notionHarness();
-    addNotionConnection(harness, "workspace_incomplete", "Incomplete");
+    addNotionConnection(harness, "workspace_complete", "Complete");
     const fixture = sessionFixture(async () => ({
       structuredContent: {
-        id: "page_incomplete",
-        content: "Possibly incomplete body",
+        id: "page_complete",
+        content: "Complete body",
       },
     }));
     const service = notionService(harness, fixedSessionProvider(fixture.session));
 
     await expect(
       service.fetch(
-        { id: "page_incomplete" },
+        { id: "page_complete" },
         toolContext(harness, "notion.fetch", "read"),
       ),
     ).resolves.toEqual({
+      workspace: { label: "Complete" },
+      result: {
+        id: "page_complete",
+        text: "Complete body",
+        truncated: false,
+      },
+    });
+  });
+
+  it("rejects malformed truncation metadata in JSON text results", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_malformed", "Malformed");
+    const fixture = sessionFixture(async () => ({
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            id: "page_malformed",
+            content: "Untrusted completeness",
+            truncated: "false",
+          }),
+        },
+      ],
+    }));
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+
+    await expect(
+      service.fetch(
+        { id: "page_malformed" },
+        toolContext(harness, "notion.fetch", "read"),
+      ),
+    ).rejects.toBeDefined();
+  });
+
+  it("treats reported omitted fetch subtrees as truncated", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_incomplete", "Incomplete");
+    const fixture = sessionFixture(async () => ({
+      structuredContent: {
+        id: "page_incomplete",
+        content: "Possibly incomplete body",
+        unknown_block_ids: ["block_omitted"],
+        unknown_block_count: 1,
+      },
+    }));
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+
+    const result = await service.fetch(
+      { id: "page_incomplete" },
+      toolContext(harness, "notion.fetch", "read"),
+    );
+
+    expect(result).toEqual({
       workspace: { label: "Incomplete" },
       result: {
         id: "page_incomplete",
@@ -180,6 +338,7 @@ describe("Notion read tools", () => {
         truncated: true,
       },
     });
+    expect(JSON.stringify(result)).not.toContain("block_omitted");
   });
 });
 

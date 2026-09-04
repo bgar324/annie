@@ -8,11 +8,7 @@ import type { ConnectionCapability, ConnectionRecord } from "../connections/type
 import { ModelSafeError } from "../core/errors.js";
 import type { TraceId, WriteIntentId } from "../core/ids.js";
 import type { WriteStore } from "../writes/store.js";
-import type {
-  NotionClientProvider,
-  NotionSession,
-  NotionUpstreamTool,
-} from "./client.js";
+import type { NotionClientProvider, NotionUpstreamTool } from "./client.js";
 
 const accountSchema = z.string().trim().min(1).max(160).optional();
 const searchArgumentsSchema = z
@@ -22,6 +18,9 @@ const searchArgumentsSchema = z
     pageSize: z.number().int().min(1).max(10).default(10),
   })
   .strict();
+const upstreamSearchArgumentsSchema = z
+  .object({ page_size: z.number().int().min(1).max(50) })
+  .loose();
 const fetchArgumentsSchema = z
   .object({
     id: z.string().trim().min(1).max(2_048),
@@ -116,6 +115,30 @@ const notionReferenceSchema = z
     timestamp: z.string().max(128).optional(),
   })
   .loose();
+interface NormalizedNotionReference {
+  readonly id?: string;
+  readonly title?: string;
+  readonly url?: string;
+  readonly type?: string;
+  readonly highlight?: string;
+  readonly timestamp?: string;
+}
+
+interface NormalizedNotionSearchResult {
+  readonly results: readonly NormalizedNotionReference[];
+  readonly truncated: boolean;
+  readonly pageScopedSearches?: readonly {
+    readonly pageId: string;
+    readonly results: readonly NormalizedNotionReference[];
+    readonly truncated: false;
+  }[];
+}
+
+interface NormalizedNotionTextResult {
+  readonly text: string;
+  readonly truncated: boolean;
+}
+
 const notionSearchResultSchema = z
   .object({ results: z.array(notionReferenceSchema).max(100) })
   .loose();
@@ -128,6 +151,8 @@ const notionFetchResultSchema = z
     text: z.string().max(maximumResultBytes).optional(),
     content: z.string().max(maximumResultBytes).optional(),
     markdown: z.string().max(maximumResultBytes).optional(),
+    unknown_block_ids: z.array(z.string().min(1).max(2_048)).max(50).optional(),
+    unknown_block_count: z.number().int().min(0).optional(),
   })
   .loose();
 const notionCreateResultSchema = z
@@ -177,7 +202,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.search",
-          description: "Search internal content in one connected Notion workspace. For automatic multi-account reads, call once per exact safe label in connected account status. A truncated result cannot establish an update target; narrow the query and search again.",
+          description: "Search internal content in one connected Notion workspace. For automatic multi-account reads, call once per exact safe label in connected account status. When an incomplete result contains one exact title candidate, Annie performs a complete page-scoped search for that candidate. A truncated result without that scoped proof cannot establish an update target; narrow the query and search again.",
           parameters: {
             type: "object",
             properties: {
@@ -269,7 +294,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.update_page",
-          description: "Update only a Notion page returned by a non-truncated notion.search and then fetched in this run, reusing its exact workspace label. Property, full-content, and text replacements require the current request to name the page; checkbox requests may instead name one unambiguous task. One replacement may include unchanged context, but a checkbox request must change exactly one marker. Text alone does not update it. Moving, deleting, and archiving are unavailable.",
+          description: "Update only a Notion page established by a complete same-run notion.search, including a complete page-scoped search added by Annie, and then fetched in this run using the same workspace label. Property, full-content, and text replacements require the current request to name the page; checkbox requests may instead name one unambiguous task. One replacement may include unchanged context, but a checkbox request must change exactly one marker. Text alone does not update it. Moving, deleting, and archiving are unavailable.",
           parameters: {
             type: "object",
             properties: {
@@ -347,15 +372,67 @@ export class NotionToolService {
     context: ToolExecutionContext,
   ): Promise<unknown> {
     const connection = this.#select("notion.search", input.workspace, context);
-    const result = await this.#clients.withSession(connection.id, context.traceId, async (session) =>
-      normalizeNotionResult(
-        "notion-search",
-        await session.call("notion-search", {
+    const result = await this.#clients.withSession(
+      connection.id,
+      context.traceId,
+      async (session) => {
+        const request = {
           query: input.query,
           query_type: "internal",
           page_size: input.pageSize,
-        }),
-      ),
+        } as const;
+        const initial = normalizeNotionResult(
+          "notion-search",
+          await session.call("notion-search", request),
+          request,
+        );
+        if (!("results" in initial) || !initial.truncated) {
+          return initial;
+        }
+
+        const queryTitle = notionSearchTitle(input.query);
+        const candidates = initial.results.filter(
+          (
+            reference,
+          ): reference is NormalizedNotionReference & { readonly id: string; readonly title: string } =>
+            typeof reference.id === "string" &&
+            typeof reference.title === "string" &&
+            notionSearchTitle(reference.title) === queryTitle,
+        );
+        const candidate = candidates[0];
+        if (queryTitle.length === 0 || candidates.length !== 1 || candidate === undefined) {
+          return initial;
+        }
+
+        const scopedRequest = {
+          query: input.query,
+          query_type: "internal",
+          page_url: candidate.id,
+          page_size: 50,
+        } as const;
+        const scoped = normalizeNotionResult(
+          "notion-search",
+          await session.call("notion-search", scopedRequest),
+          scopedRequest,
+        );
+        if (
+          !("results" in scoped) ||
+          scoped.truncated ||
+          !scoped.results.some((reference) => reference.id === candidate.id)
+        ) {
+          return initial;
+        }
+        return {
+          ...initial,
+          pageScopedSearches: [
+            {
+              pageId: candidate.id,
+              results: scoped.results,
+              truncated: false,
+            },
+          ],
+        };
+      },
       context.signal,
     );
     this.#markHealthy(connection, context.traceId);
@@ -576,6 +653,17 @@ function toUpdateArguments(
 }
 
 function normalizeNotionResult(
+  name: "notion-search",
+  raw: unknown,
+  argumentsValue: Record<string, unknown>,
+): NormalizedNotionSearchResult | NormalizedNotionTextResult;
+function normalizeNotionResult(
+  name: Exclude<NotionUpstreamTool, "notion-search">,
+  raw: unknown,
+  argumentsValue?: Record<string, unknown>,
+): unknown;
+
+function normalizeNotionResult(
   name: NotionUpstreamTool,
   raw: unknown,
   argumentsValue: Record<string, unknown> = {},
@@ -603,6 +691,7 @@ function normalizeNotionResult(
     if (typeof payload.value === "string") {
       return { text: payload.value, truncated: payload.truncated };
     }
+    const pageSize = upstreamSearchArgumentsSchema.parse(argumentsValue).page_size;
     const parsed = notionSearchResultSchema.parse(payload.value);
     return {
       results: parsed.results.map((result) => ({
@@ -615,7 +704,9 @@ function normalizeNotionResult(
           : { highlight: result.highlight ?? result.text_snippet }),
         ...(result.timestamp === undefined ? {} : { timestamp: result.timestamp }),
       })),
-      truncated: payload.truncated,
+      truncated:
+        payload.truncated ||
+        (payload.providerTruncation === undefined && parsed.results.length >= pageSize),
     };
   }
   if (name === "notion-fetch") {
@@ -624,13 +715,15 @@ function normalizeNotionResult(
     }
     const parsed = notionFetchResultSchema.parse(payload.value);
     const text = parsed.text ?? parsed.content ?? parsed.markdown;
+    const omittedBlocks =
+      (parsed.unknown_block_ids?.length ?? 0) > 0 || (parsed.unknown_block_count ?? 0) > 0;
     return {
       ...(parsed.id === undefined ? {} : { id: parsed.id }),
       ...(parsed.title === undefined ? {} : { title: parsed.title }),
       ...(parsed.url === undefined ? {} : { url: parsed.url }),
       ...(parsed.type === undefined ? {} : { type: parsed.type }),
       ...(text === undefined ? {} : { text }),
-      truncated: payload.truncated,
+      truncated: payload.truncated || omittedBlocks,
     };
   }
 
@@ -651,11 +744,13 @@ function normalizeNotionResult(
 
 function normalizedNotionPayload(
   result: z.infer<typeof toolResultSchema>,
-): { value: unknown; truncated: boolean } {
+): { value: unknown; truncated: boolean; providerTruncation?: boolean } {
   if (result.structuredContent !== undefined) {
+    const providerTruncation = notionPayloadTruncated(result.structuredContent);
     return {
       value: result.structuredContent,
-      truncated: notionPayloadTruncated(result.structuredContent),
+      truncated: providerTruncation === true,
+      ...(providerTruncation === undefined ? {} : { providerTruncation }),
     };
   }
   const text = (result.content ?? [])
@@ -663,25 +758,40 @@ function normalizedNotionPayload(
     .map((block) => block.text)
     .join("\n");
   const bounded = truncateUtf8(text, maximumResultBytes);
+  let value: unknown;
   try {
-    const value: unknown = JSON.parse(bounded.value);
-    return {
-      value,
-      truncated: bounded.truncated || notionPayloadTruncated(value),
-    };
+    value = JSON.parse(bounded.value) as unknown;
   } catch {
     return { value: bounded.value, truncated: bounded.truncated };
   }
+  const providerTruncation = notionPayloadTruncated(value);
+  return {
+    value,
+    truncated: bounded.truncated || providerTruncation === true,
+    ...(providerTruncation === undefined ? {} : { providerTruncation }),
+  };
 }
 
-function notionPayloadTruncated(value: unknown): boolean {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return false;
-  }
-  if (!("truncated" in value)) {
-    return true;
+function notionPayloadTruncated(value: unknown): boolean | undefined {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    !("truncated" in value)
+  ) {
+    return undefined;
   }
   return z.boolean().parse(value.truncated);
+}
+
+function notionSearchTitle(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/\p{M}/gu, "")
+    .toLowerCase()
+    .replace(/['’]/gu, "")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
 }
 
 function truncateUtf8(value: string, maximumBytes: number): { value: string; truncated: boolean } {

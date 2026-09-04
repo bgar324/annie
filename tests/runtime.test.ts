@@ -199,6 +199,15 @@ class FakeGoogleWorkspaceClients implements GoogleWorkspaceClientProvider {
 }
 
 
+interface FakeNotionClientOptions {
+  readonly fetchTruncated?: boolean;
+  readonly malformedFetchTruncation?: unknown;
+  readonly omitReadTruncationFlags?: boolean;
+  readonly pageScopedSearchResults?: readonly Record<string, unknown>[];
+  readonly pageScopedSearchTruncated?: boolean;
+  readonly structuredFetch?: boolean;
+}
+
 class FakeNotionClients implements NotionClientProvider {
   readonly selected: ConnectionId[] = [];
   readonly searches: Record<string, unknown>[] = [];
@@ -212,6 +221,7 @@ class FakeNotionClients implements NotionClientProvider {
       { id: "page_1", title: "Project page" },
     ],
     readonly searchTruncated = false,
+    readonly options: FakeNotionClientOptions = {},
   ) {}
 
   async withSession<T>(
@@ -242,23 +252,51 @@ class FakeNotionClients implements NotionClientProvider {
         }
         if (name === "notion-fetch") {
           this.fetches.push(argumentsValue);
+          if (Object.hasOwn(this.options, "malformedFetchTruncation")) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    content: this.fetchText,
+                    truncated: this.options.malformedFetchTruncation,
+                  }),
+                },
+              ],
+            };
+          }
+          if (this.options.structuredFetch === true) {
+            return {
+              structuredContent: {
+                content: this.fetchText,
+                ...(this.options.omitReadTruncationFlags === true
+                  ? {}
+                  : { truncated: this.options.fetchTruncated ?? false }),
+              },
+            };
+          }
           return { content: [{ type: "text", text: this.fetchText }] };
         }
         if (name !== "notion-search") {
           throw new Error(`Daily brief made an unexpected Notion call: ${name}`);
         }
         this.searches.push(argumentsValue);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                results: this.searchResults,
-                truncated: this.searchTruncated,
-              }),
-            },
-          ],
+        const pageScoped = typeof argumentsValue.page_url === "string";
+        const results =
+          pageScoped && this.options.pageScopedSearchResults !== undefined
+            ? this.options.pageScopedSearchResults
+            : this.searchResults;
+        const truncated =
+          pageScoped && this.options.pageScopedSearchTruncated !== undefined
+            ? this.options.pageScopedSearchTruncated
+            : this.searchTruncated;
+        const payload = {
+          results,
+          ...(this.options.omitReadTruncationFlags === true ? {} : { truncated }),
         };
+        return this.options.omitReadTruncationFlags === true
+          ? { structuredContent: payload }
+          : { content: [{ type: "text", text: JSON.stringify(payload) }] };
       },
     };
     return operation(session);
@@ -896,6 +934,110 @@ describe("production runtime", () => {
         },
       ],
     });
+  });
+
+  it("accepts the retry trace after completing omitted Notion read metadata", async () => {
+    const fetchedPage = [
+      "## Day 91: Thursday, September 3",
+      "### Ben's To-do's:",
+      "- [x] Buy restroom cleaning supplies",
+      "- [x] Clean restroom",
+      "- [ ] Clean and organize room",
+      "- [ ] Car wash",
+    ].join("\n");
+    const target = { id: "page_1", title: "Jadyn and Ben’s TO-DO’s!!!" };
+    const broadResults = [
+      target,
+      ...Array.from({ length: 9 }, (_, index) => ({
+        id: `other_${index}`,
+        title: `Other page ${index}`,
+      })),
+    ];
+    const model = new FakeModel();
+    model.responses.push(
+      toolCallResponse("retry_target_search", {
+        id: "call_retry_target_search",
+        name: "notion.search",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          query: "Jadyn and Ben's TO-DO's",
+        }),
+      }),
+      toolCallResponse("retry_target_fetch", {
+        id: "call_retry_target_fetch",
+        name: "notion.fetch",
+        argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+      }),
+      toolCallResponse("retry_target_write", {
+        id: "call_retry_target_write",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "update_content",
+          updates: [
+            {
+              oldText: "- [ ] Clean and organize room",
+              newText: "- [x] Clean and organize room",
+            },
+          ],
+        }),
+      }),
+      finalModelResponse("retry_target_done", "✅ done — clean and organize room is checked off."),
+    );
+    const notionClients = new FakeNotionClients(
+      true,
+      fetchedPage,
+      broadResults,
+      false,
+      {
+        omitReadTruncationFlags: true,
+        pageScopedSearchResults: [target],
+        structuredFetch: true,
+      },
+    );
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item);
+    gateway.inbox.push(
+      inboundMessage("msg_retry_target", {
+        text: "Mark clean and organize room done",
+      }),
+    );
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("done");
+    expect(notionClients.searches).toEqual([
+      {
+        query: "Jadyn and Ben's TO-DO's",
+        query_type: "internal",
+        page_size: 10,
+      },
+      {
+        query: "Jadyn and Ben's TO-DO's",
+        query_type: "internal",
+        page_url: "page_1",
+        page_size: 50,
+      },
+    ]);
+    expect(notionClients.writes).toEqual([
+      {
+        name: "notion-update-page",
+        argumentsValue: {
+          page_id: "page_1",
+          command: "update_content",
+          content_updates: [
+            {
+              old_str: "- [ ] Clean and organize room",
+              new_str: "- [x] Clean and organize room",
+              replace_all_matches: false,
+            },
+          ],
+        },
+      },
+    ]);
   });
 
   it("rejects a checkbox page absent from current search results", async () => {
@@ -1773,11 +1915,57 @@ describe("production runtime", () => {
       { id: "page_1", title: "Project page" },
       { id: "page_2", title: "Project page" },
     ]);
+
     const gateway = new FakeGateway();
     const item = await newRuntime(model, gateway, { notionClients });
     connectNotion(item);
     gateway.inbox.push(
       inboundMessage("msg_ambiguous_page_title", {
+        text: 'Update Status to SDK on Notion page "Project page" in Notion workspace Work',
+      }),
+    );
+
+    await sweep(item);
+    await runNextJob(item.runtime, Date.now() + 10);
+
+    expect(inboundState(item.runtime)).toBe("blocked");
+    expect(notionClients.writes).toHaveLength(0);
+  });
+
+  it("rejects a generic update after a search for an unrelated term", async () => {
+    const model = new FakeModel();
+    model.responses.push(
+      toolCallResponse("unrelated_page_search", {
+        id: "call_unrelated_page_search",
+        name: "notion.search",
+        argumentsJson: JSON.stringify({ workspace: "Work", query: "API" }),
+      }),
+      toolCallResponse("unrelated_page_fetch", {
+        id: "call_unrelated_page_fetch",
+        name: "notion.fetch",
+        argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+      }),
+      toolCallResponse("unrelated_page_write", {
+        id: "call_unrelated_page_write",
+        name: "notion.update_page",
+        argumentsJson: JSON.stringify({
+          workspace: "Work",
+          pageId: "page_1",
+          command: "update_properties",
+          properties: { Status: "SDK" },
+        }),
+      }),
+    );
+    const notionClients = new FakeNotionClients(
+      true,
+      "Project page",
+      [{ id: "page_1", title: "Project page" }],
+    );
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item);
+    gateway.inbox.push(
+      inboundMessage("msg_unrelated_page_search", {
         text: 'Update Status to SDK on Notion page "Project page" in Notion workspace Work',
       }),
     );
@@ -1818,6 +2006,10 @@ describe("production runtime", () => {
       "Project page",
       [{ id: "page_1", title: "Project page" }],
       true,
+      {
+        pageScopedSearchResults: [{ id: "page_1", title: "Project page" }],
+        pageScopedSearchTruncated: false,
+      },
     );
     const gateway = new FakeGateway();
     const item = await newRuntime(model, gateway, { notionClients });
@@ -1834,6 +2026,72 @@ describe("production runtime", () => {
     expect(inboundState(item.runtime)).toBe("blocked");
     expect(notionClients.writes).toHaveLength(0);
   });
+
+  it.each([
+    {
+      label: "incomplete",
+      options: { fetchTruncated: true, structuredFetch: true },
+    },
+    {
+      label: "malformed",
+      options: { malformedFetchTruncation: "false" },
+    },
+  ])(
+    "rejects a full-content replacement after $label fetch metadata",
+    async ({ options }) => {
+      const model = new FakeModel();
+      model.responses.push(
+        toolCallResponse("unsafe_fetch_search", {
+          id: "call_unsafe_fetch_search",
+          name: "notion.search",
+          argumentsJson: JSON.stringify({ workspace: "Work", query: "Project page" }),
+        }),
+        toolCallResponse("unsafe_fetch_read", {
+          id: "call_unsafe_fetch_read",
+          name: "notion.fetch",
+          argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+        }),
+        toolCallResponse("unsafe_fetch_write", {
+          id: "call_unsafe_fetch_write",
+          name: "notion.update_page",
+          argumentsJson: JSON.stringify({
+            workspace: "Work",
+            pageId: "page_1",
+            command: "replace_content",
+            newContent: "Replacement",
+          }),
+        }),
+      );
+      const notionClients = new FakeNotionClients(
+        true,
+        "Untrusted project page",
+        [{ id: "page_1", title: "Project page" }],
+        false,
+        options,
+      );
+      const gateway = new FakeGateway();
+      const item = await newRuntime(model, gateway, { notionClients });
+      connectNotion(item);
+      gateway.inbox.push(
+        inboundMessage(`msg_${options.structuredFetch === true ? "incomplete" : "malformed"}_fetch`, {
+          text: 'Replace content of Notion page "Project page" with Replacement in Notion workspace Work',
+        }),
+      );
+
+      await sweep(item);
+      await runNextJob(item.runtime, Date.now() + 10);
+
+      expect(inboundState(item.runtime)).toBe("blocked");
+      expect(notionClients.writes).toHaveLength(0);
+      expect(
+        item.runtime.database.db
+          .prepare<[], { count: number }>(
+            "SELECT COUNT(*) AS count FROM write_intents WHERE kind = 'notion_update_page'",
+          )
+          .get()?.count,
+      ).toBe(0);
+    },
+  );
 
   it.each([
     {
