@@ -46,7 +46,10 @@ export class FailureNotificationService {
         traceId: input.traceId,
         recipient: this.#recipient,
         purpose: "failure",
-        text: `I couldn't complete that request. Trace: ${input.traceId}`,
+        text:
+          input.failureCode === "missing_text"
+            ? "I can't process voice messages or other attachments yet. Please send your request as text."
+            : `I couldn't complete that request. Trace: ${input.traceId}`,
         ...(input.runId === undefined ? {} : { runId: input.runId }),
         ...(input.replyToGuid === undefined ? {} : { replyToGuid: input.replyToGuid }),
       });

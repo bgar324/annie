@@ -2042,11 +2042,17 @@ describe("production runtime", () => {
     expect(inboundState(item.runtime)).toBe("blocked");
     expect(
       item.runtime.database.db
-        .prepare<[], { purpose: string; reply_to_guid: string | null }>(
-          "SELECT purpose, reply_to_guid FROM egress_messages",
+        .prepare<[], { body: string; purpose: string; reply_to_guid: string | null }>(
+          "SELECT body, purpose, reply_to_guid FROM egress_messages",
         )
         .all(),
-    ).toEqual([{ purpose: "failure", reply_to_guid: "msg_media" }]);
+    ).toEqual([
+      {
+        body: "I can't process voice messages or other attachments yet. Please send your request as text.",
+        purpose: "failure",
+        reply_to_guid: "msg_media",
+      },
+    ]);
   });
 
   it("keeps inbound work reachable after a transient list failure", async () => {
