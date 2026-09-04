@@ -795,6 +795,15 @@ const MIGRATIONS: readonly Migration[] = [
         ON jobs(chat_id) WHERE status = 'running';
     `,
   },
+  {
+    version: 9,
+    sql: `
+      ALTER TABLE agent_runs ADD COLUMN request_scope TEXT
+      CHECK (request_scope IS NULL OR request_scope IN (
+        'conversation', 'read', 'notion_write', 'connect_google', 'connect_notion'
+      ));
+    `,
+  },
 ];
 
 export function runMigrations(
