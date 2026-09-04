@@ -1107,6 +1107,17 @@ describe("production runtime", () => {
       expectedPurpose: "reply",
     },
     {
+      label: "generic wording for action-stripped shorthand",
+      selectedLines: ["- [x] Clean room"],
+      relatedLines: [],
+      response: exactCheckboxNoOpResponse,
+      request: "Mark room done",
+      secondWorkspace: false,
+      fetchTruncated: false,
+      expectedState: "blocked",
+      expectedPurpose: "failure",
+    },
+    {
       label: "one unique exact task still unchecked",
       selectedLines: ["- [ ] Clean and organize room"],
       relatedLines: [],

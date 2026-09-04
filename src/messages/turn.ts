@@ -1657,7 +1657,7 @@ function checkboxNoOpIsProved(
   response: string,
 ): boolean {
   const authorizedStates = taskCheckboxStates(text, (labelTokens) =>
-    taskLabelTokenMatches(authorization.targetTokens, labelTokens),
+    sameTokens(authorization.targetTokens, labelTokens),
   );
   if (authorizedStates.length === 1 && authorizedStates[0] === authorization.checked) {
     return true;
@@ -1678,7 +1678,7 @@ function checkboxNoOpIsProved(
   const relatedCount = taskCheckboxStates(text, (labelTokens) =>
     tokensAppearInOrder(authorization.targetTokens, labelTokens),
   ).length;
-  return relatedCount <= 1 || responseAsksTaskClarification(response);
+  return relatedCount > 0 && responseAsksTaskClarification(response);
 }
 
 function quotedAlreadySetTaskTokens(
