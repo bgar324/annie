@@ -46,10 +46,7 @@ export class FailureNotificationService {
         traceId: input.traceId,
         recipient: this.#recipient,
         purpose: "failure",
-        text:
-          input.failureCode === "missing_text"
-            ? "I can only process text messages right now. Please type your request."
-            : `I couldn't complete that request. Trace: ${input.traceId}`,
+        text: failureNotificationText(input.failureCode, input.traceId),
         ...(input.runId === undefined ? {} : { runId: input.runId }),
         ...(input.replyToGuid === undefined ? {} : { replyToGuid: input.replyToGuid }),
       });
@@ -88,4 +85,17 @@ export class FailureNotificationService {
       `)
       .get({ trace_id: traceId })?.id;
   }
+}
+
+function failureNotificationText(failureCode: string, traceId: TraceId): string {
+  if (failureCode === "missing_text") {
+    return "I can only process text messages right now. Please type your request.";
+  }
+  if (failureCode === "unverified_write_claim") {
+    return `I didn't confirm that provider change, so I didn't report it as done. Trace: ${traceId}`;
+  }
+  if (failureCode === "ambiguous_write") {
+    return `The provider may have accepted that change, so I stopped without retrying it. Trace: ${traceId}`;
+  }
+  return `I couldn't complete that request. Trace: ${traceId}`;
 }

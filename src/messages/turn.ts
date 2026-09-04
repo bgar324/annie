@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import type { AgentLoop } from "../agent/loop.js";
-import type { ModelMessage } from "../agent/model.js";
+import type { ModelMessage, ModelToolCall } from "../agent/model.js";
 import type { ConversationHistoryStore } from "../agent/history.js";
 import type { AgentRunRecord, AgentRunStore } from "../agent/store.js";
 import { buildAssistantSystemPrompt } from "../agent/prompt.js";
@@ -21,6 +21,64 @@ import type { MessageEgressService } from "./egress.js";
 import type { FailureNotificationService } from "./failure.js";
 
 const explicitConnectToolCallId = "explicit_connection_request";
+type ProviderWriteScope = { workspace?: string };
+type ProviderWriteAuthorization =
+  | (ProviderWriteScope & { kind: "notion_create_page"; title: string; content?: string })
+  | (ProviderWriteScope & {
+      kind: "notion_update_property";
+      property: string;
+      value: string;
+    })
+  | (ProviderWriteScope & { kind: "notion_replace_content"; content: string })
+  | (ProviderWriteScope & {
+      kind: "notion_replace_text";
+      oldText: string;
+      newText: string;
+      replaceAllMatches: boolean;
+    })
+  | (ProviderWriteScope & {
+      kind: "notion_task_checkbox";
+      checked: boolean;
+      targetTokens: readonly string[];
+    });
+const taskTargetStopWords: ReadonlySet<string> = new Set([
+  "a",
+  "an",
+  "as",
+  "box",
+  "checkbox",
+  "it",
+  "item",
+  "my",
+  "our",
+  "task",
+  "the",
+  "this",
+  "to",
+  "todo",
+]);
+const taskLabelActionVerbs: ReadonlySet<string> = new Set([
+  "add",
+  "buy",
+  "call",
+  "clean",
+  "create",
+  "finish",
+  "get",
+  "make",
+  "organize",
+  "pull",
+  "read",
+  "review",
+  "send",
+  "update",
+  "wash",
+]);
+const checkboxMarkerPattern = /\[(?: |x|X)\]/gu;
+const agentWriteSuccessClaimPattern =
+  /\b(?:i|we)(?:'ve| have| just)?\s+(?:successfully\s+)?(?:updated|changed|edited|saved|created|added|sent|scheduled|rescheduled|cancelled|canceled|removed|deleted|archived|renamed|marked)\b/u;
+const agentDidWriteSuccessClaimPattern =
+  /\b(?:i|we)\s+did\s+(?:successfully\s+)?(?:update|change|edit|save|create|add|send|schedule|reschedule|cancel|remove|delete|archive|rename|mark)\b/u;
 
 interface InboundTurnRow {
   id: InboundId;
@@ -90,6 +148,7 @@ export class InboundTurnService {
       throw new Error(`Inbound ${inbound.id} cannot run from ${inbound.state}`);
     }
     const userMessage = inbound.text?.trim() ?? "";
+    const providerWriteAuthorization = currentMessageProviderWriteAuthorization(userMessage);
     context.assertLease();
     try {
       if (inbound.state === "done") {
@@ -132,6 +191,21 @@ export class InboundTurnService {
           );
           return;
         }
+        const completionRejection = this.#providerWriteCompletionRejection(
+          completed.id,
+          providerWriteAuthorization,
+          completed.finalResponse,
+        );
+        if (completionRejection !== undefined) {
+          this.#failures.plan({
+            traceId: inbound.trace_id,
+            failureCode: completionRejection,
+            runId: completed.id,
+            replyToGuid: inbound.guid,
+          });
+          this.#runs.quarantineCompleted(completed.id, completionRejection);
+          return;
+        }
         this.#finishCompletedTurn(
           inbound,
           completed.id,
@@ -166,12 +240,23 @@ export class InboundTurnService {
         );
         return;
       }
+      const providerWriteGuard = this.#providerWriteToolCallGuard(
+        inbound.id,
+        providerWriteAuthorization,
+      );
       const result = await this.#agent.execute({
         source: { kind: "inbound", inboundId: inbound.id },
         traceId: inbound.trace_id,
         initialMessages,
-        toolCallGuard: (call) =>
-          this.#connectionToolCallRejection(inbound.id, call.name, call.id),
+        toolCallGuard: (call, operationClass) =>
+          this.#connectionToolCallRejection(inbound.id, call.name, call.id) ??
+          providerWriteGuard(call, operationClass === "write"),
+        completionGuard: ({ runId, response }) =>
+          this.#providerWriteCompletionRejection(
+            runId,
+            providerWriteAuthorization,
+            response,
+          ),
         jobLease: { jobId: job.id, leaseToken: job.leaseToken },
       });
       context.assertLease();
@@ -413,6 +498,182 @@ export class InboundTurnService {
     );
   }
 
+  #providerWriteToolCallGuard(
+    inboundId: InboundId,
+    authorization: ProviderWriteAuthorization | undefined,
+  ): (call: ModelToolCall, isWrite: boolean) => string | undefined {
+    const preparedWrites = this.#db
+      .prepare<{ inbound_id: string }, { tool_call_id: string }>(`
+        SELECT tools.tool_call_id
+        FROM tool_executions AS tools
+        JOIN agent_runs AS runs ON runs.id = tools.run_id
+        WHERE runs.inbound_id = @inbound_id
+          AND tools.operation_class = 'write'
+        ORDER BY tools.created_at_ms, tools.id
+        LIMIT 2
+      `)
+      .all({ inbound_id: inboundId });
+    let authorizedCallId = preparedWrites[0]?.tool_call_id;
+    const alreadyExceeded = preparedWrites.length > 1;
+    return (call, isWrite) => {
+      if (
+        isWrite &&
+        (alreadyExceeded ||
+          (authorizedCallId !== undefined && authorizedCallId !== call.id))
+      ) {
+        return "The current request authorizes at most one provider write";
+      }
+      let rejection = providerWriteToolCallRejection(authorization, call, isWrite);
+      if (rejection === undefined) {
+        rejection = this.#unscopedWorkspaceRejection(authorization, call, isWrite);
+      }
+      if (isWrite && rejection === undefined) {
+        authorizedCallId = call.id;
+      }
+      return rejection;
+    };
+  }
+
+  #unscopedWorkspaceRejection(
+    authorization: ProviderWriteAuthorization | undefined,
+    call: ModelToolCall,
+    isWrite: boolean,
+  ): string | undefined {
+    if (!isWrite || authorization === undefined || authorization.workspace !== undefined) {
+      return undefined;
+    }
+    const workspace = modelCallArguments(call)?.workspace;
+    if (workspace === undefined) {
+      return undefined;
+    }
+    if (typeof workspace !== "string") {
+      return "The provider write exceeds the authorized account scope";
+    }
+    const capability = notionWriteCapability(authorization);
+    const eligible = this.#connections
+      .list()
+      .filter(
+        (connection) =>
+          connection.provider === "notion" &&
+          connection.status === "healthy" &&
+          connection.capabilities.includes(capability),
+      );
+    return eligible.length === 1 &&
+      workspace.trim() === eligible[0]?.safeLabel
+      ? undefined
+      : "An unscoped provider write cannot select among multiple accounts";
+  }
+
+  #providerWriteCompletionRejection(
+    runId: RunId,
+    authorization: ProviderWriteAuthorization | undefined,
+    response: string,
+  ): string | undefined {
+    if (this.#hasSucceededProviderWrite(runId)) {
+      return undefined;
+    }
+    if (
+      authorization !== undefined &&
+      this.#isValidatedConnectionClarification(runId, authorization, response)
+    ) {
+      return undefined;
+    }
+    return authorization !== undefined || claimsUnrequestedProviderWrite(response)
+      ? "unverified_write_claim"
+      : undefined;
+  }
+
+  #isValidatedConnectionClarification(
+    runId: RunId,
+    authorization: ProviderWriteAuthorization,
+    response: string,
+  ): boolean {
+    const rows = this.#db
+      .prepare<
+        { run_id: string },
+        {
+          tool_name: string;
+          status: string;
+          result_json: string | null;
+          write_intent_id: string | null;
+        }
+      >(`
+        SELECT tools.tool_name, tools.status, tools.result_json,
+               writes.id AS write_intent_id
+        FROM tool_executions AS tools
+        LEFT JOIN write_intents AS writes ON writes.tool_execution_id = tools.id
+        WHERE tools.run_id = @run_id
+          AND tools.operation_class = 'write'
+        ORDER BY tools.created_at_ms, tools.id
+        LIMIT 2
+      `)
+      .all({ run_id: runId });
+    const row = rows[0];
+    const expectedTool =
+      authorization.kind === "notion_create_page"
+        ? "notion.create_page"
+        : "notion.update_page";
+    if (
+      rows.length !== 1 ||
+      row === undefined ||
+      row.tool_name !== expectedTool ||
+      row.status !== "failed" ||
+      row.write_intent_id !== null ||
+      toolErrorCode(row.result_json) !== "connection_ambiguous"
+    ) {
+      return false;
+    }
+    const lines = response
+      .trim()
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    const question = lines[1] ?? "";
+    if (
+      lines.length !== 2 ||
+      lines[0] !== "🗂️ workspace:" ||
+      !/^› (?:which|what)\s+(?:notion\s+)?(?:workspace|account)\b.*\?$/iu.test(question) ||
+      !/\brepeat\b/iu.test(question) ||
+      !/\bin notion workspace\b/iu.test(question)
+    ) {
+      return false;
+    }
+    const capability =
+      authorization.kind === "notion_create_page"
+        ? "notion.create_page"
+        : "notion.update_page";
+    const quotedLabels = this.#connections
+      .list()
+      .filter(
+        (connection) =>
+          connection.provider === "notion" &&
+          connection.status === "healthy" &&
+          connection.capabilities.includes(capability),
+      )
+      .map((connection) => JSON.stringify(connection.safeLabel));
+    return (
+      quotedLabels.length > 1 &&
+      quotedLabels.every((label) => question.includes(label))
+    );
+  }
+
+  #hasSucceededProviderWrite(runId: RunId): boolean {
+    return (
+      this.#db
+        .prepare<{ run_id: string }, { found: number }>(`
+          SELECT 1 AS found
+          FROM tool_executions AS tools
+          JOIN write_intents AS writes ON writes.tool_execution_id = tools.id
+          WHERE tools.run_id = @run_id
+            AND tools.operation_class = 'write'
+            AND tools.status = 'succeeded'
+            AND writes.state = 'succeeded'
+          LIMIT 1
+        `)
+        .get({ run_id: runId }) !== undefined
+    );
+  }
+
   #blockWithoutRun(inbound: InboundTurnRow, failureCode: string): void {
     const transaction = this.#db.transaction(() => {
       this.#db
@@ -463,6 +724,486 @@ export class InboundTurnService {
       },
     });
   }
+}
+
+function providerWriteToolCallRejection(
+  authorization: ProviderWriteAuthorization | undefined,
+  call: ModelToolCall,
+  isWrite: boolean,
+): string | undefined {
+  if (!isWrite) {
+    return undefined;
+  }
+  if (authorization === undefined) {
+    return "A provider write requires explicit authorization in the current raw user message";
+  }
+  let matches: boolean;
+  switch (authorization.kind) {
+    case "notion_create_page":
+      matches = createPageCallMatches(authorization, call);
+      break;
+    case "notion_update_property":
+      matches = updatePropertyCallMatches(authorization, call);
+      break;
+    case "notion_replace_content":
+      matches = replaceContentCallMatches(authorization, call);
+      break;
+    case "notion_replace_text":
+      matches = replaceTextCallMatches(authorization, call);
+      break;
+    case "notion_task_checkbox":
+      matches = taskCheckboxCallMatches(authorization, call.name, modelCallArguments(call));
+      break;
+  }
+  return matches ? undefined : "The provider write exceeds the authorized change";
+}
+
+function currentMessageProviderWriteAuthorization(
+  message: string,
+): ProviderWriteAuthorization | undefined {
+  const scoped = scopedWriteRequest(directRequestBody(message));
+  const authorization =
+    createPageAuthorization(scoped.request) ??
+    replaceContentAuthorization(scoped.request) ??
+    replaceTextAuthorization(scoped.request) ??
+    updatePropertyAuthorization(scoped.request) ??
+    taskCheckboxAuthorization(scoped.request);
+  return authorization === undefined || scoped.workspace === undefined
+    ? authorization
+    : { ...authorization, workspace: scoped.workspace };
+}
+
+function directRequestBody(message: string): string {
+  return message
+    .trim()
+    .replaceAll("’", "'")
+    .replaceAll("“", '"')
+    .replaceAll("”", '"')
+    .replace(/^(?:(?:hey|hi)\s+)?annie(?:[\s,:-]+|$)/iu, "")
+    .trimStart()
+    .replace(/^(?:please|pls)(?:[\s,:-]+|$)/iu, "")
+    .trimStart()
+    .replace(
+      /^(?:(?:can|could|would|will)\s+you|(?:i'd|i would)\s+like\s+you\s+to|i\s+(?:want|need)\s+you\s+to)(?:[\s,:-]+|$)/iu,
+      "",
+    )
+    .trimStart()
+    .replace(/^(?:please|pls)(?:[\s,:-]+|$)/iu, "")
+    .trimStart();
+}
+
+function scopedWriteRequest(
+  request: string,
+): { request: string; workspace?: string } {
+  const match =
+    /^(.*?)\s+in\s+(?:the\s+)?(?:notion\s+)?workspace\s+(?:(["'])(.+?)\2|(.+?))[.!?]*$/iu.exec(
+      request,
+    );
+  if (match?.[1] === undefined) {
+    return { request };
+  }
+  const workspace = (match[3] ?? match[4] ?? "").trim();
+  return workspace.length === 0
+    ? { request: "" }
+    : { request: match[1].trimEnd(), workspace };
+}
+
+function createPageAuthorization(
+  request: string,
+): Extract<ProviderWriteAuthorization, { kind: "notion_create_page" }> | undefined {
+  const requested =
+    /^(?:create|make|add)\s+(?:a\s+)?(?:new\s+)?(?:notion\s+)?page\s+(?:called|named|titled)\s+(.+)$/iu.exec(
+      request,
+    )?.[1];
+  if (requested === undefined) {
+    return undefined;
+  }
+  const contentMatch = /^(.+?)\s+with\s+(?:content|body)\s*:?\s*(.+)$/iu.exec(requested);
+  const title = mutationValue(contentMatch?.[1] ?? requested);
+  const content = contentMatch?.[2] === undefined ? undefined : mutationValue(contentMatch[2]);
+  return title === undefined || (contentMatch !== null && content === undefined)
+    ? undefined
+    : {
+        kind: "notion_create_page",
+        title,
+        ...(content === undefined ? {} : { content }),
+      };
+}
+
+function replaceContentAuthorization(
+  request: string,
+): Extract<ProviderWriteAuthorization, { kind: "notion_replace_content" }> | undefined {
+  const replacement =
+    /^replace\s+(?:the\s+)?(?:(?:notion\s+)?(?:page|doc(?:ument)?)\s+)?(?:content|body)\s+with\s+(.+)$/iu.exec(
+      request,
+    )?.[1] ??
+    /^replace\s+(?:the\s+)?(?:content|body)\s+(?:of|in|on)\s+(?:the\s+)?(?:notion\s+)?(?:page|doc(?:ument)?)\s+with\s+(.+)$/iu.exec(
+      request,
+    )?.[1];
+  const content = replacement === undefined ? undefined : mutationValue(replacement);
+  return content === undefined ? undefined : { kind: "notion_replace_content", content };
+}
+
+function replaceTextAuthorization(
+  request: string,
+): Extract<ProviderWriteAuthorization, { kind: "notion_replace_text" }> | undefined {
+  const match =
+    /^(?:replace|change)\s+(?:all(?:\s+occurrences?\s+of)?\s+)?(["'])(.+?)\1\s+(?:with|to)\s+(["'])(.*?)\3(?:\s+(?:in|on)\b.*)?[.!?]*$/iu.exec(
+      request,
+    );
+  if (match?.[2] === undefined || match[4] === undefined) {
+    return undefined;
+  }
+  return {
+    kind: "notion_replace_text",
+    oldText: match[2],
+    newText: match[4],
+    replaceAllMatches: /^(?:replace|change)\s+all(?:\s+occurrences?\s+of)?\s/iu.test(
+      request,
+    ),
+  };
+}
+
+function updatePropertyAuthorization(
+  request: string,
+): Extract<ProviderWriteAuthorization, { kind: "notion_update_property" }> | undefined {
+  const rename =
+    /^rename\s+(?:the\s+)?(?:notion\s+)?(?:page|doc(?:ument)?)\s+to\s+(.+)$/iu.exec(
+      request,
+    )?.[1];
+  if (rename !== undefined) {
+    const value = mutationValue(rename);
+    return value === undefined
+      ? undefined
+      : { kind: "notion_update_property", property: "title", value };
+  }
+  const match = /^(?:set|change|update)\s+(?:the\s+)?(.+?)\s+(?:to|as)\s+(.+)$/iu.exec(
+    request,
+  );
+  if (match?.[1] === undefined || match[2] === undefined) {
+    return undefined;
+  }
+  const property = mutationValue(match[1]);
+  const value = mutationValue(
+    match[2].replace(
+      /\s+(?:on|in)\s+(?:the\s+)?(?:notion\s+)?(?:page|doc(?:ument)?|database|workspace)(?:\s+.*)?$/iu,
+      "",
+    ),
+  );
+  if (
+    property === undefined ||
+    value === undefined ||
+    (property.match(/[a-z0-9]+/giu)?.length ?? 0) > 4
+  ) {
+    return undefined;
+  }
+  return {
+    kind: "notion_update_property",
+    property: normalizeIdentifier(property),
+    value,
+  };
+}
+
+function createPageCallMatches(
+  authorization: Extract<ProviderWriteAuthorization, { kind: "notion_create_page" }>,
+  call: ModelToolCall,
+): boolean {
+  const args = call.name === "notion.create_page" ? modelCallArguments(call) : undefined;
+  const properties = asRecord(args?.properties);
+  if (
+    args === undefined ||
+    properties === undefined ||
+    !hasOnlyKeys(args, ["workspace", "parent", "properties", "content"])
+  ) {
+    return false;
+  }
+  const entries = Object.entries(properties);
+  const title = entries[0];
+  return (
+    workspaceMatches(authorization, args) &&
+    entries.length === 1 &&
+    title !== undefined &&
+    ["name", "title"].includes(normalizeIdentifier(title[0])) &&
+    typeof title[1] === "string" &&
+    normalizeMutationText(title[1]) === authorization.title &&
+    (authorization.content === undefined
+      ? args.content === undefined
+      : typeof args.content === "string" &&
+        normalizeMutationText(args.content) === authorization.content)
+  );
+}
+
+function updatePropertyCallMatches(
+  authorization: Extract<ProviderWriteAuthorization, { kind: "notion_update_property" }>,
+  call: ModelToolCall,
+): boolean {
+  const args = call.name === "notion.update_page" ? modelCallArguments(call) : undefined;
+  const properties = asRecord(args?.properties);
+  if (
+    args?.command !== "update_properties" ||
+    properties === undefined ||
+    !hasOnlyKeys(args, ["workspace", "pageId", "command", "properties"])
+  ) {
+    return false;
+  }
+  const entries = Object.entries(properties);
+  const property = entries[0];
+  if (entries.length !== 1 || property === undefined) {
+    return false;
+  }
+  const propertyName = normalizeIdentifier(property[0]);
+  return (
+    workspaceMatches(authorization, args) &&
+    (propertyName === authorization.property ||
+      (authorization.property === "title" && propertyName === "name")) &&
+    normalizeMutationText(scalarText(property[1])) === authorization.value
+  );
+}
+
+function replaceContentCallMatches(
+  authorization: Extract<ProviderWriteAuthorization, { kind: "notion_replace_content" }>,
+  call: ModelToolCall,
+): boolean {
+  const args = call.name === "notion.update_page" ? modelCallArguments(call) : undefined;
+  return (
+    args?.command === "replace_content" &&
+    workspaceMatches(authorization, args) &&
+    hasOnlyKeys(args, ["workspace", "pageId", "command", "newContent"]) &&
+    typeof args.newContent === "string" &&
+    normalizeMutationText(args.newContent) === authorization.content
+  );
+}
+
+function replaceTextCallMatches(
+  authorization: Extract<ProviderWriteAuthorization, { kind: "notion_replace_text" }>,
+  call: ModelToolCall,
+): boolean {
+  const args = call.name === "notion.update_page" ? modelCallArguments(call) : undefined;
+  if (
+    args?.command !== "update_content" ||
+    !workspaceMatches(authorization, args) ||
+    !hasOnlyKeys(args, ["workspace", "pageId", "command", "updates"]) ||
+    !Array.isArray(args.updates) ||
+    args.updates.length !== 1
+  ) {
+    return false;
+  }
+  const update = asRecord(args.updates[0]);
+  if (
+    update === undefined ||
+    !hasOnlyKeys(update, ["oldText", "newText", "replaceAllMatches"]) ||
+    typeof update.oldText !== "string" ||
+    typeof update.newText !== "string" ||
+    (update.replaceAllMatches ?? false) !== authorization.replaceAllMatches
+  ) {
+    return false;
+  }
+  const oldText = update.oldText;
+  const oldIndex = oldText.indexOf(authorization.oldText);
+  if (
+    oldIndex === -1 ||
+    oldText.indexOf(authorization.oldText, oldIndex + authorization.oldText.length) !== -1
+  ) {
+    return false;
+  }
+  return (
+    update.newText ===
+    oldText.slice(0, oldIndex) +
+      authorization.newText +
+      oldText.slice(oldIndex + authorization.oldText.length)
+  );
+}
+
+function modelCallArguments(call: ModelToolCall): Record<string, unknown> | undefined {
+  try {
+    return asRecord(JSON.parse(call.argumentsJson));
+  } catch {
+    return undefined;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function toolErrorCode(resultJson: string | null): string | undefined {
+  if (resultJson === null) {
+    return undefined;
+  }
+  try {
+    const error = asRecord(asRecord(JSON.parse(resultJson))?.error);
+    return typeof error?.code === "string" ? error.code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function mutationValue(value: string): string | undefined {
+  let normalized = value.trim();
+  const quote = normalized[0];
+  if (
+    normalized.length >= 2 &&
+    (quote === '"' || quote === "'") &&
+    normalized.at(-1) === quote
+  ) {
+    normalized = normalized.slice(1, -1).trim();
+  } else {
+    normalized = normalized.replace(/[.!?]+$/u, "").trimEnd();
+  }
+  normalized = normalizeMutationText(normalized);
+  return normalized.length === 0 ? undefined : normalized;
+}
+
+function normalizeMutationText(value: string): string {
+  return value.trim().replace(/\s+/gu, " ");
+}
+
+function notionWriteCapability(
+  authorization: ProviderWriteAuthorization,
+): "notion.create_page" | "notion.update_page" {
+  return authorization.kind === "notion_create_page"
+    ? "notion.create_page"
+    : "notion.update_page";
+}
+
+function workspaceMatches(
+  authorization: ProviderWriteScope,
+  argumentsValue: Record<string, unknown>,
+): boolean {
+  return (
+    authorization.workspace === undefined ||
+    (typeof argumentsValue.workspace === "string" &&
+      argumentsValue.workspace.trim() === authorization.workspace)
+  );
+}
+
+function normalizeIdentifier(value: string): string {
+  return normalizeMutationText(value).toLowerCase();
+}
+
+function scalarText(value: unknown): string {
+  return value === null ? "null" : String(value);
+}
+
+function taskCheckboxAuthorization(
+  request: string,
+): Extract<ProviderWriteAuthorization, { kind: "notion_task_checkbox" }> | undefined {
+  const checkedTarget =
+    /^(?:mark|make|set)\s+(.+?)\s+(?:as\s+)?(?:done|complete|completed|finished)[.!?]*$/iu.exec(
+      request,
+    )?.[1] ??
+    /^(?:check|tick)\s+off\s+(.+?)[.!?]*$/iu.exec(request)?.[1] ??
+    /^(?:check|tick)\s+(.+?)\s+off[.!?]*$/iu.exec(request)?.[1];
+  if (checkedTarget !== undefined) {
+    return taskCheckboxAuthorizationFor(checkedTarget, true);
+  }
+  const uncheckedTarget =
+    /^(?:mark|make|set)\s+(.+?)\s+(?:as\s+)?(?:not done|incomplete|unchecked)[.!?]*$/iu.exec(
+      request,
+    )?.[1] ?? /^uncheck\s+(.+?)[.!?]*$/iu.exec(request)?.[1];
+  return uncheckedTarget === undefined
+    ? undefined
+    : taskCheckboxAuthorizationFor(uncheckedTarget, false);
+}
+
+function taskCheckboxAuthorizationFor(
+  target: string,
+  checked: boolean,
+): Extract<ProviderWriteAuthorization, { kind: "notion_task_checkbox" }> | undefined {
+  const targetTokens = normalizeTaskTokens(
+    target.toLowerCase().match(/[a-z0-9]+/gu) ?? [],
+  );
+  return targetTokens.length === 0
+    ? undefined
+    : { kind: "notion_task_checkbox", checked, targetTokens };
+}
+
+function taskCheckboxCallMatches(
+  authorization: Extract<ProviderWriteAuthorization, { kind: "notion_task_checkbox" }>,
+  toolName: string,
+  argumentsValue: Record<string, unknown> | undefined,
+): boolean {
+  if (
+    toolName !== "notion.update_page" ||
+    argumentsValue?.command !== "update_content" ||
+    !workspaceMatches(authorization, argumentsValue) ||
+    !hasOnlyKeys(argumentsValue, ["workspace", "pageId", "command", "updates"])
+  ) {
+    return false;
+  }
+  const updates = argumentsValue.updates;
+  if (!Array.isArray(updates) || updates.length !== 1) {
+    return false;
+  }
+  const update = asRecord(updates[0]);
+  if (
+    update === undefined ||
+    !hasOnlyKeys(update, ["oldText", "newText", "replaceAllMatches"]) ||
+    typeof update.oldText !== "string" ||
+    typeof update.newText !== "string" ||
+    update.replaceAllMatches === true
+  ) {
+    return false;
+  }
+  const oldMarkers = update.oldText.match(checkboxMarkerPattern) ?? [];
+  const newMarkers = update.newText.match(checkboxMarkerPattern) ?? [];
+  if (
+    oldMarkers.length !== 1 ||
+    newMarkers.length !== 1 ||
+    (authorization.checked
+      ? oldMarkers[0] !== "[ ]" || newMarkers[0]?.toLowerCase() !== "[x]"
+      : oldMarkers[0]?.toLowerCase() !== "[x]" || newMarkers[0] !== "[ ]") ||
+    update.oldText.replace(checkboxMarkerPattern, "[?]") !==
+      update.newText.replace(checkboxMarkerPattern, "[?]")
+  ) {
+    return false;
+  }
+  return sameTokens(authorization.targetTokens, taskLabelTokens(update.oldText));
+}
+
+function taskLabelTokens(text: string): readonly string[] {
+  const checkboxLine = text
+    .split(/\r?\n/u)
+    .find((line) => /\[(?: |x|X)\]/u.test(line));
+  const marker =
+    checkboxLine === undefined ? null : /\[(?: |x|X)\]/u.exec(checkboxLine);
+  return marker === null || checkboxLine === undefined
+    ? []
+    : normalizeTaskTokens(
+        checkboxLine
+          .slice(marker.index + marker[0].length)
+          .toLowerCase()
+          .match(/[a-z0-9]+/gu) ?? [],
+      );
+}
+
+function normalizeTaskTokens(input: readonly string[]): readonly string[] {
+  const tokens = [...input];
+  if (tokens[0] === "work" && tokens[1] === "on") {
+    tokens.splice(0, 2);
+  } else if (tokens[0] !== undefined && taskLabelActionVerbs.has(tokens[0])) {
+    tokens.shift();
+  }
+  return tokens.filter((token) => !taskTargetStopWords.has(token));
+}
+
+
+function sameTokens(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((token, index) => token === right[index]);
+}
+
+function claimsUnrequestedProviderWrite(response: string): boolean {
+  const normalized = response.trim().toLowerCase().replaceAll("’", "'");
+  return (
+    agentWriteSuccessClaimPattern.test(normalized) ||
+    agentDidWriteSuccessClaimPattern.test(normalized)
+  );
 }
 
 function explicitConnectAction(provider: ConnectionProvider) {

@@ -922,6 +922,34 @@ describe("failure notifications", () => {
       harness.traces.list(traceId).some((event) => event.component === "failure_notification"),
     ).toBe(true);
   });
+  it.each([
+    [
+      "unverified_write_claim",
+      "I didn't confirm that provider change, so I didn't report it as done.",
+    ],
+    [
+      "ambiguous_write",
+      "The provider may have accepted that change, so I stopped without retrying it.",
+    ],
+  ])("explains the %s write failure without claiming success", (failureCode, message) => {
+    const harness = createMessagingHarness();
+    const traceId = newTraceId();
+    const failures = new FailureNotificationService({
+      db: harness.database.handle.db,
+      config: harness.config,
+      egress: harness.egress,
+      queue: harness.queue,
+      traces: harness.traces,
+    });
+
+    const egressId = failures.plan({ traceId, failureCode });
+
+    expect(egressRow(harness, egressId)).toMatchObject({
+      body: `${message} Trace: ${traceId}`,
+      purpose: "failure",
+    });
+  });
+
 
   it("keeps a committed reply when a later retry tries to plan failure", () => {
     const harness = createMessagingHarness();

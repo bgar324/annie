@@ -138,7 +138,14 @@ const notionCreateResultSchema = z
   })
   .loose()
   .refine((value) => value.pages !== undefined || value.id !== undefined);
-const notionUpdateResultSchema = z.object({ page_id: z.string().min(1).max(2_048) }).loose();
+const notionUpdateRequestSchema = z.object({ page_id: z.string().min(1).max(2_048) }).loose();
+const notionUpdateResponseSchema = z
+  .object({
+    id: z.string().min(1).max(2_048).optional(),
+    page_id: z.string().min(1).max(2_048).optional(),
+  })
+  .loose()
+  .refine((value) => value.id !== undefined || value.page_id !== undefined);
 
 export class NotionToolService {
   readonly #db: Database.Database;
@@ -208,7 +215,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.create_page",
-          description: "Create exactly one Notion page with narrow properties and optional text content.",
+          description: "Create one Notion page with narrow properties and optional text. Text alone does not create it.",
           parameters: {
             type: "object",
             properties: {
@@ -261,7 +268,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.update_page",
-          description: "Narrowly update Notion page properties or text content. Moving, deleting, and archiving are unavailable.",
+          description: "Narrowly update Notion page properties or text content. Text alone does not update it. Moving, deleting, and archiving are unavailable.",
           parameters: {
             type: "object",
             properties: {
@@ -577,8 +584,14 @@ function normalizeNotionResult(
     throw new NotionToolResultError();
   }
   if (name === "notion-update-page") {
-    const request = notionUpdateResultSchema.parse(argumentsValue);
-    return { pageId: request.page_id, updated: true };
+    const request = notionUpdateRequestSchema.parse(argumentsValue);
+    const payload = normalizedNotionPayload(envelope);
+    const response = notionUpdateResponseSchema.parse(payload.value);
+    const pageId = response.id ?? response.page_id;
+    if (payload.truncated || pageId !== request.page_id) {
+      throw new NotionToolResultError();
+    }
+    return { pageId, updated: true };
   }
 
   const payload = normalizedNotionPayload(envelope);

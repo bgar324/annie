@@ -185,7 +185,14 @@ describe("Notion writes", () => {
     const calls: Array<{ name: string; argumentsValue: Record<string, unknown> }> = [];
     const fixture = sessionFixture(async (name, argumentsValue) => {
       calls.push({ name, argumentsValue });
-      return { content: [{ type: "text", text: "updated" }] };
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ object: "page", id: argumentsValue.page_id }),
+          },
+        ],
+      };
     });
     const service = notionService(harness, fixedSessionProvider(fixture.session));
 
@@ -327,6 +334,34 @@ describe("Notion writes", () => {
         toolContext(harness, "notion.update_page", "write"),
       ),
     ).rejects.toMatchObject({ name: "NotionToolResultError" });
+    expect(fixture.call).toHaveBeenCalledTimes(1);
+    expect(writeStates(harness)).toEqual(["ambiguous"]);
+  });
+  it("does not fabricate update success from an unacknowledged result", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_unacknowledged", "Unacknowledged");
+    const fixture = sessionFixture(async () => ({
+      content: [{ type: "text", text: "updated" }],
+    }));
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+
+    await expect(
+      service.updatePage(
+        {
+          pageId: "page_unacknowledged",
+          command: "update_content",
+          updates: [
+            {
+              oldText: "- [ ] Task",
+              newText: "- [x] Task",
+              replaceAllMatches: false,
+            },
+          ],
+        },
+        toolContext(harness, "notion.update_page", "write"),
+      ),
+    ).rejects.toBeDefined();
+
     expect(fixture.call).toHaveBeenCalledTimes(1);
     expect(writeStates(harness)).toEqual(["ambiguous"]);
   });

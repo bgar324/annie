@@ -516,6 +516,50 @@ export class AgentRunStore {
     this.#finishRun(runId, "blocked", null, failureCode, "blocked");
   }
 
+  quarantineCompleted(runId: RunId, failureCode: string): void {
+    const now = Date.now();
+    const transaction = this.#db.transaction(() => {
+      const run = this.getRequired(runId);
+      if (run.phase === "blocked" && run.failureCode === failureCode) {
+        return;
+      }
+      if (run.phase !== "completed" || run.source.kind !== "inbound") {
+        throw new Error(`Run ${runId} cannot be quarantined`);
+      }
+      const runUpdate = this.#db
+        .prepare<{ id: string; failure_code: string; now_ms: number }>(`
+          UPDATE agent_runs
+          SET phase = 'blocked', final_response = NULL,
+              failure_code = @failure_code, updated_at_ms = @now_ms
+          WHERE id = @id AND phase = 'completed'
+        `)
+        .run({ id: runId, failure_code: failureCode, now_ms: now });
+      const inboundUpdate = this.#db
+        .prepare<{ id: string; now_ms: number }>(`
+          UPDATE inbound_messages
+          SET state = 'blocked', updated_at_ms = @now_ms
+          WHERE id = @id AND state = 'done'
+        `)
+        .run({ id: run.source.inboundId, now_ms: now });
+      if (runUpdate.changes !== 1 || inboundUpdate.changes !== 1) {
+        throw new Error(`Run ${runId} could not be quarantined atomically`);
+      }
+      this.#traces.appendInTransaction({
+        traceId: run.traceId,
+        component: "agent",
+        event: "quarantined",
+        outcome: failureCode,
+        runId,
+        data: {
+          responseBytes:
+            run.finalResponse === null ? 0 : Buffer.byteLength(run.finalResponse),
+        },
+        occurredAtMs: now,
+      });
+    });
+    transaction.immediate();
+  }
+
   #finishRun(
     runId: RunId,
     phase: "completed" | "failed" | "blocked",
