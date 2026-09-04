@@ -1675,10 +1675,7 @@ function checkboxNoOpIsProved(
   if (selectedStates.length !== 1 || selectedStates[0] !== authorization.checked) {
     return false;
   }
-  const relatedCount = taskCheckboxStates(text, (labelTokens) =>
-    tokensAppearInOrder(authorization.targetTokens, labelTokens),
-  ).length;
-  return relatedCount > 0 && responseAsksTaskClarification(response);
+  return responseAsksTaskClarification(response, selectedTokens);
 }
 
 function quotedAlreadySetTaskTokens(
@@ -1697,8 +1694,27 @@ function quotedAlreadySetTaskTokens(
   return tokens.length === 0 ? undefined : tokens;
 }
 
-function responseAsksTaskClarification(response: string): boolean {
-  return /\b(?:did you mean|which|want me|were you)\b[^?]*\?/iu.test(response);
+function responseAsksTaskClarification(
+  response: string,
+  selectedTokens: readonly string[],
+): boolean {
+  const normalized = response.toLowerCase().replaceAll("’", "'");
+  const cuePattern = /\b(?:did you mean|which|want me|were you)\b/gu;
+  for (const cue of normalized.matchAll(cuePattern)) {
+    const cueIndex = cue.index;
+    const questionEnd = normalized.indexOf("?", cueIndex);
+    if (questionEnd === -1) {
+      continue;
+    }
+    const question = normalized.slice(cueIndex, questionEnd);
+    if (
+      /\b(?:that|this|one|item|task|checkbox|those|them)\b/u.test(question) ||
+      tokensAppearInOrder(selectedTokens, taskTokens(question))
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function taskCheckboxStates(

@@ -1118,6 +1118,18 @@ describe("production runtime", () => {
       expectedPurpose: "failure",
     },
     {
+      label: "an unrelated question after shorthand no-op wording",
+      selectedLines: ["- [x] Clean room"],
+      relatedLines: [],
+      response:
+        '"Clean room" is already checked off, so no change was needed. Which color do you like?',
+      request: "Mark room done",
+      secondWorkspace: false,
+      fetchTruncated: false,
+      expectedState: "blocked",
+      expectedPurpose: "failure",
+    },
+    {
       label: "one unique exact task still unchecked",
       selectedLines: ["- [ ] Clean and organize room"],
       relatedLines: [],
