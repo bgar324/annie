@@ -184,15 +184,6 @@ const notionCreateResultSchema = z
   })
   .loose()
   .refine((value) => value.pages !== undefined || value.id !== undefined);
-const notionUpdateRequestSchema = z.object({ page_id: z.string().min(1).max(2_048) }).loose();
-const notionUpdateResponseSchema = z
-  .object({
-    id: z.string().min(1).max(2_048).optional(),
-    page_id: z.string().min(1).max(2_048).optional(),
-    truncated: z.boolean(),
-  })
-  .loose()
-  .refine((value) => value.id !== undefined || value.page_id !== undefined);
 
 export class NotionToolService {
   readonly #db: Database.Database;
@@ -657,7 +648,7 @@ export class NotionToolService {
 
 export class NotionToolResultError extends ModelSafeError<"provider_rejected"> {
   constructor() {
-    super("NotionToolResultError", "provider_rejected", "Notion rejected the tool call");
+    super("NotionToolResultError", "provider_rejected", "Notion reported a tool error");
   }
 }
 
@@ -710,17 +701,22 @@ function normalizeNotionResult(
     throw new NotionToolResultError();
   }
   if (name === "notion-update-page") {
-    const request = notionUpdateRequestSchema.parse(argumentsValue);
-    const payload = normalizedNotionPayload(envelope);
-    const response = notionUpdateResponseSchema.parse(payload.value);
+    // A non-error MCP result is Notion's acceptance. The response body is a rendered
+    // page view, not a receipt; its shape and truncation say nothing about the write.
+    // Only a queued async task, a failed status, or an error field means "not done".
+    const payload = normalizedNotionPayload(envelope).value;
+    const record = typeof payload === "object" && payload !== null && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>)
+      : {};
     if (
-      payload.truncated ||
-      (response.id !== undefined && response.id !== request.page_id) ||
-      (response.page_id !== undefined && response.page_id !== request.page_id)
+      record.object === "async_task" ||
+      record.async_task != null ||
+      record.error != null ||
+      (typeof record.status === "string" && record.status !== "succeeded")
     ) {
       throw new NotionToolResultError();
     }
-    return { pageId: request.page_id, updated: true };
+    return { pageId: String(argumentsValue.page_id), updated: true };
   }
 
   const payload = normalizedNotionPayload(envelope);
@@ -781,12 +777,13 @@ function normalizeNotionResult(
 
 function normalizedNotionPayload(
   result: z.infer<typeof toolResultSchema>,
-): { value: unknown; truncated: boolean; providerTruncation?: boolean } {
+): { value: unknown; truncated: boolean; sizeTruncated: boolean; providerTruncation?: boolean } {
   if (result.structuredContent !== undefined) {
     const providerTruncation = notionPayloadTruncated(result.structuredContent);
     return {
       value: result.structuredContent,
       truncated: providerTruncation === true,
+      sizeTruncated: false,
       ...(providerTruncation === undefined ? {} : { providerTruncation }),
     };
   }
@@ -799,12 +796,13 @@ function normalizedNotionPayload(
   try {
     value = JSON.parse(bounded.value) as unknown;
   } catch {
-    return { value: bounded.value, truncated: bounded.truncated };
+    return { value: bounded.value, truncated: bounded.truncated, sizeTruncated: bounded.truncated };
   }
   const providerTruncation = notionPayloadTruncated(value);
   return {
     value,
     truncated: bounded.truncated || providerTruncation === true,
+    sizeTruncated: bounded.truncated,
     ...(providerTruncation === undefined ? {} : { providerTruncation }),
   };
 }

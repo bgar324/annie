@@ -182,7 +182,7 @@ Every provider mutation follows a write-intent state machine:
 2. Verify the active job lease and connection credential generation.
 3. Persist `attempting` before the network call.
 4. Persist `succeeded`, `confirmed_failed`, or `ambiguous` after the result.
-For Notion updates, a non-error MCP envelope does not prove acceptance. The adapter requires an explicit `truncated: false` and a returned page identity. Every returned `id` or `page_id` must equal the requested page ID. Missing, truncated, contradictory, or mismatched acknowledgements remain acceptance-unknown.
+For Notion updates, a non-error MCP result is acceptance. The response body is a rendered page view, not a receipt, so its shape and `truncated` flag are not checked. Only a queued or wrapped `async_task`, a non-`succeeded` status, or an `error` field keeps the write acceptance-unknown. Transport failures after dispatch remain ambiguous and are never replayed.
 
 
 If the process stops while a write is `attempting`, startup changes it to `ambiguous`. The service never automatically repeats an ambiguous write. The related agent run blocks and reports its trace ID.

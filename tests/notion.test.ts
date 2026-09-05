@@ -487,108 +487,69 @@ describe("Notion writes", () => {
     addNotionConnection(harness, "workspace_rejected", "Rejected");
     const fixture = sessionFixture(async () => ({
       isError: true,
-      content: [{ type: "text", text: "validation failed" }],
+      content: [{ type: "text", text: "private-provider-body-never-log" }],
     }));
     const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const context = fetchedUpdateContext(harness, "page_bad", "Original");
 
     await expect(
       service.updatePage(
         { pageId: "page_bad", command: "replace_content", newContent: "Bad" },
-        fetchedUpdateContext(harness, "page_bad", "Original"),
+        context,
       ),
     ).rejects.toMatchObject({ name: "NotionToolResultError" });
     expect(fixture.call).toHaveBeenCalledTimes(1);
     expect(writeStates(harness)).toEqual(["ambiguous"]);
+    expect(harness.runs.getToolRequired(context.toolExecutionId).result).toMatchObject({
+      error: { code: "acceptance_unknown" },
+    });
+    expect(JSON.stringify(harness.traces.list(context.traceId))).not.toContain(
+      "private-provider-body-never-log",
+    );
   });
   it.each([
-    {
-      label: "missing page identity",
-      result: { content: [{ type: "text", text: "updated" }] },
-    },
-    {
-      label: "mismatched page identity",
-      result: {
-        structuredContent: {
-          object: "page_markdown",
-          id: "different_page",
-          markdown: "- [x] Task",
-          truncated: false,
-          unknown_block_ids: [],
-        },
-      },
-    },
-    {
-      label: "contradictory page identities",
-      result: {
-        structuredContent: {
-          object: "page_markdown",
-          id: "page_unacknowledged",
-          page_id: "different_page",
-          truncated: false,
-        },
-      },
-    },
-    {
-      label: "missing provider completion flag",
-      result: {
-        structuredContent: {
-          object: "page_markdown",
-          id: "page_unacknowledged",
-        },
-      },
-    },
-    {
-      label: "provider-truncated acknowledgement",
-      result: {
-        structuredContent: {
-          object: "page_markdown",
-          id: "page_unacknowledged",
-          markdown: "- [x] Task",
-          truncated: true,
-          unknown_block_ids: [],
-        },
-      },
-    },
-    {
-      label: "truncated acknowledgement",
-      result: {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              object: "page_markdown",
-              id: "page_unacknowledged",
-              padding: "x".repeat(131_072),
-            }),
-          },
-        ],
-      },
-    },
-  ])("keeps a $label acceptance-unknown", async ({ result }) => {
+    { label: "a page view", response: { structuredContent: { object: "page_markdown", id: "page_ack", markdown: "x", truncated: true, unknown_block_ids: ["b"] } } },
+    { label: "a bare text body", response: { content: [{ type: "text", text: "updated" }] } },
+  ])("treats $label from a non-error update as accepted", async ({ response }) => {
     const harness = notionHarness();
-    addNotionConnection(harness, "workspace_unacknowledged", "Unacknowledged");
-    const fixture = sessionFixture(async () => result);
+    addNotionConnection(harness, "workspace_ack", "Acknowledged");
+    const fixture = sessionFixture(async () => response);
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const context = fetchedUpdateContext(harness, "page_ack", "original");
+
+    await expect(service.updatePage(
+      {
+        pageId: "page_ack", command: "update_content",
+        updates: [{ oldText: "original", newText: "replacement", replaceAllMatches: false }],
+      },
+      context,
+    )).resolves.toMatchObject({
+      ok: true, outcome: "succeeded", result: { pageId: "page_ack", updated: true },
+    });
+    expect(writeStates(harness)).toEqual(["succeeded"]);
+    expect(fixture.call).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { label: "a queued async task", response: { structuredContent: { object: "async_task", id: "t1", status: "queued" } } },
+    { label: "a wrapped async task", response: { structuredContent: { page_id: "page_ack", async_task: { id: "t1" } } } },
+    { label: "a running task on the page", response: { structuredContent: { page_id: "page_ack", status: "running" } } },
+    { label: "an error field", response: { structuredContent: { page_id: "page_ack", error: { code: "validation_error" } } } },
+  ])("keeps $label acceptance-unknown", async ({ response }) => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_async", "Async");
+    const fixture = sessionFixture(async () => response);
     const service = notionService(harness, fixedSessionProvider(fixture.session));
 
-    await expect(
-      service.updatePage(
-        {
-          pageId: "page_unacknowledged",
-          command: "update_content",
-          updates: [
-            {
-              oldText: "- [ ] Task",
-              newText: "- [x] Task",
-              replaceAllMatches: false,
-            },
-          ],
-        },
-        fetchedUpdateContext(harness, "page_unacknowledged", "- [ ] Task"),
-      ),
-    ).rejects.toBeDefined();
-
-    expect(fixture.call).toHaveBeenCalledTimes(1);
+    await expect(service.updatePage(
+      {
+        pageId: "page_ack", command: "update_content",
+        updates: [{ oldText: "original", newText: "replacement", replaceAllMatches: false }],
+      },
+      fetchedUpdateContext(harness, "page_ack", "original"),
+    )).rejects.toBeDefined();
     expect(writeStates(harness)).toEqual(["ambiguous"]);
+    expect(fixture.call).toHaveBeenCalledTimes(1);
   });
 
   it("returns an authoritative unchanged result without preparing or sending a write", async () => {
