@@ -709,6 +709,8 @@ function normalizeNotionResult(
       ? (payload as Record<string, unknown>)
       : {};
     if (
+      envelope.structuredContent === undefined &&
+      (envelope.content ?? []).every((block) => block.type !== "text" || !block.text) ||
       record.object === "async_task" ||
       record.async_task != null ||
       record.error != null ||

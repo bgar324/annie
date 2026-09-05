@@ -535,6 +535,7 @@ describe("Notion writes", () => {
     { label: "a wrapped async task", response: { structuredContent: { page_id: "page_ack", async_task: { id: "t1" } } } },
     { label: "a running task on the page", response: { structuredContent: { page_id: "page_ack", status: "running" } } },
     { label: "an error field", response: { structuredContent: { page_id: "page_ack", error: { code: "validation_error" } } } },
+    { label: "an empty envelope", response: {} },
   ])("keeps $label acceptance-unknown", async ({ response }) => {
     const harness = notionHarness();
     addNotionConnection(harness, "workspace_async", "Async");
