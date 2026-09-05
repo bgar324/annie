@@ -1226,6 +1226,132 @@ describe("production runtime", () => {
     ).toEqual({ request_scope: "read" });
   });
 
+  describe("an answer to Annie's last question", () => {
+    const offer = "clean restroom is still unchecked. want me to check it off?";
+
+    async function deliveredOffer(model: FakeModel, gateway: FakeGateway, item: TrackedRuntime): Promise<void> {
+      model.scope = "read";
+      model.responses.push(finalModelResponse("offer_reply", offer));
+      gateway.inbox.push(inboundMessage("msg_offer_question", { text: "is the restroom done?" }));
+      await sweep(item);
+      await drainJobs(item.runtime);
+      expect(
+        item.runtime.database.db
+          .prepare<[], { state: string }>("SELECT state FROM egress_messages")
+          .get(),
+      ).toEqual({ state: "delivered" });
+    }
+
+    async function classifyFollowUp(model: FakeModel, gateway: FakeGateway, item: TrackedRuntime, text: string): Promise<ModelRequest> {
+      model.scope = "conversation";
+      model.responses.push(finalModelResponse("follow_up_reply", "ok."));
+      gateway.inbox.push(inboundMessage("msg_follow_up", { text }));
+      await sweep(item);
+      await runNextJob(item.runtime, Date.now() + 10);
+      const request = model.scopeRequests.at(-1);
+      if (request === undefined) {
+        throw new Error("Expected a classification request");
+      }
+      return request;
+    }
+
+    it("shows the classifier only Annie's delivered reply and the raw answer", async () => {
+      const model = new FakeModel();
+      const gateway = new FakeGateway();
+      const item = await newRuntime(model, gateway, { notionClients: new FakeNotionClients(true, notionTaskPage) });
+      connectNotion(item);
+      await deliveredOffer(model, gateway, item);
+
+      const request = await classifyFollowUp(model, gateway, item, "yes");
+
+      expect(request.messages).toHaveLength(2);
+      expect(request.messages[0]?.content).toContain(`«${offer}»`);
+      expect(request.messages[0]?.content).not.toContain("is the restroom done?");
+      expect(request.messages[1]).toEqual({ role: "user", content: "yes" });
+      expect(
+        item.runtime.traces
+          .list(acceptedTraceIdFor(item.runtime, "msg_follow_up"))
+          .filter((event) => event.event === "preceding_reply")
+          .map((event) => event.outcome),
+      ).toEqual(["included"]);
+    });
+
+    it.each([
+      {
+        label: "the reply never confirmed delivery",
+        arrange: (item: TrackedRuntime) => {
+          item.runtime.database.db.prepare("UPDATE egress_messages SET state = 'delivery_unknown'").run();
+        },
+      },
+      {
+        label: "the reply is older than the follow-up window",
+        arrange: (item: TrackedRuntime) => {
+          item.runtime.database.db
+            .prepare("UPDATE egress_messages SET created_at_ms = created_at_ms - 31 * 60 * 1000")
+            .run();
+        },
+      },
+      {
+        label: "something else reached the user after the reply",
+        arrange: (item: TrackedRuntime) => {
+          const db = item.runtime.database.db;
+          db.prepare(`
+            INSERT INTO egress_messages(
+              id, run_id, trace_id, recipient_handle, line_handle, body, purpose, state,
+              attempt_count, created_at_ms, updated_at_ms
+            )
+            SELECT 'eg_brief', NULL, 'tr_00000000000000000000000000000001', recipient_handle, line_handle,
+                   'morning brief', 'reply', 'delivered', 1, created_at_ms + 1, created_at_ms + 1
+            FROM egress_messages
+          `).run();
+        },
+      },
+    ])("gives the classifier nothing when $label", async ({ arrange }) => {
+      const model = new FakeModel();
+      const gateway = new FakeGateway();
+      const item = await newRuntime(model, gateway, { notionClients: new FakeNotionClients(true, notionTaskPage) });
+      connectNotion(item);
+      await deliveredOffer(model, gateway, item);
+      arrange(item);
+
+      const request = await classifyFollowUp(model, gateway, item, "yes");
+
+      expect(request.messages).toHaveLength(2);
+      expect(request.messages[0]?.content).not.toContain(offer);
+      expect(
+        item.runtime.traces
+          .list(acceptedTraceIdFor(item.runtime, "msg_follow_up"))
+          .filter((event) => event.event === "preceding_reply")
+          .map((event) => event.outcome),
+      ).toEqual(["none"]);
+    });
+
+    it("gives the classifier nothing when the last message got a failure notice", async () => {
+      const model = new FakeModel();
+      const gateway = new FakeGateway();
+      const item = await newRuntime(model, gateway, { notionClients: new FakeNotionClients(true, notionTaskPage) });
+      connectNotion(item);
+      await deliveredOffer(model, gateway, item);
+      model.scope = "notion_write";
+      model.responses.push({
+        id: "empty_reply", content: "", providerState: null, toolCalls: [], finishReason: "stop",
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+      });
+      gateway.inbox.push(inboundMessage("msg_failed_turn", { text: "mark it done" }));
+      await sweep(item);
+      await drainJobs(item.runtime);
+      expect(
+        item.runtime.database.db
+          .prepare<[], { purpose: string }>("SELECT purpose FROM egress_messages ORDER BY created_at_ms DESC LIMIT 1")
+          .get(),
+      ).toEqual({ purpose: "failure" });
+
+      const request = await classifyFollowUp(model, gateway, item, "yes");
+
+      expect(request.messages[0]?.content).not.toContain(offer);
+    });
+  });
+
   it("reuses a persisted request scope instead of classifying the resumed turn again", async () => {
     const request = "mark car wash done";
     const oldText = "- [ ] Car wash";
@@ -3083,7 +3209,19 @@ function inboundMessage(
 }
 
 async function runNextJob(runtime: AssistantRuntime, nowMs: number): Promise<void> {
-  const job = requiredJob(runtime.queue.claim(nowMs));
+  await runClaimedJob(runtime, requiredJob(runtime.queue.claim(nowMs)), nowMs);
+}
+
+// Runs every claimable job, including delivery reconciliation and memory maintenance, so a
+// turn ends exactly as it would in production: reply delivered and memory settled.
+async function drainJobs(runtime: AssistantRuntime): Promise<void> {
+  const nowMs = Date.now() + 120_000;
+  for (let job = runtime.queue.claim(nowMs); job !== undefined; job = runtime.queue.claim(nowMs)) {
+    await runClaimedJob(runtime, job, nowMs);
+  }
+}
+
+async function runClaimedJob(runtime: AssistantRuntime, job: ClaimedJob, nowMs: number): Promise<void> {
   const context: JobContext = {
     signal: new AbortController().signal,
     nowMs: () => nowMs,
@@ -3109,6 +3247,16 @@ function acceptedTraceId(runtime: AssistantRuntime): TraceId {
     .get();
   if (row === undefined) {
     throw new Error("Expected an accepted inbound trace");
+  }
+  return asTraceId(row.trace_id);
+}
+
+function acceptedTraceIdFor(runtime: AssistantRuntime, guid: string): TraceId {
+  const row = runtime.database.db
+    .prepare<{ guid: string }, { trace_id: string }>("SELECT trace_id FROM inbound_messages WHERE guid = @guid")
+    .get({ guid });
+  if (row === undefined) {
+    throw new Error(`Expected an accepted inbound trace for ${guid}`);
   }
   return asTraceId(row.trace_id);
 }

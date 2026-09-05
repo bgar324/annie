@@ -27,6 +27,10 @@ interface InboundTurnRow {
   sequence: number;
 }
 
+// An answer can complete only a question Annie just asked: her reply must have been
+// prepared within this window before the current message arrived.
+const followUpWindowMs = 30 * 60_000;
+
 /**
  * Runs one inbound message as an ordinary durable model/tool turn.
  *
@@ -195,11 +199,21 @@ export class InboundTurnService {
       return run.requestScope;
     }
     this.#runs.beginModelRequest(run.id, this.#config.limits.maxAgentToolRounds + 2);
+    const preceding = this.#history.precedingDeliveredReply(inbound.id, followUpWindowMs);
+    this.#traces.append({
+      traceId: run.traceId,
+      component: "request_scope",
+      event: "preceding_reply",
+      outcome: preceding === undefined ? "none" : "included",
+      runId: run.id,
+      data: preceding === undefined ? {} : { egressId: preceding.egressId },
+    });
     const scope = await classifyRequestScope({
       model: this.#model,
       traceId: run.traceId,
       runId: run.id,
       userMessage,
+      ...(preceding === undefined ? {} : { precedingReply: preceding.body }),
       signal: AbortSignal.timeout(Math.max(1, run.deadlineAtMs - Date.now())),
     });
     context.assertLease();

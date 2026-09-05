@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import type { InboundId } from "../core/ids.js";
+import type { EgressId, InboundId } from "../core/ids.js";
 import type { ModelMessage } from "./model.js";
 import { assistantHistoryText } from "./prompt.js";
 
@@ -13,6 +13,11 @@ interface HistoryRow {
   final_response: string | null;
   delivered_reply_body: string | null;
   delivered_link: number;
+}
+
+interface PrecedingReplyRow {
+  egress_id: EgressId;
+  body: string;
 }
 
 export class ConversationHistoryStore {
@@ -109,5 +114,51 @@ export class ConversationHistoryStore {
       messages += turn.length;
     }
     return turns.reverse().flat();
+  }
+
+  /**
+   * The one reply the current message can be answering: the delivered model-authored reply
+   * to the immediately preceding accepted message in this chat, prepared before the current
+   * message arrived, within the freshness window, with nothing else sent to the user in
+   * between. Failure notices, connection links, undelivered or delivery-unknown replies,
+   * and older replies contribute nothing, so an answer can complete only a question Annie
+   * is known to have just asked.
+   */
+  precedingDeliveredReply(
+    inboundId: InboundId,
+    maxAgeMs: number,
+  ): { egressId: EgressId; body: string } | undefined {
+    const row = this.#db
+      .prepare<{ id: string; max_age_ms: number }, PrecedingReplyRow>(`
+        SELECT reply.id AS egress_id, reply.body AS body
+        FROM inbound_messages AS current
+        JOIN inbound_messages AS previous
+          ON previous.chat_id = current.chat_id
+         AND previous.sequence = (
+           SELECT MAX(sequence) FROM inbound_messages
+           WHERE chat_id = current.chat_id
+             AND sequence < current.sequence
+             AND state <> 'rejected'
+         )
+        JOIN agent_runs AS runs ON runs.inbound_id = previous.id
+        JOIN egress_messages AS reply
+          ON reply.run_id = runs.id
+         AND reply.purpose = 'reply'
+         AND reply.state = 'delivered'
+        WHERE current.id = @id
+          AND reply.created_at_ms < current.created_at_ms
+          AND reply.created_at_ms >= current.created_at_ms - @max_age_ms
+          AND NOT EXISTS (
+            SELECT 1 FROM egress_messages AS later
+            WHERE later.recipient_handle = reply.recipient_handle
+              AND later.id <> reply.id
+              AND later.created_at_ms > reply.created_at_ms
+              AND later.created_at_ms < current.created_at_ms
+          )
+        ORDER BY reply.created_at_ms DESC
+        LIMIT 1
+      `)
+      .get({ id: inboundId, max_age_ms: maxAgeMs });
+    return row === undefined ? undefined : { egressId: row.egress_id, body: row.body };
   }
 }

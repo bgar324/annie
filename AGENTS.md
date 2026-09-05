@@ -97,6 +97,7 @@ Required regression cases include:
 - daily brief 08:00 scheduling across DST, restart, stale-job recovery, and exhausted leases;
 - daily brief six-tool read-only enforcement, per-account product coverage, and stale or disabled egress cancellation;
 - exact per-call account selection and automatic multi-account read coverage;
+- follow-up answers completing only Annie's immediately preceding delivered, fresh question, never a failure notice, undelivered, stale, or intervening reply;
 - reconnect identity mismatch;
 - expired and completed signed links;
 - refresh generation races;

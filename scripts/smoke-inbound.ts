@@ -29,6 +29,31 @@ const requests = {
   // tool-less conversation run answered a tool need with an empty message.
   access_question: 'Do you have access to "logit thought dump"',
   bare_page_name: '"Logit notes"',
+  // Answers to Annie's immediately preceding delivered question: the one context the
+  // classifier may see. Everything but a direct answer stays classified on its own.
+  page_name_after_offer: '"Logit notes"',
+  yes_after_offer: "yes",
+  no_after_offer: "no, leave it",
+  greeting_after_offer: "Hey annie",
+  yes_after_stale_offer: "yes",
+  yes_after_undelivered_offer: "yes",
+};
+const createOffer = {
+  question: "Are you able to make a notion page? Is that in your tool set?",
+  reply: "yeah, i can — i have create access to your notion (Personal). just tell me the page name and i'll make it.",
+};
+const checkOffer = {
+  question: "is the restroom done?",
+  reply: "clean restroom is still unchecked on today's list. want me to check it off?",
+};
+interface SeededExchange { question: string; reply: string; ageMs: number; state: "delivered" | "delivery_unknown" }
+const exchangeFixture: Readonly<Record<string, SeededExchange>> = {
+  page_name_after_offer: { ...createOffer, ageMs: 120_000, state: "delivered" },
+  yes_after_offer: { ...checkOffer, ageMs: 120_000, state: "delivered" },
+  no_after_offer: { ...checkOffer, ageMs: 120_000, state: "delivered" },
+  greeting_after_offer: { ...checkOffer, ageMs: 120_000, state: "delivered" },
+  yes_after_stale_offer: { ...checkOffer, ageMs: 2 * 3_600_000, state: "delivered" },
+  yes_after_undelivered_offer: { ...checkOffer, ageMs: 120_000, state: "delivery_unknown" },
 };
 // The production incident: earlier accepted requests that never produced a reply, then a
 // bare greeting. Those requests are closed history and lend the next turn no permission.
@@ -54,6 +79,12 @@ const expectedScope: Readonly<Record<string, RequestScope>> = {
   list_today: "read",
   access_question: "read",
   bare_page_name: "conversation",
+  page_name_after_offer: "notion_write",
+  yes_after_offer: "notion_write",
+  no_after_offer: "conversation",
+  greeting_after_offer: "conversation",
+  yes_after_stale_offer: "conversation",
+  yes_after_undelivered_offer: "conversation",
 };
 const args = process.argv.slice(2).filter((arg) => arg !== "--");
 if (args.includes("--list")) {
@@ -159,6 +190,46 @@ function seedFailedHistory(db: AssistantRuntime["database"]["db"], texts: readon
   }
 }
 
+// One completed exchange right before the current message: Annie's delivered (or not)
+// model-authored reply to the previous accepted message, aged as the case requires.
+function seedDeliveredExchange(db: AssistantRuntime["database"]["db"], exchange: SeededExchange): void {
+  const at = Date.now() - exchange.ageMs;
+  const row = {
+    inbound: "in_offer", delivery: "wd_offer", provider: "sb_offer", run: "run_offer", egress: "eg_offer",
+    chat: user, handle: line, sequence: 1_000, question: exchange.question, reply: exchange.reply,
+    state: exchange.state, trace: newTraceId(), at, attachment: JSON.stringify({
+      kind: "message", providerMessageId: "sb_offer", sentAtMs: at, updatedAtMs: at, mediaAvailable: false,
+    }),
+  };
+  db.prepare<typeof row>(`
+    INSERT INTO webhook_deliveries(
+      id, provider_delivery_id, provider_message_id, event_kind,
+      line_id, line_handle, normalized_json, trace_id, received_at_ms
+    ) VALUES (@delivery, @delivery, @provider, 'message', @handle, @handle, '{}', @trace, @at)
+  `).run(row);
+  db.prepare<typeof row>(`
+    INSERT INTO inbound_messages(
+      id, delivery_id, provider_message_id, chat_id, guid, sender, line_id, line_handle,
+      sequence, state, text, is_audio, attachment_json, trace_id, created_at_ms, updated_at_ms
+    ) VALUES (
+      @inbound, @delivery, @provider, @chat, @provider, @chat, @handle, @handle,
+      @sequence, 'done', @question, 0, @attachment, @trace, @at, @at
+    )
+  `).run(row);
+  db.prepare<typeof row>(`
+    INSERT INTO agent_runs(
+      id, inbound_id, trace_id, phase, deadline_at_ms, memory_maintenance_status,
+      final_response, request_scope, created_at_ms, updated_at_ms
+    ) VALUES (@run, @inbound, @trace, 'completed', @at, 'unchanged', @reply, 'read', @at, @at)
+  `).run(row);
+  db.prepare<typeof row>(`
+    INSERT INTO egress_messages(
+      id, run_id, trace_id, recipient_handle, line_handle, body, purpose, state,
+      attempt_count, created_at_ms, updated_at_ms
+    ) VALUES (@egress, @run, @trace, @chat, @handle, @reply, 'reply', @state, 1, @at, @at)
+  `).run(row);
+}
+
 async function runCase(name: string, text: string): Promise<void> {
   const directory = mkdtempSync(join(tmpdir(), "annie-smoke-"));
   const config = loadRuntimeConfig({
@@ -181,6 +252,7 @@ async function runCase(name: string, text: string): Promise<void> {
     ["archive", "# Task archive\n- [ ] Clean restroom\n- [ ] Clean and organize room\n"],
   ]);
   let mutations = 0;
+  const createdTitles: string[] = [];
   const notion: NotionClientProvider = {
     async withSession(_connection, _trace, operation) {
       return operation({
@@ -199,7 +271,16 @@ async function runCase(name: string, text: string): Promise<void> {
             assert(pages.has(id), "Model fetched an unknown synthetic page");
             return { structuredContent: { id, text: pages.get(id), truncated: false } };
           }
-          assert.equal(tool, "notion-update-page", "Expected an update, not page creation");
+          if (tool === "notion-create-pages") {
+            const { pages: created } = z.object({
+              pages: z.array(z.object({ properties: z.object({ title: z.string().min(1) }).loose() }).loose()).length(1),
+            }).loose().parse(argumentsValue);
+            mutations += 1;
+            pages.set("created_1", `# ${created[0]?.properties.title}\n`);
+            createdTitles.push(created[0]?.properties.title ?? "");
+            return { structuredContent: { pages: [{ id: "created_1", url: "https://notion.invalid/created_1" }] } };
+          }
+          assert.equal(tool, "notion-update-page", "Expected an update or a page creation");
           const patch = patchSchema.parse(argumentsValue);
           const source = pages.get(patch.page_id);
           assert(source !== undefined, "Model wrote an unknown page");
@@ -245,6 +326,8 @@ async function runCase(name: string, text: string): Promise<void> {
     });
     const seeded = historyFixture[name] ?? [];
     seedFailedHistory(runtime.database.db, seeded);
+    const exchange = exchangeFixture[name];
+    if (exchange !== undefined) seedDeliveredExchange(runtime.database.db, exchange);
     modelCalls = [];
     const timestamp = Date.now() + 1_000;
     inbox.push({
@@ -268,7 +351,7 @@ async function runCase(name: string, text: string): Promise<void> {
       "SELECT state FROM write_intents WHERE kind <> 'sendblue_send_message'",
     ).all();
     const reply = db.prepare<[], { purpose: string; state: string }>(
-      "SELECT purpose, state FROM egress_messages",
+      "SELECT purpose, state FROM egress_messages WHERE id <> 'eg_offer'",
     ).all();
     const run = db.prepare<{ provider: string }, { phase: string; request_scope: string | null }>(`
       SELECT runs.phase, runs.request_scope FROM agent_runs AS runs
@@ -276,7 +359,7 @@ async function runCase(name: string, text: string): Promise<void> {
       WHERE inbound.provider_message_id = @provider
     `).get({ provider: `input_${name}` });
     const runCount = db.prepare<[], { count: number }>(
-      "SELECT COUNT(*) AS count FROM agent_runs",
+      "SELECT COUNT(*) AS count FROM agent_runs WHERE id <> 'run_offer'",
     ).get()?.count;
     const scope = expectedScope[name];
     assert(scope !== undefined, "Every smoke case declares the scope its request must get");
@@ -300,6 +383,12 @@ async function runCase(name: string, text: string): Promise<void> {
       for (const past of seeded) {
         assert(!call.messages.some((message) => (message.content ?? "").includes(past)),
           "History must never reach the classifier");
+      }
+      if (exchange !== undefined) {
+        const policy = call.messages[0]?.content ?? "";
+        assert(!policy.includes(exchange.question), "The user's earlier message never reaches the classifier");
+        const fresh = exchange.state === "delivered" && exchange.ageMs < 30 * 60_000;
+        assert.equal(policy.includes(exchange.reply), fresh, "Only a fresh delivered reply reaches the classifier");
       }
     }
     for (const call of loopCalls) {
@@ -351,6 +440,26 @@ async function runCase(name: string, text: string): Promise<void> {
       assert(tools.every((tool) => requestScopeTools[scope].includes(tool.tool_name)), "A tool ran outside the classified scope");
       if (name === "bare_page_name") assert.deepEqual(tools, [], "A bare page name is conversation: no tools, yet a text reply");
       assert(!/couldn't complete/u.test(sent[0] ?? ""), "A tool-less turn must answer in text, not fail empty");
+    } else if (exchange !== undefined) {
+      // Only a direct answer to Annie's delivered, fresh question completes the offered action.
+      assert(tools.every((tool) => requestScopeTools[scope].includes(tool.tool_name)), "A tool ran outside the classified scope");
+      assert(!/couldn't complete/u.test(sent[0] ?? ""), "A follow-up must answer in text, not fail empty");
+      if (name === "page_name_after_offer") {
+        // The write tools were granted (scope is asserted above). Whether the model creates a
+        // top-level page at once or first asks where it should live is its judgment call.
+        assert(mutations <= 1 && writes.length === mutations, "At most the one offered creation");
+        assert.deepEqual(createdTitles.map((title) => title.toLowerCase()), mutations === 1 ? ["logit notes"] : []);
+        assert.equal(pages.get("daily"), original);
+      } else if (name === "yes_after_offer") {
+        assert.equal(mutations, 1, "A plain yes completes the offered checkbox");
+        assert.deepEqual(writes, [{ state: "succeeded" }]);
+        assert.equal(pages.get("daily"), original.replace("[ ] Clean restroom", "[x] Clean restroom"));
+      } else {
+        assert.equal(mutations, 0, "A refusal, greeting, stale, or undelivered offer authorizes nothing");
+        assert.deepEqual(writes, []);
+        assert.deepEqual(tools, [], "Nothing to look up: no provider tool runs");
+        assert.equal(pages.get("daily"), original);
+      }
     } else {
       assert.equal(mutations, 1, "Exactly one provider mutation, including after restart");
       assert.deepEqual(writes, [{ state: name === "ambiguous_write" ? "ambiguous" : "succeeded" }]);
