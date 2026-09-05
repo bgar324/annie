@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import type { RegisteredTool } from "../agent/tools.js";
+import { parseToolArguments, type RegisteredTool } from "../agent/tools.js";
 import type { ConnectionStore } from "./store.js";
 import { toSafeConnectionView } from "./types.js";
 
@@ -51,7 +51,7 @@ export function connectionTools(connections: ConnectionStore): readonly Register
       operationClass: "read",
       batchMode: "serial",
       execute: async (argumentsValue) => {
-        const { provider } = connectArgumentsSchema.parse(argumentsValue);
+        const { provider } = parseToolArguments(connectArgumentsSchema, argumentsValue);
         return { provider, connectionLinkWillBeAppended: true };
       },
     },

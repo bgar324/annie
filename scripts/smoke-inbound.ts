@@ -1,5 +1,11 @@
-// Real DeepSeek decisions; synthetic accounts, Notion state, and Sendblue only.
-// pnpm smoke:inbound [case names] [--keep] | pnpm smoke:inbound --list
+// The inbound request matrix: real DeepSeek decisions against synthetic Google, Notion,
+// and Sendblue. Measures pass rate, pass-through rate, and latency together, so a prompt
+// or runtime change is judged on both at once.
+//
+//   pnpm smoke:inbound                          every case once
+//   pnpm smoke:inbound list_today yes_after_offer
+//   pnpm smoke:inbound --category google_read --repeat 3
+//   pnpm smoke:inbound --list | --keep
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -8,93 +14,32 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { parseEnv } from "node:util";
 import { z } from "zod";
-import { requestScopeTools, type RequestScope } from "../src/agent/request-scope.js";
 import { loadRuntimeConfig } from "../src/config.js";
 import { newTraceId } from "../src/core/ids.js";
 import type { InboundMessage, MessageGateway } from "../src/messages/types.js";
-import type { NotionClientProvider } from "../src/notion/client.js";
 import { createRuntime, type AssistantRuntime } from "../src/runtime.js";
+import { cases, type Category, type Observation, type SmokeCase } from "./smoke/cases.js";
+import { line, seedDeliveredExchange, seedFailedHistory, syntheticGoogle, syntheticNotion, user } from "./smoke/synthetic.js";
 
-const requests = {
-  relative_date_checkbox: "Could you mark yesterday's clean and organize room done?",
-  already_checked_no_op: "Could you mark yesterday's clean and organize room done?",
-  add_task: "Add to my todo list - clean up google storage and iCloud storage",
-  read_failure: "Can you mark clean restroom done on today's list?",
-  ambiguous_write: "Can you mark clean restroom done on today's list?",
-  connect_google: "connect google",
-  greeting_after_failures: "Hey annie",
-  status_after_failures: "did that clean restroom task ever get checked off?",
-  list_today: "what's on today's list?",
-  // Production 2026-09-04: both ended as "I couldn't complete that request" because the
-  // tool-less conversation run answered a tool need with an empty message.
-  access_question: 'Do you have access to "logit thought dump"',
-  bare_page_name: '"Logit notes"',
-  // Answers to Annie's immediately preceding delivered question: the one context the
-  // classifier may see. Everything but a direct answer stays classified on its own.
-  page_name_after_offer: '"Logit notes"',
-  yes_after_offer: "yes",
-  no_after_offer: "no, leave it",
-  greeting_after_offer: "Hey annie",
-  yes_after_stale_offer: "yes",
-  yes_after_undelivered_offer: "yes",
-};
-const createOffer = {
-  question: "Are you able to make a notion page? Is that in your tool set?",
-  reply: "yeah, i can — i have create access to your notion (Personal). just tell me the page name and i'll make it.",
-};
-const checkOffer = {
-  question: "is the restroom done?",
-  reply: "clean restroom is still unchecked on today's list. want me to check it off?",
-};
-interface SeededExchange { question: string; reply: string; ageMs: number; state: "delivered" | "delivery_unknown" }
-const exchangeFixture: Readonly<Record<string, SeededExchange>> = {
-  page_name_after_offer: { ...createOffer, ageMs: 120_000, state: "delivered" },
-  yes_after_offer: { ...checkOffer, ageMs: 120_000, state: "delivered" },
-  no_after_offer: { ...checkOffer, ageMs: 120_000, state: "delivered" },
-  greeting_after_offer: { ...checkOffer, ageMs: 120_000, state: "delivered" },
-  yes_after_stale_offer: { ...checkOffer, ageMs: 2 * 3_600_000, state: "delivered" },
-  yes_after_undelivered_offer: { ...checkOffer, ageMs: 120_000, state: "delivery_unknown" },
-};
-// The production incident: earlier accepted requests that never produced a reply, then a
-// bare greeting. Those requests are closed history and lend the next turn no permission.
-const priorFailures: readonly string[] = [
-  requests.read_failure,
-  "Mark clean and organize room done", "Mark clean and organize room done",
-  "Mark clean and organize room done", "Hey annie u there?",
-  "Can you mark clean room done?", requests.relative_date_checkbox, requests.add_task,
-];
-const historyFixture: Readonly<Record<string, readonly string[]>> = {
-  greeting_after_failures: priorFailures,
-  status_after_failures: priorFailures,
-};
-const expectedScope: Readonly<Record<string, RequestScope>> = {
-  relative_date_checkbox: "notion_write",
-  already_checked_no_op: "notion_write",
-  add_task: "notion_write",
-  read_failure: "notion_write",
-  ambiguous_write: "notion_write",
-  connect_google: "connect_google",
-  greeting_after_failures: "conversation",
-  status_after_failures: "read",
-  list_today: "read",
-  access_question: "read",
-  bare_page_name: "conversation",
-  page_name_after_offer: "notion_write",
-  yes_after_offer: "notion_write",
-  no_after_offer: "conversation",
-  greeting_after_offer: "conversation",
-  yes_after_stale_offer: "conversation",
-  yes_after_undelivered_offer: "conversation",
-};
 const args = process.argv.slice(2).filter((arg) => arg !== "--");
 if (args.includes("--list")) {
-  console.log(Object.keys(requests).join("\n"));
+  for (const smokeCase of cases) console.log(`${smokeCase.name.padEnd(28)} ${smokeCase.category}`);
   process.exit(0);
 }
 const keep = args.includes("--keep");
-const names = args.filter((arg) => arg !== "--keep");
-assert(names.every((name) => Object.hasOwn(requests, name)), "Unknown smoke case; use --list");
-const cases = Object.entries(requests).filter(([name]) => names.length === 0 || names.includes(name));
+const flag = (name: string): string | undefined => {
+  const index = args.indexOf(name);
+  return index === -1 ? undefined : args[index + 1];
+};
+const repeat = Number(flag("--repeat") ?? "1");
+assert(Number.isInteger(repeat) && repeat >= 1, "--repeat needs a positive integer");
+const category = flag("--category") as Category | undefined;
+const names = args.filter((arg, index) => !arg.startsWith("--") && args[index - 1] !== "--repeat" && args[index - 1] !== "--category");
+assert(names.every((name) => cases.some((smokeCase) => smokeCase.name === name)), "Unknown smoke case; use --list");
+const selected = cases.filter((smokeCase) =>
+  (names.length === 0 || names.includes(smokeCase.name)) && (category === undefined || smokeCase.category === category));
+assert(selected.length > 0, "No case matches the selection");
+
 const local = existsSync(".env") ? parseEnv(readFileSync(".env", "utf8")) : {};
 const deepseek = Object.fromEntries([
   "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL", "DEEPSEEK_REASONING_EFFORT",
@@ -105,13 +50,26 @@ const deepseek = Object.fromEntries([
 assert(deepseek.DEEPSEEK_API_KEY, "DEEPSEEK_API_KEY is required");
 const allowedOrigin = new URL(deepseek.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com").origin;
 const networkFetch = globalThis.fetch;
-// Captured so the smoke can assert what the real model was actually offered and shown.
+
+// Captured so the matrix can assert what the real model was offered and shown, and time
+// every call to the byte, not to the headers.
 const modelCallSchema = z.object({
   messages: z.array(z.object({ role: z.string(), content: z.string().nullish() })).min(1),
   response_format: z.object({ type: z.string() }).optional(),
   tools: z.array(z.unknown()).optional(),
 });
-type ModelCall = z.infer<typeof modelCallSchema>;
+const responseSchema = z.object({
+  choices: z.array(z.object({
+    finish_reason: z.string().nullish(),
+    message: z.object({ content: z.string().nullish() }).loose(),
+  }).loose()).min(1),
+}).loose();
+type ModelCall = z.infer<typeof modelCallSchema> & {
+  kind: "classifier" | "agent" | "memory";
+  durationMs: number;
+  finishReason: string | null;
+  verdict: string | null;
+};
 let modelCalls: ModelCall[] = [];
 let blockedRequests = 0;
 globalThis.fetch = async (input, init) => {
@@ -120,31 +78,33 @@ globalThis.fetch = async (input, init) => {
     blockedRequests += 1;
     throw new Error("Smoke network boundary refused non-DeepSeek request");
   }
-  if (input instanceof Request && input.method === "POST") {
-    modelCalls.push(modelCallSchema.parse(JSON.parse(await input.clone().text())));
+  const parsed = input instanceof Request && input.method === "POST"
+    ? modelCallSchema.parse(JSON.parse(await input.clone().text()))
+    : undefined;
+  const startedAt = Date.now();
+  const response = await networkFetch(input, { ...init, redirect: "error" });
+  const body = await response.text();
+  if (parsed !== undefined) {
+    const head = parsed.messages[0]?.content ?? "";
+    const kind = head.startsWith("You are Annie") ? "agent" : head.startsWith("Maintain the canonical") ? "memory" : "classifier";
+    const choice = response.ok ? responseSchema.safeParse(JSON.parse(body)) : undefined;
+    const first = choice?.success === true ? choice.data.choices[0] : undefined;
+    modelCalls.push({
+      ...parsed, kind, durationMs: Date.now() - startedAt,
+      finishReason: first?.finish_reason ?? null,
+      verdict: kind === "classifier" ? (first?.message.content ?? null) : null,
+    });
   }
-  return networkFetch(input, { ...init, redirect: "error" });
+  return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
 };
 await assert.rejects(fetch("https://sendblue.invalid/probe"), /Smoke network boundary/u);
 assert.equal(blockedRequests, 1);
 blockedRequests = 0;
 
-const line = "+15550000001";
-const user = "+15550000002";
-const patchSchema = z.object({
-  page_id: z.string(),
-  command: z.literal("update_content"),
-  content_updates: z.tuple([z.object({
-    old_str: z.string().min(1),
-    new_str: z.string(),
-    replace_all_matches: z.literal(false),
-  })]),
-});
-
 async function drain(runtime: AssistantRuntime): Promise<void> {
   const controller = new AbortController();
   const worker = runtime.worker.run(controller.signal);
-  const deadline = Date.now() + 180_000;
+  const deadline = Date.now() + 240_000;
   try {
     while (runtime.database.db.prepare<[], { count: number }>(
       "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('pending', 'running')",
@@ -158,79 +118,27 @@ async function drain(runtime: AssistantRuntime): Promise<void> {
   }
 }
 
-// Earlier accepted requests whose runs never replied: inbound rows only, no agent run and
-// therefore no assistant turn, so history carries no delivered claim and no pending work.
-function seedFailedHistory(db: AssistantRuntime["database"]["db"], texts: readonly string[]): void {
-  for (const [index, text] of texts.entries()) {
-    const suffix = `hist_${index + 1}`;
-    const at = Date.now() - (texts.length - index) * 600_000;
-    const row = {
-      inbound: `in_${suffix}`, delivery: `wd_${suffix}`, provider: `sb_${suffix}`,
-      chat: user, handle: line, sequence: index + 1, text, trace: newTraceId(), at,
-      attachment: JSON.stringify({
-        kind: "message", providerMessageId: `sb_${suffix}`,
-        sentAtMs: at, updatedAtMs: at, mediaAvailable: false,
-      }),
-    };
-    db.prepare<typeof row>(`
-      INSERT INTO webhook_deliveries(
-        id, provider_delivery_id, provider_message_id, event_kind,
-        line_id, line_handle, normalized_json, trace_id, received_at_ms
-      ) VALUES (@delivery, @delivery, @provider, 'message', @handle, @handle, '{}', @trace, @at)
-    `).run(row);
-    db.prepare<typeof row>(`
-      INSERT INTO inbound_messages(
-        id, delivery_id, provider_message_id, chat_id, guid, sender, line_id, line_handle,
-        sequence, state, text, is_audio, attachment_json, trace_id, created_at_ms, updated_at_ms
-      ) VALUES (
-        @inbound, @delivery, @provider, @chat, @provider, @chat, @handle, @handle,
-        @sequence, 'blocked', @text, 0, @attachment, @trace, @at, @at
-      )
-    `).run(row);
-  }
+interface CaseResult {
+  name: string;
+  category: Category;
+  iteration: number;
+  passed: boolean;
+  passThrough: boolean;
+  latencyMs: number;
+  firstReplyMs: number;
+  rounds: number;
+  classifierMs: number[];
+  agentMs: number[];
+  tools: string[];
+  scopes: (string | null)[];
+  /** Raw classifier output and finish reason, so a scope miss is diagnosable after eviction. */
+  verdicts: string[];
+  reply: string;
+  error?: string;
+  artifacts?: string;
 }
 
-// One completed exchange right before the current message: Annie's delivered (or not)
-// model-authored reply to the previous accepted message, aged as the case requires.
-function seedDeliveredExchange(db: AssistantRuntime["database"]["db"], exchange: SeededExchange): void {
-  const at = Date.now() - exchange.ageMs;
-  const row = {
-    inbound: "in_offer", delivery: "wd_offer", provider: "sb_offer", run: "run_offer", egress: "eg_offer",
-    chat: user, handle: line, sequence: 1_000, question: exchange.question, reply: exchange.reply,
-    state: exchange.state, trace: newTraceId(), at, attachment: JSON.stringify({
-      kind: "message", providerMessageId: "sb_offer", sentAtMs: at, updatedAtMs: at, mediaAvailable: false,
-    }),
-  };
-  db.prepare<typeof row>(`
-    INSERT INTO webhook_deliveries(
-      id, provider_delivery_id, provider_message_id, event_kind,
-      line_id, line_handle, normalized_json, trace_id, received_at_ms
-    ) VALUES (@delivery, @delivery, @provider, 'message', @handle, @handle, '{}', @trace, @at)
-  `).run(row);
-  db.prepare<typeof row>(`
-    INSERT INTO inbound_messages(
-      id, delivery_id, provider_message_id, chat_id, guid, sender, line_id, line_handle,
-      sequence, state, text, is_audio, attachment_json, trace_id, created_at_ms, updated_at_ms
-    ) VALUES (
-      @inbound, @delivery, @provider, @chat, @provider, @chat, @handle, @handle,
-      @sequence, 'done', @question, 0, @attachment, @trace, @at, @at
-    )
-  `).run(row);
-  db.prepare<typeof row>(`
-    INSERT INTO agent_runs(
-      id, inbound_id, trace_id, phase, deadline_at_ms, memory_maintenance_status,
-      final_response, request_scope, created_at_ms, updated_at_ms
-    ) VALUES (@run, @inbound, @trace, 'completed', @at, 'unchanged', @reply, 'read', @at, @at)
-  `).run(row);
-  db.prepare<typeof row>(`
-    INSERT INTO egress_messages(
-      id, run_id, trace_id, recipient_handle, line_handle, body, purpose, state,
-      attempt_count, created_at_ms, updated_at_ms
-    ) VALUES (@egress, @run, @trace, @chat, @handle, @reply, 'reply', @state, 1, @at, @at)
-  `).run(row);
-}
-
-async function runCase(name: string, text: string): Promise<void> {
+async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseResult> {
   const directory = mkdtempSync(join(tmpdir(), "annie-smoke-"));
   const config = loadRuntimeConfig({
     NODE_ENV: "test", DATA_DIR: directory,
@@ -243,60 +151,11 @@ async function runCase(name: string, text: string): Promise<void> {
     DAILY_BRIEF_ENABLED: "false", ...deepseek,
   });
   writeFileSync(config.memoryPath, "# Memory\n\n- My todo list is Daily tasks in Personal.\n- Use UTC for dates.\n");
-  const date = (offset: number) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10);
-  const yesterday = `## ${date(-1)}\n- [${name === "already_checked_no_op" ? "x" : " "}] Clean and organize room\n- [x] Wash car`;
-  const today = `## ${date(0)}\n- [ ] Clean restroom\n- [ ] Water plants\n- [ ] Clean and organize room`;
-  const original = `# Daily tasks\n\n## ${date(-2)}\n- [ ] Clean and organize room\n\n${yesterday}\n\n${today}\n`;
-  const pages = new Map([
-    ["daily", original],
-    ["archive", "# Task archive\n- [ ] Clean restroom\n- [ ] Clean and organize room\n"],
-  ]);
-  let mutations = 0;
-  const createdTitles: string[] = [];
-  const notion: NotionClientProvider = {
-    async withSession(_connection, _trace, operation) {
-      return operation({
-        validate(tool, argumentsValue) {
-          if (tool === "notion-update-page") patchSchema.parse(argumentsValue);
-        },
-        async call(tool, argumentsValue) {
-          if (tool === "notion-search") {
-            return { structuredContent: { truncated: false, results: [
-              { id: "daily", title: "Daily tasks" }, { id: "archive", title: "Task archive" },
-            ] } };
-          }
-          if (tool === "notion-fetch") {
-            if (name === "read_failure") throw new Error("Synthetic Notion read unavailable");
-            const { id } = z.object({ id: z.string() }).parse(argumentsValue);
-            assert(pages.has(id), "Model fetched an unknown synthetic page");
-            return { structuredContent: { id, text: pages.get(id), truncated: false } };
-          }
-          if (tool === "notion-create-pages") {
-            const { pages: created } = z.object({
-              pages: z.array(z.object({ properties: z.object({ title: z.string().min(1) }).loose() }).loose()).length(1),
-            }).loose().parse(argumentsValue);
-            mutations += 1;
-            pages.set("created_1", `# ${created[0]?.properties.title}\n`);
-            createdTitles.push(created[0]?.properties.title ?? "");
-            return { structuredContent: { pages: [{ id: "created_1", url: "https://notion.invalid/created_1" }] } };
-          }
-          assert.equal(tool, "notion-update-page", "Expected an update or a page creation");
-          const patch = patchSchema.parse(argumentsValue);
-          const source = pages.get(patch.page_id);
-          assert(source !== undefined, "Model wrote an unknown page");
-          const [change] = patch.content_updates;
-          const offset = source.indexOf(change.old_str);
-          assert(offset >= 0 && source.indexOf(change.old_str, offset + 1) === -1, "Provider source must be unique");
-          mutations += 1;
-          pages.set(patch.page_id, source.replace(change.old_str, change.new_str));
-          if (name === "ambiguous_write") throw new Error("Synthetic response lost after acceptance");
-          return { structuredContent: { id: patch.page_id, truncated: false } };
-        },
-      });
-    },
-  };
+  const notion = syntheticNotion(smokeCase.notion);
+  const google = syntheticGoogle(smokeCase.google);
   const inbox: InboundMessage[] = [];
   const sent: string[] = [];
+  const sentAt: number[] = [];
   const gateway: MessageGateway = {
     async listInbound(input) {
       const matches = inbox.filter((message) => message.updatedAtMs >= input.updatedAtGteMs);
@@ -305,17 +164,20 @@ async function runCase(name: string, text: string): Promise<void> {
     async openInboundWakeStream() { throw new Error("Smoke never opens the event stream"); },
     async send(input) {
       sent.push(input.text);
+      sentAt.push(Date.now());
       return { messageHandle: `sent_${sent.length}`, status: "delivered", error: null };
     },
     async getStatus(handle) { return { messageHandle: handle, status: "delivered", error: null }; },
   };
   const overrides = {
-    messageGateway: gateway, notionClients: notion, logger: false as const,
-    gmailClients: { async forConnection() { throw new Error("Google is offline in this smoke"); } },
-    googleWorkspaceClients: { async forConnection() { throw new Error("Google is offline in this smoke"); } },
+    messageGateway: gateway, notionClients: notion.clients, logger: false as const,
+    gmailClients: google.gmailClients, googleWorkspaceClients: google.googleWorkspaceClients,
   };
   let runtime = await createRuntime(config, overrides);
-  let passed = false;
+  const result: CaseResult = {
+    name: smokeCase.name, category: smokeCase.category, iteration, passed: false, passThrough: false,
+    latencyMs: 0, firstReplyMs: 0, rounds: 0, classifierMs: [], agentMs: [], tools: [], scopes: [], verdicts: [], reply: "",
+  };
   try {
     runtime.localUi.connections.saveAuthorization({
       traceId: newTraceId(), provider: "notion", providerAccountId: "synthetic-workspace",
@@ -324,211 +186,162 @@ async function runCase(name: string, text: string): Promise<void> {
       capabilities: ["notion.search", "notion.fetch", "notion.create_page", "notion.update_page"],
       credentials: { accessToken: "synthetic-token" },
     });
-    const seeded = historyFixture[name] ?? [];
-    seedFailedHistory(runtime.database.db, seeded);
-    const exchange = exchangeFixture[name];
-    if (exchange !== undefined) seedDeliveredExchange(runtime.database.db, exchange);
-    modelCalls = [];
-    const timestamp = Date.now() + 1_000;
-    inbox.push({
-      id: `input_${name}`, senderNumber: user, contactNumber: user,
-      lineNumber: line, recipientNumber: line, text, hasMedia: false,
-      isOutbound: false, messageType: "message", groupId: null, service: "iMessage",
-      status: "RECEIVED", sentAtMs: timestamp, updatedAtMs: timestamp, replyToId: null,
+    runtime.localUi.connections.saveAuthorization({
+      traceId: newTraceId(), provider: "google", providerAccountId: "synthetic-google-sub",
+      safeLabel: "ben@example.test", safeMetadata: { email: "ben@example.test" },
+      providerState: { scopes: config.google.scopes },
+      capabilities: ["gmail.read", "calendar.read", "drive.read", "contacts.read", "tasks.read"],
+      credentials: { refreshToken: "synthetic-refresh" },
     });
+    const seeded = smokeCase.history ?? [];
+    seedFailedHistory(runtime.database.db, seeded);
+    if (smokeCase.exchange !== undefined) seedDeliveredExchange(runtime.database.db, smokeCase.exchange);
+    modelCalls = [];
+    for (const [index, text] of smokeCase.texts.entries()) {
+      const timestamp = Date.now() + 1_000 + index;
+      inbox.push({
+        id: `input_${smokeCase.name}_${index}`, senderNumber: user, contactNumber: user,
+        lineNumber: line, recipientNumber: line, text, hasMedia: false,
+        isOutbound: false, messageType: "message", groupId: null, service: "iMessage",
+        status: "RECEIVED", sentAtMs: timestamp, updatedAtMs: timestamp, replyToId: null,
+      });
+    }
+    const startedAt = Date.now();
     await runtime.receiver.sweepOnce(new AbortController().signal);
     await drain(runtime);
-    if (name === "ambiguous_write" || name === "connect_google") {
+    if (smokeCase.restart === true) {
       await runtime.close();
       runtime = await createRuntime(config, overrides);
       await drain(runtime);
     }
     const db = runtime.database.db;
-    const tools = db.prepare<[], { tool_name: string; status: string }>(
-      "SELECT tool_name, status FROM tool_executions ORDER BY rowid",
-    ).all();
-    const writes = db.prepare<[], { state: string }>(
-      "SELECT state FROM write_intents WHERE kind <> 'sendblue_send_message'",
-    ).all();
-    const reply = db.prepare<[], { purpose: string; state: string }>(
-      "SELECT purpose, state FROM egress_messages WHERE id <> 'eg_offer'",
-    ).all();
-    const run = db.prepare<{ provider: string }, { phase: string; request_scope: string | null }>(`
-      SELECT runs.phase, runs.request_scope FROM agent_runs AS runs
-      JOIN inbound_messages AS inbound ON inbound.id = runs.inbound_id
-      WHERE inbound.provider_message_id = @provider
-    `).get({ provider: `input_${name}` });
-    const runCount = db.prepare<[], { count: number }>(
-      "SELECT COUNT(*) AS count FROM agent_runs WHERE id <> 'run_offer'",
-    ).get()?.count;
-    const scope = expectedScope[name];
-    assert(scope !== undefined, "Every smoke case declares the scope its request must get");
-    const purpose = name === "ambiguous_write" ? "failure" : name === "connect_google" ? "recovery" : "reply";
-    assert.deepEqual(reply, [{ purpose, state: "delivered" }]);
-    assert.equal(sent.length, 1);
-    assert(sent[0]?.trim(), "Expected a user-visible reply");
-    assert.equal(run?.phase, name === "ambiguous_write" ? "blocked" : "completed");
-    assert.equal(pages.get("archive"), "# Task archive\n- [ ] Clean restroom\n- [ ] Clean and organize room\n");
-    assert.equal(runCount, 1, "Seeded history must never start a run of its own");
-    assert.equal(run?.request_scope, scope, "Automatic classification of the current inbound");
-    const scopeCalls = modelCalls.filter((call) => call.response_format !== undefined);
-    const loopCalls = modelCalls.filter((call) => call.response_format === undefined
-      && call.messages[0]?.content?.startsWith("You are Annie") === true);
-    assert(scopeCalls.length >= 1 && loopCalls.length >= 1, "Real scope and agent calls happened");
+    const observation: Observation = {
+      texts: smokeCase.texts,
+      runs: db.prepare<[], { phase: string; request_scope: string | null }>(`
+        SELECT runs.phase, runs.request_scope FROM agent_runs AS runs
+        JOIN inbound_messages AS inbound ON inbound.id = runs.inbound_id
+        WHERE runs.id <> 'run_offer' ORDER BY inbound.sequence
+      `).all(),
+      replies: db.prepare<[], { purpose: string; state: string }>(
+        "SELECT purpose, state FROM egress_messages WHERE id <> 'eg_offer' ORDER BY created_at_ms",
+      ).all(),
+      sent, notion, google, config, runtime,
+      tools: db.prepare<[], { tool_name: string; status: string }>(
+        "SELECT tool_name, status FROM tool_executions ORDER BY rowid",
+      ).all(),
+      writes: db.prepare<[], { state: string }>(
+        "SELECT state FROM write_intents WHERE kind <> 'sendblue_send_message'",
+      ).all(),
+    };
+    result.latencyMs = (sentAt.at(-1) ?? startedAt) - startedAt;
+    result.firstReplyMs = (sentAt[0] ?? startedAt) - startedAt;
+    result.rounds = modelCalls.filter((call) => call.kind === "agent").length;
+    result.classifierMs = modelCalls.filter((call) => call.kind === "classifier").map((call) => call.durationMs);
+    result.agentMs = modelCalls.filter((call) => call.kind === "agent").map((call) => call.durationMs);
+    result.tools = observation.tools.map((tool) => `${tool.tool_name}:${tool.status}`);
+    result.scopes = observation.runs.map((run) => run.request_scope);
+    result.verdicts = modelCalls.filter((call) => call.kind === "classifier")
+      .map((call) => `${call.finishReason ?? "?"}:${(call.verdict ?? "").replace(/\s+/gu, " ").slice(0, 60)}`);
+    result.reply = smokeCase.name === "connect_google"
+      ? (sent.at(-1) ?? "").replace(/https:\/\/\S+/gu, "[synthetic signed link]")
+      : (sent.at(-1) ?? "");
+    const lastPurpose = observation.replies.at(-1)?.purpose;
+    result.passThrough = observation.replies.length === smokeCase.texts.length
+      && observation.replies.every((reply) => reply.state === "delivered" && reply.purpose !== "failure");
+
+    // Invariants every case shares.
+    const purpose = smokeCase.purpose ?? "reply";
+    assert.equal(observation.replies.length, smokeCase.texts.length, "One delivered message per inbound text");
+    assert(observation.replies.every((reply) => reply.state === "delivered"));
+    assert.equal(lastPurpose, purpose, `The last turn ends in a ${purpose}`);
+    assert.equal(sent.length, smokeCase.texts.length);
+    assert(sent.every((text) => text.trim().length > 0), "Every reply has user-visible text");
+    assert.equal(observation.runs.length, smokeCase.texts.length, "Seeded history must never start a run of its own");
+    assert.equal(observation.runs.at(-1)?.phase, purpose === "failure" ? "blocked" : "completed");
+    for (const [index, expected] of smokeCase.scopes.entries()) {
+      if (expected !== null) assert.equal(observation.runs[index]?.request_scope, expected, `Classification of text ${index + 1}`);
+    }
+    const scopeCalls = modelCalls.filter((call) => call.kind === "classifier");
+    const loopCalls = modelCalls.filter((call) => call.kind === "agent");
+    assert(scopeCalls.length >= smokeCase.texts.length && loopCalls.length >= 1, "Real scope and agent calls happened");
     for (const call of scopeCalls) {
       assert.equal(call.response_format?.type, "json_object");
       assert.equal(call.tools, undefined, "The classifier is offered no tools");
       assert.equal(call.messages.length, 2, "Classifier sees one policy plus the raw request");
-      assert.deepEqual(call.messages[1], { role: "user", content: text });
+      assert(smokeCase.texts.includes(call.messages[1]?.content ?? ""), "The classifier sees the raw request");
       for (const past of seeded) {
-        assert(!call.messages.some((message) => (message.content ?? "").includes(past)),
-          "History must never reach the classifier");
+        assert(!call.messages.some((message) => (message.content ?? "").includes(past)), "History must never reach the classifier");
       }
-      if (exchange !== undefined) {
+      if (smokeCase.exchange !== undefined) {
         const policy = call.messages[0]?.content ?? "";
-        assert(!policy.includes(exchange.question), "The user's earlier message never reaches the classifier");
-        const fresh = exchange.state === "delivered" && exchange.ageMs < 30 * 60_000;
-        assert.equal(policy.includes(exchange.reply), fresh, "Only a fresh delivered reply reaches the classifier");
+        assert(!policy.includes(smokeCase.exchange.question), "The user's earlier message never reaches the classifier");
+        const fresh = smokeCase.exchange.state === "delivered" && smokeCase.exchange.ageMs < 30 * 60_000;
+        assert.equal(policy.includes(smokeCase.exchange.reply), fresh, "Only a fresh delivered reply reaches the classifier");
       }
     }
     for (const call of loopCalls) {
-      assert.deepEqual(
-        call.messages.filter((message) => message.role === "user"),
-        [{ role: "user", content: text }],
-        "Only the current inbound is a live user message",
-      );
+      const live = call.messages.filter((message) => message.role === "user");
+      assert.equal(live.length, 1, "Only the current inbound is a live user message");
+      assert(smokeCase.texts.includes(live[0]?.content ?? ""));
       for (const past of seeded) {
-        assert(call.messages.some((message) =>
-          message.role === "system" && (message.content ?? "").includes(past)),
+        assert(call.messages.some((message) => message.role === "system" && (message.content ?? "").includes(past)),
           "Prior requests stay quoted as closed system data");
       }
     }
-    if (name === "connect_google") {
-      assert.equal(mutations, 0);
-      assert.deepEqual(writes, []);
-      assert.deepEqual(tools, [{ tool_name: "connections.connect", status: "succeeded" }]);
-      assert.equal(pages.get("daily"), original);
-      const url = new URL(sent[0]?.split("\n").at(-1) ?? "");
-      assert.equal(url.origin, new URL(config.publicBaseUrl).origin);
-      assert.equal(url.pathname, "/connect/google");
-      const token = url.searchParams.get("token");
-      assert(token);
-      assert.equal(runtime.localUi.links.resolve(token, "google").provider, "google");
-    } else if (seeded.length > 0) {
-      assert.equal(mutations, 0, "Closed failed history never authorizes a provider write");
-      assert.deepEqual(writes, []);
-      assert.equal(pages.get("daily"), original);
-      assert(tools.every((tool) => requestScopeTools[scope].includes(tool.tool_name)),
-        "A tool ran outside the classified scope");
-      assert(!/https?:\/\//u.test(sent[0] ?? ""), "A greeting or status answer sends no link");
-      if (scope === "conversation") {
-        assert.deepEqual(tools, [], "A greeting executes no provider tool at all");
-        assert(loopCalls.every((call) => call.tools === undefined), "A greeting is offered no tool");
-      } else {
-        assert(loopCalls.every((call) => !/(update|create)_page/u.test(JSON.stringify(call.tools ?? []))),
-          "A status question is never offered a Notion write tool");
-      }
-    } else if (name === "already_checked_no_op" || name === "read_failure" || name === "list_today") {
-      assert.equal(mutations, 0);
-      assert.deepEqual(writes, []);
-      assert.equal(pages.get("daily"), original);
-      assert(tools.some((tool) => tool.tool_name === "notion.fetch" && tool.status === (name === "read_failure" ? "failed" : "succeeded")));
-    } else if (name === "access_question" || name === "bare_page_name") {
-      assert.equal(mutations, 0);
-      assert.deepEqual(writes, []);
-      assert.equal(pages.get("daily"), original);
-      assert(tools.every((tool) => requestScopeTools[scope].includes(tool.tool_name)), "A tool ran outside the classified scope");
-      if (name === "bare_page_name") assert.deepEqual(tools, [], "A bare page name is conversation: no tools, yet a text reply");
-      assert(!/couldn't complete/u.test(sent[0] ?? ""), "A tool-less turn must answer in text, not fail empty");
-    } else if (exchange !== undefined) {
-      // Only a direct answer to Annie's delivered, fresh question completes the offered action.
-      assert(tools.every((tool) => requestScopeTools[scope].includes(tool.tool_name)), "A tool ran outside the classified scope");
-      assert(!/couldn't complete/u.test(sent[0] ?? ""), "A follow-up must answer in text, not fail empty");
-      if (name === "page_name_after_offer") {
-        // The write tools were granted (scope is asserted above). Whether the model creates a
-        // top-level page at once or first asks where it should live is its judgment call.
-        assert(mutations <= 1 && writes.length === mutations, "At most the one offered creation");
-        assert.deepEqual(createdTitles.map((title) => title.toLowerCase()), mutations === 1 ? ["logit notes"] : []);
-        assert.equal(pages.get("daily"), original);
-      } else if (name === "yes_after_offer") {
-        assert.equal(mutations, 1, "A plain yes completes the offered checkbox");
-        assert.deepEqual(writes, [{ state: "succeeded" }]);
-        assert.equal(pages.get("daily"), original.replace("[ ] Clean restroom", "[x] Clean restroom"));
-      } else {
-        assert.equal(mutations, 0, "A refusal, greeting, stale, or undelivered offer authorizes nothing");
-        assert.deepEqual(writes, []);
-        assert.deepEqual(tools, [], "Nothing to look up: no provider tool runs");
-        assert.equal(pages.get("daily"), original);
-      }
-    } else {
-      assert.equal(mutations, 1, "Exactly one provider mutation, including after restart");
-      assert.deepEqual(writes, [{ state: name === "ambiguous_write" ? "ambiguous" : "succeeded" }]);
-      if (name === "relative_date_checkbox") {
-        assert.equal(pages.get("daily"), original.replace(yesterday, yesterday.replace("[ ]", "[x]")));
-      } else if (name === "ambiguous_write") {
-        assert.equal(pages.get("daily"), original.replace("[ ] Clean restroom", "[x] Clean restroom"));
-      } else {
-        const changed = pages.get("daily") ?? "";
-        const before = original.trimEnd().split("\n");
-        const added: string[] = [];
-        let cursor = 0;
-        for (const lineText of changed.trimEnd().split("\n")) {
-          if (lineText === before[cursor]) cursor += 1;
-          else added.push(lineText);
-        }
-        assert.equal(cursor, before.length, "Task addition must preserve every original line");
-        assert(added.length >= 1 && added.length <= 2 && added.every((item) => /^- \[ \] /u.test(item)));
-        assert(/google storage/iu.test(added.join(" ")) && /icloud storage/iu.test(added.join(" ")));
-        assert(changed.startsWith(original.slice(0, original.indexOf(today))), "Earlier days must be unchanged");
-      }
-    }
     assert.equal(blockedRequests, 0, "A provider tried to escape the synthetic boundary");
-    // Reply shape, checked only on the read probes so wording variance never fails a write or
-    // recovery case: › marks exactly the listed tasks; outcomes, answers, and questions stay
-    // unprefixed lowercase prose; no Markdown.
-    const replyLines = (sent[0] ?? "").split("\n").filter((lineText) => lineText.trim() !== "");
-    if (name === "list_today" || name === "status_after_failures" || name === "already_checked_no_op") {
-      assert(replyLines.every((lineText) => !/^\s*[-*]/u.test(lineText) && !lineText.includes("*")), "Markdown leaked into the reply");
-      assert(!replyLines.some((lineText) => /^› .*\?$/u.test(lineText)), "A question was bulleted with ›");
-      const items = replyLines
-        .filter((lineText) => lineText.startsWith("› "))
-        .map((lineText) => lineText.slice(2).replace(/^\[[ x]\] /u, "").trim().toLowerCase());
-      if (name === "list_today") {
-        assert.deepEqual(items, ["clean restroom", "water plants", "clean and organize room"], "Exactly today's tasks are › items");
-      } else {
-        assert(!(replyLines[1] ?? "").startsWith("› "), "An outcome or answer is prose, not a › item");
-      }
-      // Lowercase prose: a capitalized first word is allowed only for provider content or product names.
-      const allowedCapitals = new Set([...pages.values(), "Personal Notion Google"].join(" ").match(/\b[A-Z][a-z]+/gu) ?? []);
-      for (const lineText of replyLines.filter((candidate) => !candidate.startsWith("› ") && !candidate.endsWith(":"))) {
-        const word = /[A-Za-z][a-z']*/u.exec(lineText)?.[0];
-        if (word !== undefined && /^[A-Z]/u.test(word)) {
-          assert(allowedCapitals.has(word), `Model prose is not lowercase: ${lineText}`);
-        }
-      }
-    }
-    const displayReply = name === "connect_google"
-      ? sent[0]?.replace(/https:\/\/\S+/gu, "[synthetic signed link]")
-      : sent[0];
-    console.log(JSON.stringify({
-      case: name, scope, mutations, tools, historyRows: seeded.length,
-      calls: { scope: scopeCalls.length, agent: loopCalls.length },
-      reply: displayReply, passed: true,
-    }));
-    passed = true;
+    smokeCase.expect(observation);
+    result.passed = true;
+  } catch (error) {
+    result.error = (error instanceof Error ? error.message : String(error)).split("\n")[0] ?? "unknown";
+    result.artifacts = directory;
   } finally {
     await runtime.close();
-    if (passed && !keep) rmSync(directory, { recursive: true });
-    else console.log(`Synthetic artifacts: ${directory}`);
+    if (result.passed && !keep) rmSync(directory, { recursive: true });
   }
+  return result;
 }
 
+const percentile = (values: readonly number[], q: number): number => {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] ?? 0;
+};
+
+function summarize(label: string, rows: readonly CaseResult[]): string {
+  const passed = rows.filter((row) => row.passed).length;
+  const through = rows.filter((row) => row.passThrough).length;
+  const latency = rows.map((row) => row.latencyMs);
+  const agent = rows.flatMap((row) => row.agentMs);
+  return [
+    label.padEnd(16),
+    `n=${String(rows.length).padStart(3)}`,
+    `pass=${String(passed).padStart(3)}`,
+    `through=${String(through).padStart(3)}`,
+    `latency p50=${String(percentile(latency, 0.5)).padStart(6)}ms p95=${String(percentile(latency, 0.95)).padStart(6)}ms`,
+    `rounds p50=${percentile(rows.map((row) => row.rounds), 0.5)}`,
+    `agent call p50=${percentile(agent, 0.5)}ms p95=${percentile(agent, 0.95)}ms`,
+    `classifier p50=${percentile(rows.flatMap((row) => row.classifierMs), 0.5)}ms`,
+  ].join("  ");
+}
+
+const results: CaseResult[] = [];
 try {
-  for (const [name, request] of cases) await runCase(name, request);
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(message.replaceAll(deepseek.DEEPSEEK_API_KEY, "[redacted]"));
-  process.exitCode = 1;
+  for (let iteration = 1; iteration <= repeat; iteration += 1) {
+    for (const smokeCase of selected) {
+      const result = await runCase(smokeCase, iteration);
+      results.push(result);
+      console.log(JSON.stringify(result));
+    }
+  }
 } finally {
   globalThis.fetch = networkFetch;
 }
+
+console.log("");
+for (const group of [...new Set(results.map((row) => row.category))]) {
+  console.log(summarize(group, results.filter((row) => row.category === group)));
+}
+console.log(summarize("ALL", results));
+const failed = results.filter((row) => !row.passed);
+for (const row of failed) console.log(`FAILED ${row.name} #${row.iteration}: ${row.error}  (${row.artifacts})`);
+process.exitCode = failed.length === 0 ? 0 : 1;

@@ -208,7 +208,7 @@ export class InboundTurnService {
       runId: run.id,
       data: preceding === undefined ? {} : { egressId: preceding.egressId },
     });
-    const scope = await classifyRequestScope({
+    const classified = await classifyRequestScope({
       model: this.#model,
       traceId: run.traceId,
       runId: run.id,
@@ -217,8 +217,18 @@ export class InboundTurnService {
       signal: AbortSignal.timeout(Math.max(1, run.deadlineAtMs - Date.now())),
     });
     context.assertLease();
-    this.#runs.setRequestScope(run.id, scope, { jobId: job.id, leaseToken: job.leaseToken });
-    return scope;
+    if (classified.fallback !== undefined) {
+      this.#traces.append({
+        traceId: run.traceId,
+        component: "request_scope",
+        event: "fallback",
+        outcome: classified.fallback,
+        runId: run.id,
+        data: { scope: classified.scope },
+      });
+    }
+    this.#runs.setRequestScope(run.id, classified.scope, { jobId: job.id, leaseToken: job.leaseToken });
+    return classified.scope;
   }
 
   /**

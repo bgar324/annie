@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { AgentRunStore } from "../agent/store.js";
-import type { RegisteredTool, ToolExecutionContext } from "../agent/tools.js";
+import { parseToolArguments, type RegisteredTool, type ToolExecutionContext } from "../agent/tools.js";
 import type { ConnectionRouter } from "../connections/router.js";
 import type { ConnectionStore } from "../connections/store.js";
 import type { ConnectionCapability, ConnectionRecord } from "../connections/types.js";
@@ -172,7 +172,7 @@ export class GoogleWorkspaceToolService {
         operationClass: "read",
         batchMode: "parallel_read",
         execute: async (argumentsValue, context) =>
-          this.search(searchArgumentsSchema.parse(argumentsValue), context),
+          this.search(parseToolArguments(searchArgumentsSchema, argumentsValue), context),
       },
       {
         definition: {
@@ -183,7 +183,7 @@ export class GoogleWorkspaceToolService {
         operationClass: "read",
         batchMode: "parallel_read",
         execute: async (argumentsValue, context) =>
-          this.read(readArgumentsSchema.parse(argumentsValue), context),
+          this.read(parseToolArguments(readArgumentsSchema, argumentsValue), context),
       },
     ];
   }

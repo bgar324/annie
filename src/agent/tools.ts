@@ -1,4 +1,5 @@
 import { Ajv, type ValidateFunction } from "ajv";
+import { z } from "zod";
 import type { ConnectionId, RunId, ToolExecutionId, TraceId } from "../core/ids.js";
 import type { ModelToolDefinition } from "./model.js";
 
@@ -34,6 +35,25 @@ export class ToolRegistryError extends Error {
     this.name = "ToolRegistryError";
     this.code = code;
   }
+}
+
+/**
+ * Parses tool arguments with the adapter's own schema after JSON-schema validation. The
+ * two schemas can disagree at the edges (a strict per-command object behind a flat JSON
+ * schema), and a bare ZodError would reach the model as an opaque provider failure. This
+ * names the offending paths instead, so the model corrects its next call. Issue messages
+ * carry paths and expectations, never argument values.
+ */
+export function parseToolArguments<T extends z.ZodType>(schema: T, argumentsValue: unknown): z.output<T> {
+  const parsed = schema.safeParse(argumentsValue);
+  if (parsed.success) {
+    return parsed.data;
+  }
+  const detail = parsed.error.issues
+    .slice(0, 5)
+    .map((issue) => `${issue.path.length === 0 ? "arguments" : `/${issue.path.join("/")}`}: ${issue.message}`)
+    .join("; ");
+  throw new ToolRegistryError("invalid_arguments", `Tool arguments do not match the tool schema: ${detail}`);
 }
 
 export class ToolRegistry {
@@ -93,10 +113,22 @@ export class ToolRegistry {
     if (
       argumentsValue === null ||
       typeof argumentsValue !== "object" ||
-      Array.isArray(argumentsValue) ||
-      !compiled.validate(argumentsValue)
+      Array.isArray(argumentsValue)
     ) {
-      throw new ToolRegistryError("invalid_arguments", "Tool arguments do not match the tool schema");
+      throw new ToolRegistryError("invalid_arguments", "Tool arguments must be one JSON object");
+    }
+    if (!compiled.validate(argumentsValue)) {
+      // Name the violations so the model can correct its next call instead of guessing;
+      // schema paths and keywords carry no user data. Bounded so a pathological call
+      // cannot flood the transcript.
+      const detail = (compiled.validate.errors ?? [])
+        .slice(0, 5)
+        .map((error) => {
+          const extra = typeof error.params.additionalProperty === "string" ? ` '${error.params.additionalProperty}'` : "";
+          return `${error.instancePath === "" ? "arguments" : error.instancePath} ${error.message ?? "is invalid"}${extra}`;
+        })
+        .join("; ");
+      throw new ToolRegistryError("invalid_arguments", `Tool arguments do not match the tool schema: ${detail}`);
     }
     if (input.context.replay && compiled.tool.operationClass === "write") {
       throw new ToolRegistryError("replay_write_blocked", "Replay mode cannot execute provider writes");

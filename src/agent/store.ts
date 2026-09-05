@@ -430,6 +430,7 @@ export class AgentRunStore {
     toolExecutionId: ToolExecutionId,
     status: "succeeded" | "failed" | "ambiguous" | "not_executed",
     result: unknown,
+    cause?: unknown,
   ): ToolExecutionRecord {
     const row = this.#db
       .prepare<{
@@ -452,6 +453,22 @@ export class AgentRunStore {
       });
     if (row === undefined) {
       throw new Error("Tool execution cannot finish from its current state");
+    }
+    if (cause !== undefined) {
+      // The model sees only a safe summary; the operator needs the class and message
+      // to diagnose a failure the summary hides. Bounded, and redacted like every event.
+      this.#traces.append({
+        traceId: this.getRequired(row.run_id as RunId).traceId,
+        runId: row.run_id as RunId,
+        toolExecutionId,
+        component: "tool",
+        event: status,
+        outcome: cause instanceof Error ? cause.name : "unknown",
+        data: {
+          toolName: row.tool_name,
+          message: (cause instanceof Error ? cause.message : String(cause)).slice(0, 300),
+        },
+      });
     }
     return toTool(row);
   }

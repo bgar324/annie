@@ -31,14 +31,14 @@ export async function classifyRequestScope(input: {
   userMessage: string;
   precedingReply?: string;
   signal: AbortSignal;
-}): Promise<RequestScope> {
+}): Promise<{ scope: RequestScope; fallback?: "budget_exhausted" | "unparseable" }> {
   const response = await input.model.complete({
     traceId: input.traceId,
     runId: input.runId,
     signal: input.signal,
     responseFormat: "json",
     reasoningEffort: "low",
-    maxOutputTokens: 768,
+    maxOutputTokens: 1_536,
     tools: [],
     messages: [
       {
@@ -48,7 +48,7 @@ export async function classifyRequestScope(input: {
           "Classify the requested action, not whether you can complete it. Missing page, account, or date context does not remove an explicit write request; the later execution stage resolves its target.",
           "conversation: greetings, acknowledgements, small talk, or text not requesting external information/action.",
           "read: requests to look up information, check status, or discuss a past action. Asking whether you have access to, can see, or can find a named page, file, thread, event, or account is read, because answering needs a lookup. A question about whether a change happened is not permission to make it.",
-          "notion_write: this message explicitly asks to create or change a Notion page, document, todo/task list, property, or checkbox. Ordinary wording and relative dates are allowed.",
+          "notion_write: this message explicitly asks to create or change a Notion page, document, todo/task list, property, or checkbox. Ordinary wording and relative dates are allowed. A reminder, alarm, notification, email, text, or calendar request is not a Notion write; it is conversation or read, and the assistant may offer a list entry instead.",
           "connect_google or connect_notion: this message explicitly asks for that provider's connection/reconnection link.",
           "Earlier user messages never supply authorization: historical, quoted, hypothetical, or negated actions are not new commands. Unclear requests get conversation or read, never write/connect permission.",
           ...(input.precedingReply === undefined
@@ -63,8 +63,18 @@ export async function classifyRequestScope(input: {
       { role: "user", content: input.userMessage },
     ],
   });
-  if (response.toolCalls.length !== 0 || response.content.length > 512) {
-    throw new Error("Invalid current-request scope response");
+  // Low reasoning can still spend the whole output budget deliberating over an odd
+  // message and return no JSON at all. That is not a failed turn: read-only access is the
+  // safe floor (no write, no link), so the run proceeds there and the trace records why.
+  if (response.finishReason === "length" || response.content.trim() === "") {
+    return { scope: "read", fallback: "budget_exhausted" };
   }
-  return responseSchema.parse(JSON.parse(response.content)).scope;
+  if (response.toolCalls.length !== 0 || response.content.length > 512) {
+    return { scope: "read", fallback: "unparseable" };
+  }
+  try {
+    return { scope: responseSchema.parse(JSON.parse(response.content)).scope };
+  } catch {
+    return { scope: "read", fallback: "unparseable" };
+  }
 }

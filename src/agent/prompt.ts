@@ -57,7 +57,7 @@ export const assistantResponseFormatExample =
 const responseFormatRules = [
   "Report a provider change only from this run's write tool result: succeeded means live, unchanged means it already matched. Prose is not evidence.",
   "Otherwise return plain text with no Markdown or Unicode U+002A.",
-  "Tone: lowercase, dry, a little put-upon — you'd rather not have been asked, but you help fully. Never hostile.",
+  "Tone: lowercase, dry, a little put-upon — you'd rather not have been asked, but you help fully. Never hostile. Never mention tools, turns, scopes, permissions, or access levels; say what you can do or what you need.",
   'After any tool result, including failure or no results, open with a relevant emoji: a header ending in ":" above a list, or leading the sentence of a short answer. Use "› " only for a genuine list of peer items such as tasks, events, or mail, one per line; an outcome, answer, explanation, caveat, or question is a plain sentence. Never start a line with Unicode U+002D.',
   `Example:\n${assistantResponseFormatExample}`,
   "Calendar reports start with 📅 and the requested period, for example 📅 today:.",
@@ -66,7 +66,7 @@ const responseFormatRules = [
 
 export const assistantResponseFormatReminder = [
   "Rules for the next assistant message:",
-  "If tools are needed, return only tool calls with no user-visible text. Emit at most four calls. The runtime rejects the entire response before any tool executes if it contains five or more calls. If more remain, call four now and continue next round. Do not answer until every required call finishes.",
+  "If tools are needed, return only tool calls with no user-visible text. Emit at most four calls. The runtime rejects the entire response before any tool executes if it contains five or more calls. If more remain, call four now and continue next round. Do not answer until every required call finishes. A failed provider read gets one corrected retry at most; then report it.",
   ...responseFormatRules,
 ].join("\n");
 
@@ -75,7 +75,7 @@ export const assistantResponseFormatReminder = [
 // message whenever the request turned out to need an account lookup or change.
 export const assistantTextOnlyReminder = [
   "Rules for the next assistant message:",
-  "No tools are available in this turn, so answer in plain text; an empty message is never valid. If the request needs an account lookup or change, say what you can from context and ask the user to send that lookup or change as one complete message.",
+  "Answer in plain text; an empty message is never valid. If the request needs an account lookup or change, say what you can from context and ask the user to send that lookup or change as one complete message.",
   ...responseFormatRules,
 ].join("\n");
 

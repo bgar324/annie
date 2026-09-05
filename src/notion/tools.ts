@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import { z } from "zod";
 import type { AgentRunStore } from "../agent/store.js";
-import type { RegisteredTool, ToolExecutionContext } from "../agent/tools.js";
+import { parseToolArguments, type RegisteredTool, type ToolExecutionContext } from "../agent/tools.js";
 import type { ConnectionRouter } from "../connections/router.js";
 import type { ConnectionStore } from "../connections/store.js";
 import type { ConnectionCapability, ConnectionRecord } from "../connections/types.js";
@@ -229,7 +229,7 @@ export class NotionToolService {
         operationClass: "read",
         batchMode: "parallel_read",
         execute: async (argumentsValue, context) =>
-          this.search(searchArgumentsSchema.parse(argumentsValue), context),
+          this.search(parseToolArguments(searchArgumentsSchema, argumentsValue), context),
       },
       {
         definition: {
@@ -248,7 +248,7 @@ export class NotionToolService {
         operationClass: "read",
         batchMode: "parallel_read",
         execute: async (argumentsValue, context) =>
-          this.fetch(fetchArgumentsSchema.parse(argumentsValue), context),
+          this.fetch(parseToolArguments(fetchArgumentsSchema, argumentsValue), context),
       },
       {
         definition: {
@@ -301,7 +301,7 @@ export class NotionToolService {
         },
         operationClass: "write",
         execute: async (argumentsValue, context) =>
-          this.createPage(createPageArgumentsSchema.parse(argumentsValue), context),
+          this.createPage(parseToolArguments(createPageArgumentsSchema, argumentsValue), context),
       },
       {
         definition: {
@@ -346,25 +346,28 @@ export class NotionToolService {
               },
             },
             required: ["workspace", "pageId", "command"],
+            // Each command owns exactly its fields; the others are forbidden, not ignored, so
+            // a stray `newContent` on an update is rejected here by name instead of failing
+            // later as an opaque error.
             allOf: [
               {
                 if: { properties: { command: { const: "update_properties" } } },
                 then: {
-                  properties: { properties: { type: "object" } },
+                  properties: { properties: { type: "object" }, newContent: false, updates: false },
                   required: ["properties"],
                 },
               },
               {
                 if: { properties: { command: { const: "replace_content" } } },
                 then: {
-                  properties: { newContent: { type: "string" } },
+                  properties: { newContent: { type: "string" }, properties: false, updates: false },
                   required: ["newContent"],
                 },
               },
               {
                 if: { properties: { command: { const: "update_content" } } },
                 then: {
-                  properties: { updates: { type: "array" } },
+                  properties: { updates: { type: "array" }, newContent: false, properties: false },
                   required: ["updates"],
                 },
               },
@@ -374,7 +377,7 @@ export class NotionToolService {
         },
         operationClass: "write",
         execute: async (argumentsValue, context) =>
-          this.updatePage(updatePageArgumentsSchema.parse(argumentsValue), context),
+          this.updatePage(parseToolArguments(updatePageArgumentsSchema, argumentsValue), context),
       },
     ];
   }

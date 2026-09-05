@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { AgentRunStore } from "../agent/store.js";
-import type { RegisteredTool, ToolExecutionContext } from "../agent/tools.js";
+import { parseToolArguments, type RegisteredTool, type ToolExecutionContext } from "../agent/tools.js";
 import type { ConnectionRouter } from "../connections/router.js";
 import type { ConnectionStore } from "../connections/store.js";
 import type { ConnectionCapability, ConnectionRecord } from "../connections/types.js";
@@ -98,7 +98,7 @@ export class GmailToolService {
         operationClass: "read",
         batchMode: "parallel_read",
         execute: async (argumentsValue, context) =>
-          this.search(searchArgumentsSchema.parse(argumentsValue), context),
+          this.search(parseToolArguments(searchArgumentsSchema, argumentsValue), context),
       },
       {
         definition: {
@@ -117,7 +117,7 @@ export class GmailToolService {
         operationClass: "read",
         batchMode: "parallel_read",
         execute: async (argumentsValue, context) =>
-          this.readThread(readThreadArgumentsSchema.parse(argumentsValue), context),
+          this.readThread(parseToolArguments(readThreadArgumentsSchema, argumentsValue), context),
       },
     ];
   }

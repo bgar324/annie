@@ -407,6 +407,29 @@ describe("Notion writes", () => {
     expect(writeStates(harness)).toEqual(["succeeded", "succeeded", "succeeded"]);
   });
 
+  it("names a stray field on an update instead of failing at the provider boundary", async () => {
+    // Production shape: the model sent newContent alongside update_content. The registry
+    // must reject it by path before any intent or dispatch, so the model corrects its call.
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_stray", "Stray");
+    const fixture = sessionFixture(async () => { throw new Error("must not dispatch"); });
+    const registry = new ToolRegistry(notionService(harness, fixedSessionProvider(fixture.session)).tools());
+
+    await expect(registry.execute({
+      name: "notion.update_page",
+      argumentsJson: JSON.stringify({
+        workspace: "Stray", pageId: "page_1", command: "update_content", newContent: "",
+        updates: [{ oldText: "- [ ] Task", newText: "- [x] Task" }],
+      }),
+      context: toolContext(harness, "notion.update_page", "write"),
+    })).rejects.toMatchObject({
+      code: "invalid_arguments",
+      message: expect.stringMatching(/newContent/u),
+    });
+    expect(fixture.call).not.toHaveBeenCalled();
+    expect(writeStates(harness)).toEqual([]);
+  });
+
   it("rejects an incompatible write before intent or MCP dispatch without changing health", async () => {
     const harness = notionHarness();
     const connection = addNotionConnection(harness, "workspace_drift", "Drifted");

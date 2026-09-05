@@ -412,7 +412,12 @@ describe("Google Workspace read tools", () => {
         }),
         context: toolContext(harness, "google.search"),
       }),
-    ).rejects.toMatchObject({ name: "ZodError" });
+    ).rejects.toMatchObject({
+      name: "ToolRegistryError",
+      code: "invalid_arguments",
+      // The model sees which path failed and why, never a bare provider failure.
+      message: expect.stringMatching(/^Tool arguments do not match the tool schema: \/queries/u),
+    });
     for (const invalidTimestamp of ["2026-06-02", "2026-06-02T09:00:00"]) {
       await expect(
         registry.execute({
@@ -427,7 +432,7 @@ describe("Google Workspace read tools", () => {
           }),
           context: toolContext(harness, "google.search"),
         }),
-      ).rejects.toMatchObject({ name: "ZodError" });
+      ).rejects.toMatchObject({ name: "ToolRegistryError", code: "invalid_arguments" });
     }
     await expect(
       registry.execute({

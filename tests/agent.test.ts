@@ -67,7 +67,9 @@ describe("assistant prompt", () => {
       Buffer.byteLength(prompt) +
       Buffer.byteLength(assistantResponseFormatReminder) -
       Buffer.byteLength(memory);
-    expect(fixedWireBytes).toBeLessThan(4_352);
+    // Prompt-bloat tripwire, not a provider limit. Raised 4096 → 4352 for the tone line and
+    // 4352 → 4608 for the one-retry rule (measured 4408); every raise is a deliberate trade.
+    expect(fixedWireBytes).toBeLessThan(4_608);
   });
 
   it("teaches › for list items only and shows an unprefixed closing sentence", () => {
@@ -1595,7 +1597,11 @@ describe("durable bounded agent loop", () => {
           replay: false,
         },
       }),
-    ).rejects.toMatchObject({ code: "invalid_arguments" });
+    ).rejects.toMatchObject({
+      code: "invalid_arguments",
+      // The model corrects its next call from this; a bare "does not match" cost a round.
+      message: expect.stringMatching(/must have required property 'value'|additional properties 'unexpected'/u),
+    });
     expect(executions).toBe(0);
   });
 });
@@ -1625,7 +1631,7 @@ describe("current-request scope", () => {
       signal: AbortSignal.timeout(5_000),
     });
 
-    expect(scope).toBe("notion_write");
+    expect(scope).toEqual({ scope: "notion_write" });
     expect(requests).toHaveLength(1);
     expect(requests[0]?.responseFormat).toBe("json");
     expect(requests[0]?.tools).toEqual([]);
@@ -1638,28 +1644,33 @@ describe("current-request scope", () => {
   });
 
   it.each([
-    { label: "an unknown scope", content: '{"scope":"admin_write"}', toolCalls: [] },
+    { label: "an unknown scope", content: '{"scope":"admin_write"}', toolCalls: [], finishReason: "stop", fallback: "unparseable" },
     {
       label: "unexpected response keys",
       content: '{"scope":"read","tool":"notion.update_page"}',
-      toolCalls: [],
+      toolCalls: [], finishReason: "stop", fallback: "unparseable",
     },
-    { label: "prose instead of JSON", content: "notion_write", toolCalls: [] },
+    { label: "prose instead of JSON", content: "notion_write", toolCalls: [], finishReason: "stop", fallback: "unparseable" },
     {
       label: "a tool call",
       content: '{"scope":"read"}',
       toolCalls: [
         { id: "call_classify", name: "notion.update_page", argumentsJson: "{}" },
       ],
+      finishReason: "stop", fallback: "unparseable",
     },
-  ])("fails closed on $label", async ({ content, toolCalls }) => {
+    { label: "a spent output budget", content: "", toolCalls: [], finishReason: "length", fallback: "budget_exhausted" },
+    { label: "a write verdict cut off by the budget", content: '{"scope":"notion_wr', toolCalls: [], finishReason: "length", fallback: "budget_exhausted" },
+  ])("falls to read-only on $label", async ({ content, toolCalls, finishReason, fallback }) => {
+    // Read is the safe floor: no write tool, no connection link, but the user still gets an
+    // answer instead of a failure notice. A garbled write verdict never widens to a write.
     const model = scriptedModel([
       {
         id: "scope_invalid",
         content,
         providerState: null,
         toolCalls,
-        finishReason: "stop",
+        finishReason,
         usage: emptyUsage,
       },
     ]);
@@ -1672,7 +1683,7 @@ describe("current-request scope", () => {
         userMessage: "Hey annie",
         signal: AbortSignal.timeout(5_000),
       }),
-    ).rejects.toThrow();
+    ).resolves.toEqual({ scope: "read", fallback });
   });
 
   it("grants provider writes to the write scope alone", () => {

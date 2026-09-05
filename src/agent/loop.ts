@@ -157,11 +157,15 @@ export class AgentLoop {
         );
         let response;
         try {
+          // A run offered no tools can only word a reply: nothing to look up, nothing to
+          // change, so high reasoning buys 15–35 s of deliberation over a greeting or a
+          // decline. Tool-bearing runs keep the configured effort.
           response = await this.#model.complete({
             traceId: run.traceId,
             runId: run.id,
             messages: requestMessages,
             tools: toolDefinitions,
+            ...(toolDefinitions.length === 0 ? { reasoningEffort: "medium" as const } : {}),
             signal: runSignal,
           });
         } catch (error) {
@@ -381,7 +385,7 @@ export class AgentLoop {
           throw new AgentLimitError("run_deadline", "The agent run deadline was reached");
         }
         const normalized = safeToolError(error);
-        this.#runs.finishTool(execution.id, "failed", normalized);
+        this.#runs.finishTool(execution.id, "failed", normalized, error);
         this.#runs.appendToolMessage(run.id, call.id, canonicalJson(normalized));
       }
     }
@@ -509,7 +513,7 @@ export class AgentLoop {
         return { content: canonicalJson(result), deadlineReached: true };
       }
       const result = safeToolError(error);
-      this.#runs.finishTool(execution.id, "failed", result);
+      this.#runs.finishTool(execution.id, "failed", result, error);
       return { content: canonicalJson(result), deadlineReached: false };
     }
   }

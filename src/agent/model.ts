@@ -45,7 +45,7 @@ export interface ModelRequest {
   messages: readonly ModelMessage[];
   tools: readonly ModelToolDefinition[];
   responseFormat?: "json";
-  reasoningEffort?: "low";
+  reasoningEffort?: "low" | "medium";
   maxOutputTokens?: number;
   signal?: AbortSignal;
 }
