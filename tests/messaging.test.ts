@@ -150,6 +150,10 @@ class FakeSendblueGateway implements MessageGateway {
       error: status === "failed" ? "Sendblue delivery failed" : null,
     };
   }
+
+  async startTyping(): Promise<void> {
+    return undefined;
+  }
 }
 
 async function* wakeEvents(count: number, signal: AbortSignal): AsyncGenerator<void> {

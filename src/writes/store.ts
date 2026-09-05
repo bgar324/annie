@@ -14,7 +14,8 @@ export type WriteKind =
   | "gmail_send_draft"
   | "notion_create_page"
   | "notion_update_page"
-  | "sendblue_send_message";
+  | "sendblue_send_message"
+  | "sendblue_typing_indicator";
 
 export type WriteState =
   | "prepared"
@@ -278,7 +279,10 @@ export class WriteStore {
       if (row === undefined) {
         throw new Error(`Write ${input.writeId} is not executable`);
       }
-      if (row.run_id !== null) {
+      // provider_writes is the run's one-mutation cap and means the user's provider
+      // changes. Sendblue-side calls (the reply send, a typing bubble) keep their attempt
+      // records but never spend it.
+      if (row.run_id !== null && !row.kind.startsWith("sendblue_")) {
         this.#db
           .prepare<{ run_id: string; now_ms: number }>(`
             UPDATE agent_runs
@@ -458,7 +462,9 @@ export class WriteStore {
             `)
             .run({ id: row.tool_execution_id, now_ms: now });
         }
-        if (row.run_id !== null) {
+        // A typing indicator is a provider mutation and keeps its honest ambiguous record,
+        // but an unconfirmed bubble harms nothing: it must never block the run it belongs to.
+        if (row.run_id !== null && row.kind !== "sendblue_typing_indicator") {
           this.#db
             .prepare<{ id: string; write_id: string; now_ms: number }>(`
               UPDATE agent_runs

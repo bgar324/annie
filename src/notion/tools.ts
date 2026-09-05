@@ -7,8 +7,9 @@ import type { ConnectionStore } from "../connections/store.js";
 import type { ConnectionCapability, ConnectionRecord } from "../connections/types.js";
 import { ModelSafeError } from "../core/errors.js";
 import type { TraceId } from "../core/ids.js";
+import { canonicalJson } from "../core/json.js";
 import type { WriteStore } from "../writes/store.js";
-import type { NotionClientProvider, NotionUpstreamTool } from "./client.js";
+import { NotionMcpError, type NotionClientProvider, type NotionUpstreamTool } from "./client.js";
 
 const accountSchema = z.string().trim().min(1).max(160).optional();
 const searchArgumentsSchema = z
@@ -16,6 +17,7 @@ const searchArgumentsSchema = z
     query: z.string().trim().min(1).max(512),
     workspace: accountSchema,
     pageSize: z.number().int().min(1).max(10).default(10),
+    hydrate: z.number().int().min(0).max(3).default(0),
   })
   .strict();
 const upstreamSearchArgumentsSchema = z
@@ -137,6 +139,20 @@ interface NormalizedNotionTextResult {
   readonly truncated: boolean;
 }
 
+/** A fetched page as the model and the write guard see it; hydration returns the same shape. */
+interface NormalizedNotionPage {
+  readonly id?: string;
+  readonly title?: string;
+  readonly url?: string;
+  readonly type?: string;
+  readonly text?: string;
+  readonly truncated: boolean;
+}
+
+// Hydration bounds mirror gmail.search: enough for a task page or a note, never a report.
+const maximumHydratedPageBytes = 24_576;
+const maximumHydrationBytes = 49_152;
+
 const fetchedPageSchema = z.object({
   workspace: z.object({ label: z.string() }),
   result: z.object({
@@ -214,13 +230,14 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.search",
-          description: "Search internal content in one connected Notion workspace. For automatic multi-account reads, call once per exact safe label in connected account status. Search finds candidate pages; fetch the selected page before editing it.",
+          description: "Search internal content in one connected Notion workspace. For automatic multi-account reads, call once per exact safe label in connected account status. Set hydrate to 1-3 to also return the full text of the top results as pages, which counts as fetching them: use it when you expect to read or edit the page you find, so search and fetch take one round. Use 0 for a broad lookup.",
           parameters: {
             type: "object",
             properties: {
               query: { type: "string", minLength: 1, maxLength: 512 },
               workspace: { type: "string", minLength: 1, maxLength: 160 },
               pageSize: { type: "integer", minimum: 1, maximum: 10, default: 10 },
+              hydrate: { type: "integer", minimum: 0, maximum: 3, default: 0 },
             },
             required: ["query"],
             additionalProperties: false,
@@ -396,11 +413,35 @@ export class NotionToolService {
           query_type: "internal",
           page_size: input.pageSize,
         } as const;
-        return normalizeNotionResult(
+        const search = normalizeNotionResult(
           "notion-search",
           await session.call("notion-search", request),
           request,
         );
+        if (input.hydrate === 0 || !("results" in search)) {
+          return search;
+        }
+        // Hydration: the top results' full text in the same tool round, so the usual
+        // search-then-fetch pair costs one model round instead of two. Each page is the
+        // exact notion.fetch shape, bounded per page and in total; a page that fails or
+        // overflows is simply absent, and the search result itself is never lost.
+        const pages: NormalizedNotionPage[] = [];
+        let bytes = 0;
+        for (const reference of search.results.slice(0, input.hydrate)) {
+          if (reference.id === undefined) continue;
+          let page: NormalizedNotionPage;
+          try {
+            page = normalizeNotionResult("notion-fetch", await session.call("notion-fetch", { id: reference.id }));
+          } catch (error) {
+            if (error instanceof NotionMcpError || error instanceof NotionToolResultError) continue;
+            throw error;
+          }
+          const size = Buffer.byteLength(canonicalJson(page));
+          if (size > maximumHydratedPageBytes || bytes + size > maximumHydrationBytes) break;
+          bytes += size;
+          pages.push({ ...page, id: reference.id });
+        }
+        return { ...search, pages };
       },
       context.signal,
     );
@@ -510,6 +551,12 @@ export class NotionToolService {
     });
   }
 
+  /**
+   * The page the model may edit: the latest complete same-run, same-connection read of
+   * it, whether from notion.fetch or hydrated into a notion.search result. Both are the
+   * same normalized shape recorded on a succeeded tool execution, so a hydrated page is
+   * exactly as much proof as a fetched one.
+   */
   #fetchedPage(
     pageId: string,
     connection: ConnectionRecord,
@@ -518,13 +565,25 @@ export class NotionToolService {
     const row = this.#db
       .prepare<
         { run_id: string; connection_id: string; page_id: string },
-        { result_json: string }
+        { page_json: string }
       >(`
-        SELECT result_json FROM tool_executions
-        WHERE run_id = @run_id AND connection_id = @connection_id
-          AND tool_name = 'notion.fetch' AND status = 'succeeded'
-          AND json_extract(arguments_json, '$.id') = @page_id
-          AND result_json IS NOT NULL
+        SELECT page_json FROM (
+          SELECT rowid, json_object('workspace', json_extract(result_json, '$.workspace'),
+                                    'result', json_extract(result_json, '$.result')) AS page_json
+          FROM tool_executions
+          WHERE run_id = @run_id AND connection_id = @connection_id
+            AND tool_name = 'notion.fetch' AND status = 'succeeded'
+            AND json_extract(arguments_json, '$.id') = @page_id
+            AND result_json IS NOT NULL
+          UNION ALL
+          SELECT executions.rowid, json_object('workspace', json_extract(executions.result_json, '$.workspace'),
+                                               'result', pages.value) AS page_json
+          FROM tool_executions AS executions,
+               json_each(executions.result_json, '$.result.pages') AS pages
+          WHERE executions.run_id = @run_id AND executions.connection_id = @connection_id
+            AND executions.tool_name = 'notion.search' AND executions.status = 'succeeded'
+            AND json_extract(pages.value, '$.id') = @page_id
+        )
         ORDER BY rowid DESC
         LIMIT 1
       `)
@@ -534,7 +593,7 @@ export class NotionToolService {
         page_id: pageId,
       });
     const fetched = fetchedPageSchema.safeParse(
-      row === undefined ? undefined : JSON.parse(row.result_json),
+      row === undefined ? undefined : JSON.parse(row.page_json),
     );
     if (
       !fetched.success ||
@@ -689,7 +748,12 @@ function normalizeNotionResult(
   argumentsValue: Record<string, unknown>,
 ): NormalizedNotionSearchResult | NormalizedNotionTextResult;
 function normalizeNotionResult(
-  name: Exclude<NotionUpstreamTool, "notion-search">,
+  name: "notion-fetch",
+  raw: unknown,
+  argumentsValue?: Record<string, unknown>,
+): NormalizedNotionPage;
+function normalizeNotionResult(
+  name: Exclude<NotionUpstreamTool, "notion-search" | "notion-fetch">,
   raw: unknown,
   argumentsValue?: Record<string, unknown>,
 ): unknown;

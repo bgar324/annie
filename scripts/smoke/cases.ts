@@ -122,7 +122,7 @@ export const cases: readonly SmokeCase[] = [
     texts: [requests.relative_date_checkbox], scopes: ["notion_write"], notion: { yesterdayChecked: true },
     expect(o) {
       noProviderWrite(o);
-      assert(o.tools.some((tool) => tool.tool_name === "notion.fetch" && tool.status === "succeeded"));
+      assert(o.tools.some((tool) => tool.tool_name.startsWith("notion.") && tool.status === "succeeded"), "The page was read");
       replyShape(o, { outcomeIsProse: true });
     },
   },
@@ -181,7 +181,7 @@ export const cases: readonly SmokeCase[] = [
     texts: ["what's on today's list?"], scopes: ["read"],
     expect(o) {
       noProviderWrite(o);
-      assert(o.tools.some((tool) => tool.tool_name === "notion.fetch" && tool.status === "succeeded"));
+      assert(o.tools.some((tool) => tool.tool_name.startsWith("notion.") && tool.status === "succeeded"), "The page was read");
       replyShape(o, { items: ["clean restroom", "water plants", "clean and organize room"] });
     },
   },

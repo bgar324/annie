@@ -17,6 +17,7 @@ import type { JobContext } from "../queue/worker.js";
 import type { TraceStore } from "../tracing/store.js";
 import type { MessageEgressService } from "./egress.js";
 import type { FailureNotificationService } from "./failure.js";
+import type { TypingIndicatorService } from "./typing.js";
 
 interface InboundTurnRow {
   id: InboundId;
@@ -49,6 +50,7 @@ export class InboundTurnService {
   readonly #recovery: ConnectionRecoveryService;
   readonly #egress: MessageEgressService;
   readonly #failures: FailureNotificationService;
+  readonly #typing: TypingIndicatorService;
   readonly #traces: TraceStore;
 
   constructor(input: {
@@ -63,6 +65,7 @@ export class InboundTurnService {
     recovery: ConnectionRecoveryService;
     egress: MessageEgressService;
     failures: FailureNotificationService;
+    typing: TypingIndicatorService;
     traces: TraceStore;
   }) {
     this.#db = input.db;
@@ -76,6 +79,7 @@ export class InboundTurnService {
     this.#recovery = input.recovery;
     this.#egress = input.egress;
     this.#failures = input.failures;
+    this.#typing = input.typing;
     this.#traces = input.traces;
   }
 
@@ -195,6 +199,11 @@ export class InboundTurnService {
       deadlineAtMs: Date.now() + this.#config.limits.maxAgentRunMs,
     });
     this.#runs.bindJob(run.id, job.id, job.leaseToken);
+    // Fire-and-forget by design: the bubble races the classifier call and never gates the
+    // reply. The service settles its own intent and swallows its own failures.
+    if (run.requestScope === null) {
+      void this.#typing.start({ runId: run.id, traceId: run.traceId });
+    }
     if (run.requestScope !== null) {
       return run.requestScope;
     }

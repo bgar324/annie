@@ -162,6 +162,7 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
       return { messages: matches.slice(input.offset, input.offset + input.limit), total: matches.length };
     },
     async openInboundWakeStream() { throw new Error("Smoke never opens the event stream"); },
+    async startTyping() { return undefined; },
     async send(input) {
       sent.push(input.text);
       sentAt.push(Date.now());
@@ -230,7 +231,7 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
         "SELECT tool_name, status FROM tool_executions ORDER BY rowid",
       ).all(),
       writes: db.prepare<[], { state: string }>(
-        "SELECT state FROM write_intents WHERE kind <> 'sendblue_send_message'",
+        "SELECT state FROM write_intents WHERE kind NOT LIKE 'sendblue_%'",
       ).all(),
     };
     result.latencyMs = (sentAt.at(-1) ?? startedAt) - startedAt;

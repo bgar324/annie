@@ -40,18 +40,23 @@ export class AgentLoop {
   readonly #writes: WriteStore;
   readonly #limits: AgentLoopLimits;
 
+  readonly #release: readonly ((traceId: TraceId) => Promise<void>)[];
+
   constructor(input: {
     model: ChatModel;
     tools: ToolRegistry;
     runs: AgentRunStore;
     writes: WriteStore;
     limits: AgentLoopLimits;
+    /** Provider sessions held for the run; each is closed when the run ends, on any path. */
+    release?: readonly ((traceId: TraceId) => Promise<void>)[];
   }) {
     this.#model = input.model;
     this.#tools = input.tools;
     this.#runs = input.runs;
     this.#writes = input.writes;
     this.#limits = input.limits;
+    this.#release = input.release ?? [];
   }
 
   async execute(input: {
@@ -193,6 +198,10 @@ export class AgentLoop {
         return this.#bounded(run, "ambiguous_write");
       }
       throw error;
+    } finally {
+      for (const release of this.#release) {
+        await release(run.traceId).catch(() => undefined);
+      }
     }
   }
 

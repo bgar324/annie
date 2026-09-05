@@ -25,6 +25,7 @@ import { SendblueGateway } from "./messages/client.js";
 import { DailyBriefService } from "./messages/daily-brief.js";
 import { MessageEgressService, type EgressSendPolicy } from "./messages/egress.js";
 import { FailureNotificationService } from "./messages/failure.js";
+import { TypingIndicatorService } from "./messages/typing.js";
 import { MessageIngressService } from "./messages/inbound.js";
 import { SendblueReceiver } from "./messages/receiver.js";
 import { InboundTurnService } from "./messages/turn.js";
@@ -168,13 +169,13 @@ export async function createRuntime(
       runs,
       traces,
     });
+    const notionClients =
+      overrides.notionClients ?? new HostedNotionClientProvider(config, refresh, traces);
     const notion = new NotionToolService({
       db: database.db,
       router,
       connections,
-      clients:
-        overrides.notionClients ??
-        new HostedNotionClientProvider(config, refresh, traces),
+      clients: notionClients,
       runs,
       writes,
     });
@@ -190,7 +191,10 @@ export async function createRuntime(
       maxProviderWrites: config.limits.maxAgentWrites,
       maxRunMs: config.limits.maxAgentRunMs,
     };
-    const agent = new AgentLoop({ model, tools: agentTools, runs, writes, limits: agentLimits });
+    const agent = new AgentLoop({
+      model, tools: agentTools, runs, writes, limits: agentLimits,
+      release: notionClients.release === undefined ? [] : [(traceId) => notionClients.release!(traceId)],
+    });
     const memory = new MemoryDocumentStore({
       path: config.memoryPath,
       maximumBytes: config.limits.memoryMaxBytes,
@@ -209,6 +213,12 @@ export async function createRuntime(
       egress,
       queue,
       traces,
+    });
+    const typing = new TypingIndicatorService({
+      sender: messages,
+      writes,
+      traces,
+      recipient: config.userPhoneNumber,
     });
     const dailyBrief = new DailyBriefService({
       db: database.db,
@@ -238,6 +248,7 @@ export async function createRuntime(
       recovery,
       egress,
       failures,
+      typing,
       traces,
     });
     const handlers: JobHandlers = {

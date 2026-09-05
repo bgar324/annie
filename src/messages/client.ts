@@ -84,6 +84,9 @@ const statusDeliverySchema = deliverySchema
     ...delivery,
     status: typeof delivery.status === "string" ? delivery.status : delivery.status.status,
   }));
+const typingSchema = z
+  .object({ status: z.enum(["SENT", "ERROR"]).nullish(), error_message: z.string().max(4_096).nullish() })
+  .loose();
 const eventSchema = z
   .object({
     id: z.string().min(1).max(512),
@@ -210,6 +213,27 @@ export class SendblueGateway implements MessageGateway {
         });
       }
       return normalized;
+    } catch (error) {
+      throw normalizeMessagingError(error, true);
+    }
+  }
+
+  async startTyping(input: { to: string; maxDurationMs: number }): Promise<void> {
+    try {
+      const response = await this.#client.typingIndicators
+        .send(
+          { from_number: this.#fromNumber, number: input.to, state: "start", max_duration_ms: input.maxDurationMs },
+          { maxRetries: 0 },
+        )
+        .asResponse();
+      const body = parseResponse(typingSchema, await boundedResponseJson(response, true), true);
+      if (body.status === "ERROR") {
+        throw new MessagingProviderError({
+          message: "Sendblue confirmed that the typing indicator failed",
+          kind: "terminal",
+          ...requestId(response),
+        });
+      }
     } catch (error) {
       throw normalizeMessagingError(error, true);
     }

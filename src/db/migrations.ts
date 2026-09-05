@@ -804,6 +804,52 @@ const MIGRATIONS: readonly Migration[] = [
       ));
     `,
   },
+  {
+    // sendblue_typing_indicator joins the durable write kinds: a typing bubble is a
+    // provider mutation, so it gets an attempt record like every other one. The kind
+    // CHECK lives in a STRICT table, hence the rebuild.
+    version: 10,
+    rebuildsForeignKeys: true,
+    sql: `
+      CREATE TABLE write_intents_v10 (
+        id TEXT PRIMARY KEY,
+        run_id TEXT REFERENCES agent_runs(id),
+        tool_execution_id TEXT UNIQUE REFERENCES tool_executions(id),
+        egress_id TEXT UNIQUE REFERENCES egress_messages(id),
+        connection_id TEXT REFERENCES connections(id),
+        kind TEXT NOT NULL CHECK (kind IN (
+          'gmail_create_draft', 'gmail_send_draft', 'notion_create_page',
+          'notion_update_page', 'sendblue_send_message', 'sendblue_typing_indicator'
+        )),
+        state TEXT NOT NULL CHECK (state IN (
+          'prepared', 'attempting', 'succeeded', 'confirmed_failed',
+          'ambiguous', 'reconciled_succeeded', 'unresolved'
+        )),
+        request_fingerprint TEXT NOT NULL,
+        safe_summary_json TEXT NOT NULL CHECK (json_valid(safe_summary_json)),
+        request_json TEXT NOT NULL CHECK (json_valid(request_json)),
+        connection_generation INTEGER,
+        provider_reference_json TEXT CHECK (
+          provider_reference_json IS NULL OR json_valid(provider_reference_json)
+        ),
+        attempted_at_ms INTEGER,
+        completed_at_ms INTEGER,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        CHECK (run_id IS NOT NULL OR egress_id IS NOT NULL)
+      ) STRICT;
+
+      INSERT INTO write_intents_v10 SELECT
+        id, run_id, tool_execution_id, egress_id, connection_id, kind, state,
+        request_fingerprint, safe_summary_json, request_json, connection_generation,
+        provider_reference_json, attempted_at_ms, completed_at_ms, created_at_ms,
+        updated_at_ms
+      FROM write_intents;
+
+      DROP TABLE write_intents;
+      ALTER TABLE write_intents_v10 RENAME TO write_intents;
+    `,
+  },
 ];
 
 export function runMigrations(

@@ -137,12 +137,25 @@ export interface NotionClientProvider {
     operation: (session: NotionSession) => Promise<T>,
     signal?: AbortSignal,
   ): Promise<T>;
+  /** Closes every session opened under this trace; a no-op for providers that keep none. */
+  release?(traceId: TraceId): Promise<void>;
+}
+
+interface OpenSession {
+  client: Client;
+  tools: ReadonlyMap<string, NotionToolDescriptor>;
+  accessToken: string;
 }
 
 export class HostedNotionClientProvider implements NotionClientProvider {
   readonly #config: RuntimeConfig;
   readonly #refresh: RefreshCoordinator;
   readonly #traces: TraceStore;
+  // One connected client and tool list per (run, connection). Every Notion call used to
+  // pay initialize → tools/list → close, about 0.4 s of a 0.9 s call; a run's second and
+  // later calls now reuse the first's session. Concurrent parallel reads share it: the MCP
+  // client multiplexes requests by id. The loop releases a run's sessions when it ends.
+  readonly #sessions = new Map<string, Promise<OpenSession>>();
 
   constructor(config: RuntimeConfig, refresh: RefreshCoordinator, traces: TraceStore) {
     this.#config = config;
@@ -162,6 +175,40 @@ export class HostedNotionClientProvider implements NotionClientProvider {
       Date.now(),
       signal,
     );
+    const key = `${traceId}:${connectionId}`;
+    let pending = this.#sessions.get(key);
+    // A refreshed token invalidates the session opened with the old one.
+    if (pending !== undefined && (await pending).accessToken !== credential.accessToken) {
+      this.#sessions.delete(key);
+      await this.#closeSession(pending);
+      pending = undefined;
+    }
+    if (pending === undefined) {
+      pending = this.#open(connectionId, traceId, credential.accessToken, signal);
+      this.#sessions.set(key, pending);
+      pending.catch(() => this.#sessions.delete(key));
+    }
+    const open = await pending;
+    return operation(
+      new NotionMcpSession({ client: open.client, tools: open.tools, traceId, connectionId, traces: this.#traces }),
+    );
+  }
+
+  async release(traceId: TraceId): Promise<void> {
+    const prefix = `${traceId}:`;
+    for (const [key, pending] of this.#sessions) {
+      if (!key.startsWith(prefix)) continue;
+      this.#sessions.delete(key);
+      await this.#closeSession(pending);
+    }
+  }
+
+  async #open(
+    connectionId: ConnectionId,
+    traceId: TraceId,
+    accessToken: string,
+    signal: AbortSignal | undefined,
+  ): Promise<OpenSession> {
     const fetch = createTracedProviderFetch({
       traces: this.#traces,
       traceId,
@@ -170,18 +217,21 @@ export class HostedNotionClientProvider implements NotionClientProvider {
     });
     const client = await connectNotionClient({
       mcpUrl: this.#config.notion.mcpUrl,
-      accessToken: credential.accessToken,
+      accessToken,
       fetch,
       ...(signal === undefined ? {} : { signal }),
     });
     try {
-      const tools = await listEveryNotionTool(client);
-      return await operation(
-        new NotionMcpSession({ client, tools, traceId, connectionId, traces: this.#traces }),
-      );
-    } finally {
+      return { client, tools: await listEveryNotionTool(client), accessToken };
+    } catch (error) {
       await client.close().catch(() => undefined);
+      throw error;
     }
+  }
+
+  async #closeSession(pending: Promise<OpenSession>): Promise<void> {
+    const open = await pending.catch(() => undefined);
+    await open?.client.close().catch(() => undefined);
   }
 }
 
@@ -262,8 +312,11 @@ class CompatibleTransport implements Transport {
     return this.#inner.send(message, options);
   }
 
-  close(): Promise<void> {
-    return this.#inner.close();
+  async close(): Promise<void> {
+    // Tell Notion the session is over instead of letting it idle out server-side; the
+    // DELETE is best-effort and never blocks the local close.
+    await this.#inner.terminateSession().catch(() => undefined);
+    await this.#inner.close();
   }
 
   setProtocolVersion(version: string): void {

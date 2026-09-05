@@ -368,6 +368,16 @@ class FakeGateway implements MessageGateway {
     };
   }
 
+  readonly typingStarts: { to: string; maxDurationMs: number }[] = [];
+  typingError: Error | undefined;
+
+  async startTyping(input: { to: string; maxDurationMs: number }): Promise<void> {
+    this.typingStarts.push(input);
+    if (this.typingError !== undefined) {
+      throw this.typingError;
+    }
+  }
+
   /** Resolves when the receiver issues its next inbound list request. */
   nextList(): Promise<void> {
     const { promise, resolve } = Promise.withResolvers<void>();
@@ -617,7 +627,7 @@ describe("production runtime", () => {
     ]);
     expect(
       item.runtime.database.db
-        .prepare<[], { state: string }>("SELECT state FROM write_intents WHERE kind <> 'sendblue_send_message'")
+        .prepare<[], { state: string }>("SELECT state FROM write_intents WHERE kind NOT LIKE 'sendblue_%'")
         .all(),
     ).toEqual([{ state: "succeeded" }]);
     expect(
@@ -636,6 +646,80 @@ describe("production runtime", () => {
         .prepare<[], { request_scope: string | null }>("SELECT request_scope FROM agent_runs")
         .get(),
     ).toEqual({ request_scope: "notion_write" });
+  });
+
+  describe("typing indicator", () => {
+    it("shows one bubble per turn without spending the run's write", async () => {
+      const model = new FakeModel();
+      model.scope = "notion_write";
+      model.responses.push(
+        toolCallResponse("typing_fetch", {
+          id: "call_typing_fetch", name: "notion.fetch",
+          argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
+        }),
+        toolCallResponse("typing_write", {
+          id: "call_typing_write", name: "notion.update_page",
+          argumentsJson: JSON.stringify({
+            workspace: "Work", pageId: "page_1", command: "update_content",
+            updates: [{ oldText: "- [ ] Car wash", newText: "- [x] Car wash" }],
+          }),
+        }),
+        finalModelResponse("typing_done", "✅ done."),
+      );
+      const notionClients = new FakeNotionClients(true, notionTaskPage);
+      const gateway = new FakeGateway();
+      const item = await newRuntime(model, gateway, { notionClients });
+      connectNotion(item);
+      gateway.inbox.push(inboundMessage("msg_typing", { text: "mark car wash done" }));
+
+      await sweep(item);
+      await drainJobs(item.runtime);
+
+      // The bubble is a durable, settled provider attempt, and the user's one write still went through.
+      expect(gateway.typingStarts).toEqual([{ to: userNumber, maxDurationMs: 60_000 }]);
+      expect(
+        item.runtime.database.db
+          .prepare<[], { kind: string; state: string }>(
+            "SELECT kind, state FROM write_intents WHERE kind <> 'sendblue_send_message' ORDER BY created_at_ms",
+          )
+          .all(),
+      ).toEqual([
+        { kind: "sendblue_typing_indicator", state: "succeeded" },
+        { kind: "notion_update_page", state: "succeeded" },
+      ]);
+      expect(item.runtime.database.db.prepare<[], { provider_writes: number }>("SELECT provider_writes FROM agent_runs").get())
+        .toEqual({ provider_writes: 1 });
+      expect(notionClients.writes).toHaveLength(1);
+    });
+
+    it("never lets a failed or interrupted bubble touch the turn", async () => {
+      const model = new FakeModel();
+      model.scope = "conversation";
+      model.responses.push(finalModelResponse("typing_reply", "hey."));
+      const gateway = new FakeGateway();
+      gateway.typingError = new MessagingProviderError({ message: "Sendblue HTTP 500", kind: "ambiguous", status: 500 });
+      const item = await newRuntime(model, gateway, { notionClients: new FakeNotionClients(true, notionTaskPage) });
+      connectNotion(item);
+      gateway.inbox.push(inboundMessage("msg_typing_fail", { text: "hey" }));
+
+      await sweep(item);
+      await drainJobs(item.runtime);
+
+      expect(egressState(item.runtime)).toBe("delivered");
+      expect(item.runtime.database.db.prepare<[], { state: string }>("SELECT state FROM write_intents WHERE kind = 'sendblue_typing_indicator'").get())
+        .toEqual({ state: "ambiguous" });
+
+      // A crash between the attempt and its settlement: recovery marks the bubble ambiguous,
+      // as it does every open attempt, but the run it belongs to is not blocked by it.
+      const runId = item.runtime.database.db.prepare<[], { id: string }>("SELECT id FROM agent_runs").get()?.id;
+      item.runtime.database.db.prepare("UPDATE write_intents SET state = 'attempting' WHERE kind = 'sendblue_typing_indicator'").run();
+      item.runtime.database.db.prepare("UPDATE agent_runs SET phase = 'running'").run();
+      const writes = new WriteStore(item.runtime.database.db, item.runtime.traces);
+      writes.recoverOpenAttempts();
+      expect(item.runtime.database.db.prepare<{ id: string }, { phase: string; ambiguous_write_id: string | null }>(
+        "SELECT phase, ambiguous_write_id FROM agent_runs WHERE id = @id",
+      ).get({ id: runId ?? "" })).toEqual({ phase: "running", ambiguous_write_id: null });
+    });
   });
 
   it("sets a requested date through one property update", async () => {
@@ -678,7 +762,7 @@ describe("production runtime", () => {
     });
     expect(
       item.runtime.database.db
-        .prepare<[], { state: string }>("SELECT state FROM write_intents WHERE kind <> 'sendblue_send_message'")
+        .prepare<[], { state: string }>("SELECT state FROM write_intents WHERE kind NOT LIKE 'sendblue_%'")
         .all(),
     ).toEqual([{ state: "succeeded" }]);
   });
@@ -724,7 +808,7 @@ describe("production runtime", () => {
     expect(count(item.runtime, "tool_executions")).toBe(1);
     expect(
       item.runtime.database.db
-        .prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM write_intents WHERE kind <> 'sendblue_send_message'")
+        .prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM write_intents WHERE kind NOT LIKE 'sendblue_%'")
         .get()?.count,
     ).toBe(0);
     expect(
@@ -787,7 +871,7 @@ describe("production runtime", () => {
     expect(notionClients.writes).toEqual([]);
     expect(
       item.runtime.database.db
-        .prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM write_intents WHERE kind <> 'sendblue_send_message'")
+        .prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM write_intents WHERE kind NOT LIKE 'sendblue_%'")
         .get()?.count,
     ).toBe(0);
     expect(
@@ -853,7 +937,7 @@ describe("production runtime", () => {
     expect(notionClients.writes[0]?.argumentsValue).toMatchObject({ page_id: "page_1" });
     expect(
       item.runtime.database.db
-        .prepare<[], { state: string }>("SELECT state FROM write_intents WHERE kind <> 'sendblue_send_message'")
+        .prepare<[], { state: string }>("SELECT state FROM write_intents WHERE kind NOT LIKE 'sendblue_%'")
         .all(),
     ).toEqual([{ state: "succeeded" }]);
     expect(
@@ -1099,7 +1183,7 @@ describe("production runtime", () => {
     expect(
       item.runtime.database.db
         .prepare<[], { count: number }>(
-          "SELECT COUNT(*) AS count FROM write_intents WHERE kind <> 'sendblue_send_message'",
+          "SELECT COUNT(*) AS count FROM write_intents WHERE kind NOT LIKE 'sendblue_%'",
         )
         .get()?.count,
     ).toBe(0);
@@ -1149,7 +1233,7 @@ describe("production runtime", () => {
       expect(
         item.runtime.database.db
           .prepare<[], { count: number }>(
-            "SELECT COUNT(*) AS count FROM write_intents WHERE kind <> 'sendblue_send_message'",
+            "SELECT COUNT(*) AS count FROM write_intents WHERE kind NOT LIKE 'sendblue_%'",
           )
           .get()?.count,
       ).toBe(0);
@@ -1215,7 +1299,7 @@ describe("production runtime", () => {
     expect(
       item.runtime.database.db
         .prepare<[], { count: number }>(
-          "SELECT COUNT(*) AS count FROM write_intents WHERE kind <> 'sendblue_send_message'",
+          "SELECT COUNT(*) AS count FROM write_intents WHERE kind NOT LIKE 'sendblue_%'",
         )
         .get()?.count,
     ).toBe(0);
@@ -1433,7 +1517,7 @@ describe("production runtime", () => {
     expect(
       item.runtime.database.db
         .prepare<[], { state: string }>(
-          "SELECT state FROM write_intents WHERE kind <> 'sendblue_send_message'",
+          "SELECT state FROM write_intents WHERE kind NOT LIKE 'sendblue_%'",
         )
         .all(),
     ).toEqual([{ state: "succeeded" }]);

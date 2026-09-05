@@ -59,6 +59,8 @@ export interface InboundMessageSource {
 export interface MessageSender {
   send(input: { to: string; text: string; replyTo?: string }): Promise<DeliveryResource>;
   getStatus(messageHandle: string): Promise<DeliveryResource>;
+  /** Shows a typing bubble to the recipient until a reply lands or the duration lapses. */
+  startTyping(input: { to: string; maxDurationMs: number }): Promise<void>;
 }
 
 export interface MessageGateway extends InboundMessageSource, MessageSender {}

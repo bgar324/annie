@@ -1,9 +1,13 @@
+import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import { AgentRunStore } from "../src/agent/store.js";
 import { ToolRegistry, type ToolExecutionContext } from "../src/agent/tools.js";
+import { loadRuntimeConfig } from "../src/config.js";
+import { RefreshCoordinator } from "../src/connections/refresh.js";
 import { ConnectionRouter } from "../src/connections/router.js";
 import { ConnectionStore } from "../src/connections/store.js";
 import {
@@ -15,6 +19,7 @@ import {
   type TraceId,
 } from "../src/core/ids.js";
 import {
+  HostedNotionClientProvider,
   NotionMcpSession,
   type NotionClientProvider,
   type NotionSession,
@@ -60,10 +65,7 @@ describe("Notion read tools", () => {
     const service = notionService(harness, provider);
     const context = toolContext(harness, "notion.search", "read");
 
-    const result = await service.search(
-      { query: "quarterly plan", workspace: "Personal", pageSize: 5 },
-      context,
-    );
+    const result = await service.search({ query: "quarterly plan", workspace: "Personal", pageSize: 5, hydrate: 0 }, context);
 
     expect(result).toEqual({
       workspace: { label: "Personal" },
@@ -87,10 +89,7 @@ describe("Notion read tools", () => {
     const service = notionService(harness, fixedSessionProvider(fixture.session));
 
     await expect(
-      service.search(
-        { query: "plan", workspace: "Search", pageSize: 5 },
-        toolContext(harness, "notion.search", "read"),
-      ),
+      service.search({ query: "plan", workspace: "Search", pageSize: 5, hydrate: 0 }, toolContext(harness, "notion.search", "read")),
     ).resolves.toEqual({
       workspace: { label: "Search" },
       result: {
@@ -111,10 +110,7 @@ describe("Notion read tools", () => {
     const service = notionService(harness, fixedSessionProvider(fixture.session));
 
     await expect(
-      service.search(
-        { query: "quarterly", workspace: "Search", pageSize: 5 },
-        toolContext(harness, "notion.search", "read"),
-      ),
+      service.search({ query: "quarterly", workspace: "Search", pageSize: 5, hydrate: 0 }, toolContext(harness, "notion.search", "read")),
     ).resolves.toEqual({
       workspace: { label: "Search" },
       result: {
@@ -136,10 +132,7 @@ describe("Notion read tools", () => {
     const service = notionService(harness, fixedSessionProvider(fixture.session));
 
     await expect(
-      service.search(
-        { query: "plan", workspace: "Search", pageSize: 1 },
-        toolContext(harness, "notion.search", "read"),
-      ),
+      service.search({ query: "plan", workspace: "Search", pageSize: 1, hydrate: 0 }, toolContext(harness, "notion.search", "read")),
     ).resolves.toEqual({
       workspace: { label: "Search" },
       result: {
@@ -656,6 +649,64 @@ describe("Notion writes", () => {
   });
 
   it.each([
+    { label: "authorizes", truncated: false, code: undefined },
+    { label: "does not authorize with an incomplete page", truncated: true, code: "write_target_unverified" },
+  ])("a hydrated search result $label an update like a fetch", async ({ truncated, code }) => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_hydrate", "Work");
+    const calls: string[] = [];
+    const fixture = sessionFixture(async (name, argumentsValue) => {
+      calls.push(name);
+      if (name === "notion-search") {
+        return { structuredContent: { results: [{ id: "tasks", title: "Tasks" }, { id: "notes", title: "Notes" }], truncated: false } };
+      }
+      if (name === "notion-fetch") {
+        return { structuredContent: { id: String(argumentsValue.id), text: "- [ ] Task\n- [ ] Other", truncated } };
+      }
+      return { structuredContent: { id: "tasks" } };
+    });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const searchContext = toolContext(harness, "notion.search", "read", undefined, { query: "task", hydrate: 1 });
+
+    const searched = await service.search({ query: "task", workspace: "Work", pageSize: 5, hydrate: 1 }, searchContext);
+    harness.runs.finishTool(searchContext.toolExecutionId, "succeeded", searched);
+
+    // One hydrated page in one tool round: the search plus exactly one fetch, both in the
+    // same session, and the page carries the fetch shape the guard checks.
+    expect(calls).toEqual(["notion-search", "notion-fetch"]);
+    expect(searched).toMatchObject({ result: { pages: [{ id: "tasks", text: "- [ ] Task\n- [ ] Other", truncated }] } });
+
+    const update = service.updatePage({
+      pageId: "tasks", command: "update_content",
+      updates: [{ oldText: "- [ ] Task", newText: "- [x] Task", replaceAllMatches: false }],
+    }, toolContext(harness, "notion.update_page", "write", searchContext.runId));
+    if (code === undefined) {
+      await expect(update).resolves.toMatchObject({ ok: true, outcome: "succeeded" });
+      expect(writeStates(harness)).toEqual(["succeeded"]);
+    } else {
+      await expect(update).rejects.toMatchObject({ code });
+      expect(writeStates(harness)).toEqual([]);
+    }
+  });
+
+  it("keeps the search result when a hydration fetch fails", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_hydrate_fail", "Work");
+    const fixture = sessionFixture(async (name) => {
+      if (name === "notion-search") {
+        return { structuredContent: { results: [{ id: "broken", title: "Broken" }], truncated: false } };
+      }
+      return { isError: true, content: [{ type: "text", text: "boom" }] };
+    });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+
+    await expect(service.search(
+      { query: "broken", workspace: "Work", pageSize: 5, hydrate: 1 },
+      toolContext(harness, "notion.search", "read"),
+    )).resolves.toMatchObject({ result: { results: [{ id: "broken" }], pages: [] } });
+  });
+
+  it.each([
     { label: "another page", sourcePage: "other", truncated: false, freshRun: false },
     { label: "an incomplete fetch", sourcePage: "tasks", truncated: true, freshRun: false },
     { label: "a previous run", sourcePage: "tasks", truncated: false, freshRun: true },
@@ -765,7 +816,7 @@ describe("Notion MCP boundary", () => {
     const service = notionService(harness, fixedSessionProvider(session));
     const healthBefore = harness.connections.getRequired(connection.id);
 
-    await expect(service.search({ query: "x", pageSize: 1 }, context)).resolves.toEqual({
+    await expect(service.search({ query: "x", pageSize: 1, hydrate: 0 }, context)).resolves.toEqual({
       workspace: { label: "Session" },
       result: { results: [], truncated: false },
     });
@@ -824,7 +875,7 @@ describe("Notion MCP boundary", () => {
     const service = notionService(harness, fixedSessionProvider(session));
     const healthBefore = harness.connections.getRequired(connection.id);
 
-    await expect(service.search({ query: "x", pageSize: 1 }, context)).rejects.toMatchObject({
+    await expect(service.search({ query: "x", pageSize: 1, hydrate: 0 }, context)).rejects.toMatchObject({
       code: "schema_drift",
     });
 
@@ -856,6 +907,80 @@ describe("Notion MCP boundary", () => {
     expect(registry.definitions().map((definition) => definition.name).join(" ")).not.toMatch(
       /delete|archive|move|duplicate/u,
     );
+  });
+
+  it("opens one MCP session per run and connection, then releases it", async () => {
+    // A minimal Streamable HTTP MCP server: counts initializations so reuse is observable.
+    let initializations = 0;
+    let closed = 0;
+    const server = createServer((request, response) => {
+      if (request.method === "DELETE") {
+        closed += 1;
+        response.writeHead(200).end();
+        return;
+      }
+      if (request.method !== "POST") {
+        response.writeHead(405).end();
+        return;
+      }
+      let body = "";
+      request.on("data", (chunk: Buffer) => { body += chunk.toString("utf8"); });
+      request.on("end", () => {
+        const message = JSON.parse(body) as { id?: number; method: string };
+        const reply = (result: unknown): void => {
+          response.writeHead(200, { "content-type": "application/json", "mcp-session-id": "session_1" });
+          response.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
+        };
+        if (message.method === "initialize") {
+          initializations += 1;
+          reply({ protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "fake", version: "0" } });
+        } else if (message.method === "notifications/initialized") {
+          response.writeHead(202).end();
+        } else if (message.method === "tools/list") {
+          reply({ tools: [{ name: "notion-search", inputSchema: { type: "object" } }] });
+        } else if (message.method === "tools/call") {
+          reply({ structuredContent: { results: [], truncated: false } });
+        } else {
+          response.writeHead(404).end();
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert(address !== null && typeof address === "object");
+    const harness = notionHarness();
+    const config = loadRuntimeConfig({
+      NODE_ENV: "test", DATA_DIR: harness.database.directory,
+      DATABASE_PATH: harness.database.config.databasePath, MEMORY_PATH: harness.database.config.memoryPath,
+      TRACE_DIR: harness.database.config.traceDir,
+      NOTION_MCP_URL: `http://127.0.0.1:${address.port}/mcp`,
+      SENDBLUE_API_KEY_ID: "k", SENDBLUE_API_SECRET_KEY: "s", SENDBLUE_FROM_NUMBER: "+15551112222",
+      USER_PHONE_NUMBER: "+15559990000", PUBLIC_BASE_URL: "https://assistant.example",
+      DEEPSEEK_API_KEY: "d", GOOGLE_CLIENT_ID: "g", GOOGLE_CLIENT_SECRET: "g",
+      CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
+    });
+    const refresh = new RefreshCoordinator({
+      db: harness.database.handle.db, config, connections: harness.connections, traces: harness.traces,
+    });
+    const provider = new HostedNotionClientProvider(config, refresh, harness.traces);
+    const connection = addNotionConnection(harness, "workspace_reuse", "Reuse");
+    const traceId = newTraceId();
+    const search = (session: NotionSession) => session.call("notion-search", { query: "x", query_type: "internal", page_size: 1 });
+    try {
+      await provider.withSession(connection.id, traceId, search);
+      await provider.withSession(connection.id, traceId, search);
+      await Promise.all([provider.withSession(connection.id, traceId, search), provider.withSession(connection.id, traceId, search)]);
+      expect(initializations).toBe(1);
+
+      await provider.release(traceId);
+      expect(closed).toBe(1);
+      await provider.withSession(connection.id, newTraceId(), search);
+      expect(initializations).toBe(2);
+      await provider.release(traceId);
+    } finally {
+      await provider.release(traceId);
+      server.close();
+    }
   });
 });
 

@@ -784,6 +784,9 @@ describe("automatic credential refresh and recovery", () => {
       async getStatus(): Promise<DeliveryResource> {
         throw new Error("No delivery status read expected");
       },
+      async startTyping(): Promise<void> {
+        return undefined;
+      },
     };
     const egress = new MessageEgressService({
       db: harness.database.handle.db,
