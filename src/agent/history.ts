@@ -118,11 +118,13 @@ export class ConversationHistoryStore {
 
   /**
    * The one reply the current message can be answering: the delivered model-authored reply
-   * to the immediately preceding accepted message in this chat, prepared before the current
-   * message arrived, within the freshness window, with nothing else sent to the user in
-   * between. Failure notices, connection links, undelivered or delivery-unknown replies,
-   * and older replies contribute nothing, so an answer can complete only a question Annie
-   * is known to have just asked.
+   * to the immediately preceding accepted message in this chat, confirmed delivered before
+   * the user sent the current message, within the freshness window, with nothing else sent
+   * to the user in between. Failure notices, connection links, undelivered or
+   * delivery-unknown replies, replies confirmed only after the answer was sent, and older
+   * replies contribute nothing, so an answer can complete only a question Annie is known
+   * to have just asked. Delivery confirmation lags the device by a poll, so the gate errs
+   * toward supplying nothing.
    */
   precedingDeliveredReply(
     inboundId: InboundId,
@@ -146,14 +148,14 @@ export class ConversationHistoryStore {
          AND reply.purpose = 'reply'
          AND reply.state = 'delivered'
         WHERE current.id = @id
-          AND reply.created_at_ms < current.created_at_ms
-          AND reply.created_at_ms >= current.created_at_ms - @max_age_ms
+          AND reply.updated_at_ms < json_extract(current.attachment_json, '$.sentAtMs')
+          AND reply.updated_at_ms >= json_extract(current.attachment_json, '$.sentAtMs') - @max_age_ms
           AND NOT EXISTS (
             SELECT 1 FROM egress_messages AS later
             WHERE later.recipient_handle = reply.recipient_handle
               AND later.id <> reply.id
               AND later.created_at_ms > reply.created_at_ms
-              AND later.created_at_ms < current.created_at_ms
+              AND later.created_at_ms < json_extract(current.attachment_json, '$.sentAtMs')
           )
         ORDER BY reply.created_at_ms DESC
         LIMIT 1

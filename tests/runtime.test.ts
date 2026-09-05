@@ -1287,7 +1287,17 @@ describe("production runtime", () => {
         label: "the reply is older than the follow-up window",
         arrange: (item: TrackedRuntime) => {
           item.runtime.database.db
-            .prepare("UPDATE egress_messages SET created_at_ms = created_at_ms - 31 * 60 * 1000")
+            .prepare("UPDATE egress_messages SET created_at_ms = created_at_ms - 31 * 60 * 1000, updated_at_ms = updated_at_ms - 31 * 60 * 1000")
+            .run();
+        },
+      },
+      {
+        label: "delivery was confirmed only after the answer was sent",
+        arrange: (item: TrackedRuntime) => {
+          // Crossed messages: the user's answer left their phone before Annie's question
+          // was known to have arrived, so it cannot be answering it.
+          item.runtime.database.db
+            .prepare("UPDATE egress_messages SET updated_at_ms = updated_at_ms + 60 * 60 * 1000")
             .run();
         },
       },
