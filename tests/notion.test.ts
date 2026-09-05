@@ -531,6 +531,38 @@ describe("Notion writes", () => {
   });
 
   it.each([
+    { label: "a rendered page body", response: { content: [{ type: "text", text: "<page url=\"https://notion.so/x\">\n# logit notes\n</page>" }] }, pages: [] },
+    { label: "a documented pages receipt", response: { content: [{ type: "text", text: "{\"pages\":[{\"id\":\"created_2\",\"url\":\"https://notion.so/created_2\",\"properties\":{\"title\":\"logit notes\"}}]}" }] }, pages: [{ id: "created_2", url: "https://notion.so/created_2" }] },
+  ])("treats $label from a non-error create as accepted", async ({ response, pages }) => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_create_ack", "Notes");
+    const fixture = sessionFixture(async () => response);
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+
+    await expect(service.createPage(
+      { workspace: "Notes", properties: { title: "logit notes" } },
+      toolContext(harness, "notion.create_page", "write"),
+    )).resolves.toMatchObject({ ok: true, outcome: "succeeded", result: { pages } });
+    expect(writeStates(harness)).toEqual(["succeeded"]);
+    expect(fixture.call).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a queued async create acceptance-unknown", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_create_async", "Notes");
+    const fixture = sessionFixture(async () => ({
+      structuredContent: { object: "async_task", id: "t1", status: "queued" },
+    }));
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+
+    await expect(service.createPage(
+      { workspace: "Notes", properties: { title: "logit notes" } },
+      toolContext(harness, "notion.create_page", "write"),
+    )).rejects.toBeDefined();
+    expect(writeStates(harness)).toEqual(["ambiguous"]);
+  });
+
+  it.each([
     { label: "a queued async task", response: { structuredContent: { object: "async_task", id: "t1", status: "queued" } } },
     { label: "a wrapped async task", response: { structuredContent: { page_id: "page_ack", async_task: { id: "t1" } } } },
     { label: "a running task on the page", response: { structuredContent: { page_id: "page_ack", status: "running" } } },

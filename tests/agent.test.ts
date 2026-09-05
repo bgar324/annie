@@ -5,6 +5,7 @@ import { DeepSeekChatModel } from "../src/agent/deepseek.js";
 import { ConversationHistoryStore } from "../src/agent/history.js";
 import type { ChatModel, ModelRequest, ModelResponse } from "../src/agent/model.js";
 import {
+  assistantResponseFormatExample,
   assistantResponseFormatReminder,
   buildAssistantSystemPrompt,
 } from "../src/agent/prompt.js";
@@ -66,7 +67,22 @@ describe("assistant prompt", () => {
       Buffer.byteLength(prompt) +
       Buffer.byteLength(assistantResponseFormatReminder) -
       Buffer.byteLength(memory);
-    expect(fixedWireBytes).toBeLessThan(4_096);
+    expect(fixedWireBytes).toBeLessThan(4_352);
+  });
+
+  it("teaches › for list items only and shows an unprefixed closing sentence", () => {
+    expect(assistantResponseFormatReminder).toContain(`Example:\n${assistantResponseFormatExample}`);
+    const lines = assistantResponseFormatExample.split("\n").filter((line) => line.trim() !== "");
+    const items = lines.filter((line) => line.startsWith("› "));
+    const headers = lines.filter((line) => line.endsWith(":") && !line.startsWith("› "));
+    const sentences = lines.filter((line) => !items.includes(line) && !headers.includes(line));
+    expect(items.length).toBeGreaterThanOrEqual(2);
+    expect(headers.length).toBeGreaterThanOrEqual(2);
+    expect(sentences).toHaveLength(1);
+    expect(sentences[0]).toMatch(/^[a-z][^›:]*\?$/u);
+    expect(assistantResponseFormatReminder).not.toContain("- ›");
+    expect(assistantResponseFormatReminder).not.toContain("**");
+    expect(assistantResponseFormatReminder).not.toMatch(/^\s*-/mu);
   });
 });
 
@@ -726,14 +742,6 @@ describe("durable bounded agent loop", () => {
         ),
       },
     ]);
-    expect(assistantResponseFormatReminder).toContain(
-      'Every other nonblank line must be another such header or an item beginning exactly "› ".',
-    );
-    expect(assistantResponseFormatReminder).toContain(
-      "Example:\n📬 inbox:\n\n🚨 needs attention:\n› first item\n\n👀 worth a peek:\n› second item\n\n🗑️ ignore:\n› third item",
-    );
-    expect(assistantResponseFormatReminder).not.toContain("- ›");
-    expect(assistantResponseFormatReminder).not.toContain("**");
     expect(requests[1]?.messages).toEqual([
       { role: "system", content: "Be concise." },
       { role: "user", content: "Do both" },
@@ -929,6 +937,33 @@ describe("durable bounded agent loop", () => {
       response: normalized,
     });
     expect(harness.runs.getRequired(result.run.id).finalResponse).toBe(normalized);
+  });
+
+  it("turns a lone › outcome line into plain prose", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Mark it done");
+    const model = scriptedModel([
+      {
+        id: "response_final",
+        content: "✅ daily tasks:\n- › already checked off, so nothing to change.\n\nwant today's copy ticked instead?",
+        providerState: null,
+        toolCalls: [],
+        finishReason: "stop",
+        usage: emptyUsage,
+      },
+    ]);
+    const loop = createAgentLoop(harness.runs, harness.writes, model, new ToolRegistry([]));
+
+    const result = await loop.execute({
+      source: { kind: "inbound", inboundId },
+      traceId,
+      initialMessages: [{ role: "user", content: "Mark it done" }],
+    });
+
+    expect(result).toMatchObject({
+      outcome: "completed",
+      response: "✅ daily tasks:\nalready checked off, so nothing to change.\n\nwant today's copy ticked instead?",
+    });
   });
 
   it("resumes a committed tool result without executing the provider operation again", async () => {

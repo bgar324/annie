@@ -701,24 +701,28 @@ function normalizeNotionResult(
     throw new NotionToolResultError();
   }
   if (name === "notion-update-page") {
-    // A non-error MCP result is Notion's acceptance. The response body is a rendered
-    // page view, not a receipt; its shape and truncation say nothing about the write.
-    // Only a queued async task, a failed status, or an error field means "not done".
-    const payload = normalizedNotionPayload(envelope).value;
-    const record = typeof payload === "object" && payload !== null && !Array.isArray(payload)
-      ? (payload as Record<string, unknown>)
-      : {};
-    if (
-      envelope.structuredContent === undefined &&
-      (envelope.content ?? []).every((block) => block.type !== "text" || !block.text) ||
-      record.object === "async_task" ||
-      record.async_task != null ||
-      record.error != null ||
-      (typeof record.status === "string" && record.status !== "succeeded")
-    ) {
-      throw new NotionToolResultError();
-    }
+    assertNotionWriteAccepted(envelope);
     return { pageId: String(argumentsValue.page_id), updated: true };
+  }
+  if (name === "notion-create-pages") {
+    // Same acceptance rule as update. Page ids and URLs are reported when the body carries
+    // them; a rendered or truncated body does not turn an accepted create into an unknown one,
+    // which is how a created "logit notes" page was once reported as acceptance-unknown.
+    assertNotionWriteAccepted(envelope);
+    const parsed = notionCreateResultSchema.safeParse(normalizedNotionPayload(envelope).value);
+    const pages = !parsed.success
+      ? []
+      : parsed.data.pages ??
+        (parsed.data.id === undefined
+          ? []
+          : [{ id: parsed.data.id, ...(parsed.data.url === undefined ? {} : { url: parsed.data.url }) }]);
+    return {
+      pages: pages.map((page) => ({
+        id: page.id,
+        ...(page.title === undefined ? {} : { title: page.title }),
+        ...(page.url === undefined ? {} : { url: page.url }),
+      })),
+    };
   }
 
   const payload = normalizedNotionPayload(envelope);
@@ -744,37 +748,41 @@ function normalizeNotionResult(
         (payload.providerTruncation === undefined && parsed.results.length >= pageSize),
     };
   }
-  if (name === "notion-fetch") {
-    if (typeof payload.value === "string") {
-      return { text: payload.value, truncated: payload.truncated };
-    }
-    const parsed = notionFetchResultSchema.parse(payload.value);
-    const text = parsed.text ?? parsed.content ?? parsed.markdown;
-    const omittedBlocks =
-      (parsed.unknown_block_ids?.length ?? 0) > 0 || (parsed.unknown_block_count ?? 0) > 0;
-    return {
-      ...(parsed.id === undefined ? {} : { id: parsed.id }),
-      ...(parsed.title === undefined ? {} : { title: parsed.title }),
-      ...(parsed.url === undefined ? {} : { url: parsed.url }),
-      ...(parsed.type === undefined ? {} : { type: parsed.type }),
-      ...(text === undefined ? {} : { text }),
-      truncated: payload.truncated || omittedBlocks,
-    };
+  if (typeof payload.value === "string") {
+    return { text: payload.value, truncated: payload.truncated };
   }
-
-  const parsed = notionCreateResultSchema.parse(payload.value);
-  const pages =
-    parsed.pages ??
-    (parsed.id === undefined
-      ? []
-      : [{ id: parsed.id, ...(parsed.url === undefined ? {} : { url: parsed.url }) }]);
+  const parsed = notionFetchResultSchema.parse(payload.value);
+  const text = parsed.text ?? parsed.content ?? parsed.markdown;
+  const omittedBlocks =
+    (parsed.unknown_block_ids?.length ?? 0) > 0 || (parsed.unknown_block_count ?? 0) > 0;
   return {
-    pages: pages.map((page) => ({
-      id: page.id,
-      ...(page.title === undefined ? {} : { title: page.title }),
-      ...(page.url === undefined ? {} : { url: page.url }),
-    })),
+    ...(parsed.id === undefined ? {} : { id: parsed.id }),
+    ...(parsed.title === undefined ? {} : { title: parsed.title }),
+    ...(parsed.url === undefined ? {} : { url: parsed.url }),
+    ...(parsed.type === undefined ? {} : { type: parsed.type }),
+    ...(text === undefined ? {} : { text }),
+    truncated: payload.truncated || omittedBlocks,
   };
+}
+
+// A non-error MCP result is Notion's acceptance of a write. The body is a rendered page
+// view, not a receipt; its shape and truncation say nothing about the write. Only an empty
+// envelope, a queued async task, a failed status, or an error field means "not done".
+function assertNotionWriteAccepted(envelope: z.infer<typeof toolResultSchema>): void {
+  const payload = normalizedNotionPayload(envelope).value;
+  const record = typeof payload === "object" && payload !== null && !Array.isArray(payload)
+    ? (payload as Record<string, unknown>)
+    : {};
+  if (
+    envelope.structuredContent === undefined &&
+    (envelope.content ?? []).every((block) => block.type !== "text" || !block.text) ||
+    record.object === "async_task" ||
+    record.async_task != null ||
+    record.error != null ||
+    (typeof record.status === "string" && record.status !== "succeeded")
+  ) {
+    throw new NotionToolResultError();
+  }
 }
 
 function normalizedNotionPayload(

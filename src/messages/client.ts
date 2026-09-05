@@ -57,7 +57,14 @@ const inboundPageSchema = z
       .loose(),
   })
   .loose();
-const deliveryStatusSchema = z.enum(["QUEUED", "SENT", "DELIVERED", "ERROR"]);
+// Sendblue reports the whole message lifecycle here, not only the four values its status
+// endpoint documents (see its message object): REGISTERED, PENDING, ACCEPTED, and QUEUED
+// precede handoff, SENT means Apple has it, DELIVERED and READ mean the device has it, ERROR
+// and DECLINED mean it failed. An early poll used to fail the codec on a pre-handoff value
+// and end reconciliation as delivery-unknown, dropping the delivered reply from history.
+const deliveryStatusSchema = z.enum([
+  "REGISTERED", "PENDING", "ACCEPTED", "QUEUED", "SENT", "DELIVERED", "READ", "ERROR", "DECLINED",
+]);
 const deliverySchema = z
   .object({
     error_code: z.number().nullish(),
@@ -223,7 +230,12 @@ export class SendblueGateway implements MessageGateway {
       }
       return toDeliveryResource(delivery, response);
     } catch (error) {
-      throw normalizeMessagingError(error, false);
+      const normalized = normalizeMessagingError(error, false);
+      // A malformed status body is retried under the bounded reconciliation budget; only a
+      // provider verdict may end a delivery check, so it never becomes delivery-unknown here.
+      throw normalized.kind === "terminal" && normalized.status === undefined
+        ? new MessagingProviderError({ message: normalized.message, kind: "transient" })
+        : normalized;
     }
   }
 }
@@ -252,20 +264,28 @@ function toDeliveryResource(
   delivery: z.infer<typeof deliverySchema>,
   response: Response,
 ): DeliveryResource {
-  const status =
-    delivery.status === "QUEUED"
-      ? "pending"
-      : delivery.status === "SENT"
-        ? "sent"
-        : delivery.status === "DELIVERED"
-          ? "delivered"
-          : "failed";
+  const status = deliveryStatus(delivery.status);
   return {
     messageHandle: delivery.message_handle,
     status,
     ...requestId(response),
     error: status === "failed" ? "Sendblue delivery failed" : null,
   };
+}
+
+function deliveryStatus(value: z.infer<typeof deliveryStatusSchema>): DeliveryResource["status"] {
+  switch (value) {
+    case "SENT":
+      return "sent";
+    case "DELIVERED":
+    case "READ":
+      return "delivered";
+    case "ERROR":
+    case "DECLINED":
+      return "failed";
+    default:
+      return "pending";
+  }
 }
 
 async function* validatedWakeEvents(

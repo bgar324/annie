@@ -24,6 +24,11 @@ const requests = {
   connect_google: "connect google",
   greeting_after_failures: "Hey annie",
   status_after_failures: "did that clean restroom task ever get checked off?",
+  list_today: "what's on today's list?",
+  // Production 2026-09-04: both ended as "I couldn't complete that request" because the
+  // tool-less conversation run answered a tool need with an empty message.
+  access_question: 'Do you have access to "logit thought dump"',
+  bare_page_name: '"Logit notes"',
 };
 // The production incident: earlier accepted requests that never produced a reply, then a
 // bare greeting. Those requests are closed history and lend the next turn no permission.
@@ -46,6 +51,9 @@ const expectedScope: Readonly<Record<string, RequestScope>> = {
   connect_google: "connect_google",
   greeting_after_failures: "conversation",
   status_after_failures: "read",
+  list_today: "read",
+  access_question: "read",
+  bare_page_name: "conversation",
 };
 const args = process.argv.slice(2).filter((arg) => arg !== "--");
 if (args.includes("--list")) {
@@ -331,11 +339,18 @@ async function runCase(name: string, text: string): Promise<void> {
         assert(loopCalls.every((call) => !/(update|create)_page/u.test(JSON.stringify(call.tools ?? []))),
           "A status question is never offered a Notion write tool");
       }
-    } else if (name === "already_checked_no_op" || name === "read_failure") {
+    } else if (name === "already_checked_no_op" || name === "read_failure" || name === "list_today") {
       assert.equal(mutations, 0);
       assert.deepEqual(writes, []);
       assert.equal(pages.get("daily"), original);
       assert(tools.some((tool) => tool.tool_name === "notion.fetch" && tool.status === (name === "read_failure" ? "failed" : "succeeded")));
+    } else if (name === "access_question" || name === "bare_page_name") {
+      assert.equal(mutations, 0);
+      assert.deepEqual(writes, []);
+      assert.equal(pages.get("daily"), original);
+      assert(tools.every((tool) => requestScopeTools[scope].includes(tool.tool_name)), "A tool ran outside the classified scope");
+      if (name === "bare_page_name") assert.deepEqual(tools, [], "A bare page name is conversation: no tools, yet a text reply");
+      assert(!/couldn't complete/u.test(sent[0] ?? ""), "A tool-less turn must answer in text, not fail empty");
     } else {
       assert.equal(mutations, 1, "Exactly one provider mutation, including after restart");
       assert.deepEqual(writes, [{ state: name === "ambiguous_write" ? "ambiguous" : "succeeded" }]);
@@ -359,6 +374,30 @@ async function runCase(name: string, text: string): Promise<void> {
       }
     }
     assert.equal(blockedRequests, 0, "A provider tried to escape the synthetic boundary");
+    // Reply shape, checked only on the read probes so wording variance never fails a write or
+    // recovery case: › marks exactly the listed tasks; outcomes, answers, and questions stay
+    // unprefixed lowercase prose; no Markdown.
+    const replyLines = (sent[0] ?? "").split("\n").filter((lineText) => lineText.trim() !== "");
+    if (name === "list_today" || name === "status_after_failures" || name === "already_checked_no_op") {
+      assert(replyLines.every((lineText) => !/^\s*[-*]/u.test(lineText) && !lineText.includes("*")), "Markdown leaked into the reply");
+      assert(!replyLines.some((lineText) => /^› .*\?$/u.test(lineText)), "A question was bulleted with ›");
+      const items = replyLines
+        .filter((lineText) => lineText.startsWith("› "))
+        .map((lineText) => lineText.slice(2).replace(/^\[[ x]\] /u, "").trim().toLowerCase());
+      if (name === "list_today") {
+        assert.deepEqual(items, ["clean restroom", "water plants", "clean and organize room"], "Exactly today's tasks are › items");
+      } else {
+        assert(!(replyLines[1] ?? "").startsWith("› "), "An outcome or answer is prose, not a › item");
+      }
+      // Lowercase prose: a capitalized first word is allowed only for provider content or product names.
+      const allowedCapitals = new Set([...pages.values(), "Personal Notion Google"].join(" ").match(/\b[A-Z][a-z]+/gu) ?? []);
+      for (const lineText of replyLines.filter((candidate) => !candidate.startsWith("› ") && !candidate.endsWith(":"))) {
+        const word = /[A-Za-z][a-z']*/u.exec(lineText)?.[0];
+        if (word !== undefined && /^[A-Z]/u.test(word)) {
+          assert(allowedCapitals.has(word), `Model prose is not lowercase: ${lineText}`);
+        }
+      }
+    }
     const displayReply = name === "connect_google"
       ? sent[0]?.replace(/https:\/\/\S+/gu, "[synthetic signed link]")
       : sent[0];

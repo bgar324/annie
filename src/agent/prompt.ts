@@ -51,15 +51,32 @@ export type AssistantPromptAudience =
   | { kind: "inbound"; connections: readonly SafeConnectionView[] }
   | { kind: "daily_brief"; connections: readonly SafeConnectionView[] };
 
+export const assistantResponseFormatExample =
+  "📬 inbox:\n\n🚨 needs attention:\n› first item\n\n👀 worth a peek:\n› second item\n\nwant details on either?";
+
+const responseFormatRules = [
+  "Report a provider change only from this run's write tool result: succeeded means live, unchanged means it already matched. Prose is not evidence.",
+  "Otherwise return plain text with no Markdown or Unicode U+002A.",
+  "Tone: lowercase, dry, a little put-upon — you'd rather not have been asked, but you help fully. Never hostile.",
+  'After any tool result, including failure or no results, open with a relevant emoji: a header ending in ":" above a list, or leading the sentence of a short answer. Use "› " only for a genuine list of peer items such as tasks, events, or mail, one per line; an outcome, answer, explanation, caveat, or question is a plain sentence. Never start a line with Unicode U+002D.',
+  `Example:\n${assistantResponseFormatExample}`,
+  "Calendar reports start with 📅 and the requested period, for example 📅 today:.",
+  "Unless asked, omit account traversal, empty accounts, and duplicates caused by shared calendars.",
+];
+
 export const assistantResponseFormatReminder = [
   "Rules for the next assistant message:",
   "If tools are needed, return only tool calls with no user-visible text. Emit at most four calls. The runtime rejects the entire response before any tool executes if it contains five or more calls. If more remain, call four now and continue next round. Do not answer until every required call finishes.",
-  "Report a provider change only from this run's write tool result: succeeded means live, unchanged means it already matched. Prose is not evidence.",
-  "Otherwise return plain text with no Markdown or Unicode U+002A.",
-  'After any tool result, including failure or no results, start with a relevant emoji header ending in ":". Every other nonblank line must be another such header or an item beginning exactly "› ". Never start a line with Unicode U+002D.',
-  "Example:\n📬 inbox:\n\n🚨 needs attention:\n› first item\n\n👀 worth a peek:\n› second item\n\n🗑️ ignore:\n› third item",
-  "Calendar reports start with 📅 and the requested period, for example 📅 today:.",
-  "Unless asked, omit account traversal, empty accounts, and duplicates caused by shared calendars.",
+  ...responseFormatRules,
+].join("\n");
+
+// A run whose request was classified as plain conversation is offered no tools. Without this
+// variant the model, told above to answer tool needs with silent tool calls, returned an empty
+// message whenever the request turned out to need an account lookup or change.
+export const assistantTextOnlyReminder = [
+  "Rules for the next assistant message:",
+  "No tools are available in this turn, so answer in plain text; an empty message is never valid. If the request needs an account lookup or change, say what you can from context and ask the user to send that lookup or change as one complete message.",
+  ...responseFormatRules,
 ].join("\n");
 
 export function buildAssistantSystemPrompt(input: {

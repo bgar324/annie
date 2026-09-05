@@ -589,7 +589,7 @@ describe("production runtime", () => {
           updates: [{ oldText, newText }],
         }),
       }),
-      finalModelResponse("add_task_done", "📋 added:\n› pull day is on the list now."),
+      finalModelResponse("add_task_done", "📋 added:\npull day is on the list now."),
     );
     const notionClients = new FakeNotionClients(true, notionTaskPage);
     const gateway = new FakeGateway();
@@ -626,7 +626,7 @@ describe("production runtime", () => {
           "SELECT body, purpose FROM egress_messages",
         )
         .get(),
-    ).toEqual({ body: "📋 added:\n› pull day is on the list now.", purpose: "reply" });
+    ).toEqual({ body: "📋 added:\npull day is on the list now.", purpose: "reply" });
     expect(model.scopeRequests).toHaveLength(1);
     expect(model.requests[0]?.tools.map((tool) => tool.name).sort()).toEqual(
       [...requestScopeTools.notion_write].sort(),
@@ -688,13 +688,13 @@ describe("production runtime", () => {
       label: "an already-set observation",
       request: "is the restroom marked done?",
       scope: "read" as const,
-      response: "🧐 checked the page:\n› clean restroom is already checked off.",
+      response: "🧐 checked the page:\nclean restroom is already checked off.",
     },
     {
       label: "a clarifying question",
       request: "mark it done",
       scope: "notion_write" as const,
-      response: "🤔 which one:\n› i see clean restroom and car wash — which should i check off?",
+      response: "🤔 which one:\ni see clean restroom and car wash — which should i check off?",
     },
   ])("completes $label with no provider write", async ({ request, response, scope }) => {
     const model = new FakeModel();
@@ -1039,7 +1039,7 @@ describe("production runtime", () => {
   it("answers a greeting after failed write requests with no tools and no provider call", async () => {
     const model = new FakeModel();
     model.scope = "conversation";
-    model.responses.push(finalModelResponse("greeting_reply", "👋 hey:\n› what do you need?"));
+    model.responses.push(finalModelResponse("greeting_reply", "hey. what do you need?"));
     const notionClients = new FakeNotionClients(true, notionTaskPage);
     const gateway = new FakeGateway();
     const item = await newRuntime(model, gateway, { notionClients });
@@ -1112,7 +1112,7 @@ describe("production runtime", () => {
       item.runtime.database.db
         .prepare<[], { body: string; purpose: string }>("SELECT body, purpose FROM egress_messages")
         .get(),
-    ).toEqual({ body: "👋 hey:\n› what do you need?", purpose: "reply" });
+    ).toEqual({ body: "hey. what do you need?", purpose: "reply" });
   });
 
   it.each(["conversation", "read"] as const)(

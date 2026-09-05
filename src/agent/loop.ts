@@ -3,7 +3,7 @@ import { ModelSafeError } from "../core/errors.js";
 import type { RunId, TraceId } from "../core/ids.js";
 import { maximumMessageTextCharacters } from "../messages/types.js";
 import type { ChatModel, ModelMessage, ModelToolCall } from "./model.js";
-import { assistantResponseFormatReminder } from "./prompt.js";
+import { assistantResponseFormatReminder, assistantTextOnlyReminder } from "./prompt.js";
 import {
   AgentLimitError,
   AgentRunStore,
@@ -124,7 +124,7 @@ export class AgentLoop {
         }
         const last = messages.at(-1);
         if (last?.role === "assistant" && (last.toolCalls?.length ?? 0) === 0) {
-          const response = normalizeFinalResponse(last.content);
+          const response = normalizeFinalResponse(last.content, run.source.kind === "inbound");
           if (response.length === 0) {
             return this.#bounded(run, "empty_model_response");
           }
@@ -145,13 +145,12 @@ export class AgentLoop {
         if (toolRounds > this.#limits.maxToolRounds) {
           throw new AgentLimitError("round_limit", "The tool round limit was reached");
         }
+        const reminder =
+          toolDefinitions.length === 0 ? assistantTextOnlyReminder : assistantResponseFormatReminder;
         const requestMessages: readonly ModelMessage[] =
-          last?.role === "system" && last.content === assistantResponseFormatReminder
+          last?.role === "system" && last.content === reminder
             ? messages
-            : [
-                ...messages,
-                { role: "system", content: assistantResponseFormatReminder },
-              ];
+            : [...messages, { role: "system", content: reminder }];
         this.#runs.beginModelRequest(
           run.id,
           this.#limits.maxToolRounds + 1 + Number(run.requestScope !== null),
@@ -554,8 +553,11 @@ function pendingToolCalls(messages: readonly ModelMessage[]): readonly ModelTool
   return [];
 }
 
-function normalizeFinalResponse(content: string): string {
-  return content.trim().replace(/^[\t ]*-[\t ]*›[ \t]*/gmu, "› ");
+function normalizeFinalResponse(content: string, inbound: boolean): string {
+  const normalized = content.trim().replace(/^[\t ]*-[\t ]*›[ \t]*/gmu, "› ");
+  // In a reply, › enumerates peer items; a single › line is an outcome or answer and stays prose.
+  // A daily brief keeps its own section contract, so a one-item section is left alone.
+  return inbound && normalized.match(/^› /gmu)?.length === 1 ? normalized.replace(/^› /mu, "") : normalized;
 }
 
 function answeredToolCalls(messages: readonly ModelMessage[]): ReadonlySet<string> {

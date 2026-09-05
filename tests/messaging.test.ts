@@ -669,15 +669,35 @@ describe("Sendblue API requests", () => {
     expect(url.searchParams.get("handle")).toBe("msg_sent_1");
   });
 
-  it("refuses a status response for a different message handle", async () => {
+  it.each([
+    ["REGISTERED", "pending"],
+    ["PENDING", "pending"],
+    ["ACCEPTED", "pending"],
+    ["READ", "delivered"],
+    ["DECLINED", "failed"],
+  ])("keeps polling through Sendblue lifecycle status %s as %s", async (raw, expected) => {
     const harness = createMessagingHarness();
     const gateway = new SendblueGateway(harness.config, stubFetch([], () =>
-      Response.json({ message_handle: "msg_other", status: "DELIVERED" }),
+      Response.json({ message_handle: "msg_sent_1", status: { status: raw } }),
     ));
+
+    await expect(gateway.getStatus("msg_sent_1")).resolves.toMatchObject({
+      messageHandle: "msg_sent_1",
+      status: expected,
+    });
+  });
+
+  it.each([
+    ["a different message handle", { message_handle: "msg_other", status: "DELIVERED" }],
+    ["an undocumented status", { message_handle: "msg_sent_1", status: { status: "SOMETHING_NEW" } }],
+  ])("retries a status poll that returns %s instead of ending reconciliation", async (_label, body) => {
+    const harness = createMessagingHarness();
+    const gateway = new SendblueGateway(harness.config, stubFetch([], () => Response.json(body)));
 
     await expect(gateway.getStatus("msg_sent_1")).rejects.toMatchObject({
       name: "MessagingProviderError",
-      kind: "terminal",
+      kind: "transient",
+      message: "Sendblue returned an invalid response",
     });
   });
 });
