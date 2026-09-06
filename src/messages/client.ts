@@ -218,13 +218,14 @@ export class SendblueGateway implements MessageGateway {
     }
   }
 
-  async startTyping(input: { to: string; maxDurationMs: number }): Promise<void> {
+  async startTyping(input: { to: string }): Promise<void> {
     try {
+      // The legacy form: no state, no duration. Sendblue's typing-v2 fields (`state`,
+      // `max_duration_ms`) are honored only by workers on newer firmware and were accepted
+      // with 200 yet never shown; the bare start is documented to always succeed and lasts
+      // Sendblue's 60-second default, which covers a turn.
       const response = await this.#client.typingIndicators
-        .send(
-          { from_number: this.#fromNumber, number: input.to, state: "start", max_duration_ms: input.maxDurationMs },
-          { maxRetries: 0 },
-        )
+        .send({ from_number: this.#fromNumber, number: input.to }, { maxRetries: 0 })
         .asResponse();
       const body = parseResponse(typingSchema, await boundedResponseJson(response, true), true);
       if (body.status === "ERROR") {

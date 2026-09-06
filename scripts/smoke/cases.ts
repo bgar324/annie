@@ -208,6 +208,7 @@ export const cases: readonly SmokeCase[] = [
       noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o);
       assert(o.tools.some((tool) => tool.tool_name === "gmail.search" && tool.status === "succeeded"));
       assert(/assignment|deadline|lee/iu.test(lastReply(o)), "The one urgent mail is surfaced");
+      assert(!/ben@example\.test/u.test(lastReply(o)), "The reading account is never shown unasked");
     },
   },
   {

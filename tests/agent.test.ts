@@ -67,9 +67,10 @@ describe("assistant prompt", () => {
       Buffer.byteLength(prompt) +
       Buffer.byteLength(assistantResponseFormatReminder) -
       Buffer.byteLength(memory);
-    // Prompt-bloat tripwire, not a provider limit. Raised 4096 → 4352 for the tone line and
-    // 4352 → 4608 for the one-retry rule (measured 4408); every raise is a deliberate trade.
-    expect(fixedWireBytes).toBeLessThan(4_608);
+    // Prompt-bloat tripwire, not a provider limit. Raised 4096 → 4352 for the tone line,
+    // 4352 → 4608 for the one-retry rule, and 4608 → 4864 for the never-show-accounts rule;
+    // every raise is a deliberate trade.
+    expect(fixedWireBytes).toBeLessThan(4_864);
   });
 
   it("teaches › for list items only and shows an unprefixed closing sentence", () => {

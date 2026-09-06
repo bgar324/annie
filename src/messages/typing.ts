@@ -3,9 +3,8 @@ import type { TraceStore } from "../tracing/store.js";
 import type { WriteStore } from "../writes/store.js";
 import type { MessageSender } from "./types.js";
 
-// Long enough to cover a tool-bearing turn; the bubble clears on its own if the reply is
-// late, and Sendblue ends it when the reply lands.
-const typingDurationMs = 60_000;
+// Sendblue's default bubble lasts 60 seconds, enough to cover a turn; it clears on its own
+// if the reply is late, and Sendblue ends it when the reply lands.
 
 /**
  * Shows the user a typing bubble while a turn runs. A provider mutation like any other:
@@ -34,7 +33,7 @@ export class TypingIndicatorService {
 
   /** Never throws; the caller must not await this on the critical path. */
   async start(input: { runId: RunId; traceId: TraceId }): Promise<void> {
-    const request = { to: this.#recipient, state: "start", maxDurationMs: typingDurationMs };
+    const request = { to: this.#recipient, state: "start" };
     let write;
     try {
       write = this.#writes.prepare({
@@ -42,7 +41,7 @@ export class TypingIndicatorService {
         runId: input.runId,
         kind: "sendblue_typing_indicator",
         request,
-        safeSummary: { maxDurationMs: typingDurationMs },
+        safeSummary: { state: "start" },
       });
       this.#writes.beginAttempt({ writeId: write.id, traceId: input.traceId });
     } catch (error) {
@@ -50,7 +49,7 @@ export class TypingIndicatorService {
       return;
     }
     try {
-      await this.#sender.startTyping({ to: this.#recipient, maxDurationMs: typingDurationMs });
+      await this.#sender.startTyping({ to: this.#recipient });
       this.#writes.complete({
         writeId: write.id,
         traceId: input.traceId,

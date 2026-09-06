@@ -368,10 +368,10 @@ class FakeGateway implements MessageGateway {
     };
   }
 
-  readonly typingStarts: { to: string; maxDurationMs: number }[] = [];
+  readonly typingStarts: { to: string }[] = [];
   typingError: Error | undefined;
 
-  async startTyping(input: { to: string; maxDurationMs: number }): Promise<void> {
+  async startTyping(input: { to: string }): Promise<void> {
     this.typingStarts.push(input);
     if (this.typingError !== undefined) {
       throw this.typingError;
@@ -676,7 +676,7 @@ describe("production runtime", () => {
       await drainJobs(item.runtime);
 
       // The bubble is a durable, settled provider attempt, and the user's one write still went through.
-      expect(gateway.typingStarts).toEqual([{ to: userNumber, maxDurationMs: 60_000 }]);
+      expect(gateway.typingStarts).toEqual([{ to: userNumber }]);
       expect(
         item.runtime.database.db
           .prepare<[], { kind: string; state: string }>(
