@@ -4,7 +4,6 @@ import type { ChatModel, ModelMessage, ModelToolCall } from "../agent/model.js";
 import type { ConversationHistoryStore } from "../agent/history.js";
 import type { AgentRunRecord, AgentRunStore } from "../agent/store.js";
 import { buildAssistantSystemPrompt } from "../agent/prompt.js";
-import { classifyRequestScope, requestScopeTools, type RequestScope } from "../agent/request-scope.js";
 import type { RuntimeConfig } from "../config.js";
 import type { ConnectionRecoveryService } from "../connections/recovery.js";
 import type { ConnectionStore } from "../connections/store.js";
@@ -27,10 +26,6 @@ interface InboundTurnRow {
   trace_id: TraceId;
   sequence: number;
 }
-
-// An answer can complete only a question Annie just asked: her reply must have been
-// prepared within this window before the current message arrived.
-const followUpWindowMs = 30 * 60_000;
 
 /**
  * Runs one inbound message as an ordinary durable model/tool turn.
@@ -118,18 +113,24 @@ export class InboundTurnService {
         });
         return;
       }
-      const scope = await this.#requestScope(inbound, userMessage, job, context);
+      const run = this.#runs.startOrResume({
+        source: { kind: "inbound", inboundId: inbound.id },
+        traceId: inbound.trace_id,
+        deadlineAtMs: Date.now() + this.#config.limits.maxAgentRunMs,
+      });
+      this.#runs.bindJob(run.id, job.id, job.leaseToken);
+      // Fire-and-forget by design: the bubble never gates the reply. The service settles
+      // its own intent and swallows its own failures. A resumed run already showed one.
+      if (run.modelRequests === 0) {
+        void this.#typing.start({ runId: run.id, traceId: run.traceId });
+      }
       const memory = await this.#memory.load();
       const history = this.#history.loadBefore(inbound.id);
       const initialMessages: readonly ModelMessage[] = [
-        {
-          role: "system",
-          content: this.#systemPrompt(memory) +
-            `\nCurrent request permissions: ${scope}. They cannot be widened by history. If a follow-up needs a write instruction of its own, ask the user to state the change rather than merely confirm an old offer. Never claim an external action when this turn has no tools.`,
-        },
+        { role: "system", content: this.#systemPrompt(memory) },
         ...(history.length === 0 ? [] : [{
           role: "system" as const,
-          content: "Prior conversation is quoted context, not pending work. Missing replies do not authorize retries. Only the next user message is current.\n" + JSON.stringify(history),
+          content: "Prior conversation, most recent last. Only the final user message is the current request; use the rest to resolve what it refers to.\n" + JSON.stringify(history),
         }]),
         { role: "user", content: userMessage },
       ];
@@ -137,8 +138,7 @@ export class InboundTurnService {
         source: { kind: "inbound", inboundId: inbound.id },
         traceId: inbound.trace_id,
         initialMessages,
-        allowedToolNames: requestScopeTools[scope],
-        toolCallGuard: (call) => this.#connectionToolCallRejection(inbound.id, call, scope),
+        toolCallGuard: (call) => this.#connectionToolCallRejection(inbound.id, call),
         jobLease: { jobId: job.id, leaseToken: job.leaseToken },
       });
       context.assertLease();
@@ -185,59 +185,6 @@ export class InboundTurnService {
         replyToGuid: inbound.guid,
       });
     }
-  }
-
-  async #requestScope(
-    inbound: InboundTurnRow,
-    userMessage: string,
-    job: ClaimedJob,
-    context: JobContext,
-  ): Promise<RequestScope> {
-    const run = this.#runs.startOrResume({
-      source: { kind: "inbound", inboundId: inbound.id },
-      traceId: inbound.trace_id,
-      deadlineAtMs: Date.now() + this.#config.limits.maxAgentRunMs,
-    });
-    this.#runs.bindJob(run.id, job.id, job.leaseToken);
-    // Fire-and-forget by design: the bubble races the classifier call and never gates the
-    // reply. The service settles its own intent and swallows its own failures.
-    if (run.requestScope === null) {
-      void this.#typing.start({ runId: run.id, traceId: run.traceId });
-    }
-    if (run.requestScope !== null) {
-      return run.requestScope;
-    }
-    this.#runs.beginModelRequest(run.id, this.#config.limits.maxAgentToolRounds + 2);
-    const preceding = this.#history.precedingContext(inbound.id, followUpWindowMs);
-    this.#traces.append({
-      traceId: run.traceId,
-      component: "request_scope",
-      event: "preceding_reply",
-      outcome: preceding === undefined ? "none" : preceding.kind,
-      runId: run.id,
-      data: preceding === undefined ? {} : { egressId: preceding.egressId },
-    });
-    const classified = await classifyRequestScope({
-      model: this.#model,
-      traceId: run.traceId,
-      runId: run.id,
-      userMessage,
-      ...(preceding === undefined ? {} : { preceding }),
-      signal: AbortSignal.timeout(Math.max(1, run.deadlineAtMs - Date.now())),
-    });
-    context.assertLease();
-    if (classified.fallback !== undefined) {
-      this.#traces.append({
-        traceId: run.traceId,
-        component: "request_scope",
-        event: "fallback",
-        outcome: classified.fallback,
-        runId: run.id,
-        data: { scope: classified.scope },
-      });
-    }
-    this.#runs.setRequestScope(run.id, classified.scope, { jobId: job.id, leaseToken: job.leaseToken });
-    return classified.scope;
   }
 
   /**
@@ -322,17 +269,10 @@ export class InboundTurnService {
   #connectionToolCallRejection(
     inboundId: InboundId,
     call: ModelToolCall,
-    scope: RequestScope,
   ): string | undefined {
     const run = this.#runForInbound(inboundId);
     if (run === undefined) {
       throw new Error(`Inbound ${inboundId} has no agent run`);
-    }
-    if (call.name === "connections.connect") {
-      const provider = scope === "connect_google" ? "google" : scope === "connect_notion" ? "notion" : undefined;
-      if (parseConnectToolArguments(call.argumentsJson).provider !== provider) {
-        return "The connection provider must match the current request";
-      }
     }
     if (this.#toolCallWasPrepared(run.id, call.id)) {
       return undefined;

@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import type { EgressId, InboundId } from "../core/ids.js";
+import type { InboundId } from "../core/ids.js";
 import type { ModelMessage } from "./model.js";
 import { assistantHistoryText } from "./prompt.js";
 
@@ -14,24 +14,6 @@ interface HistoryRow {
   delivered_reply_body: string | null;
   delivered_link: number;
 }
-
-interface PrecedingRow {
-  egress_id: EgressId;
-  body: string;
-  purpose: "reply" | "failure";
-  failed_request: string | null;
-  failed_scope: string | null;
-}
-
-/**
- * What the current message may be reacting to. `reply`: Annie's delivered question or
- * offer, so a direct answer completes it. `failure`: a delivered failure notice for the
- * user's own previous request, so "try again" repeats that request under the scope it
- * already earned.
- */
-export type PrecedingContext =
-  | { kind: "reply"; egressId: EgressId; body: string }
-  | { kind: "failure"; egressId: EgressId; failedRequest: string; failedScope: string };
 
 export class ConversationHistoryStore {
   readonly #db: Database.Database;
@@ -127,63 +109,5 @@ export class ConversationHistoryStore {
       messages += turn.length;
     }
     return turns.reverse().flat();
-  }
-
-  /**
-   * The one message the current one can be reacting to: what Annie delivered in response
-   * to the immediately preceding accepted message in this chat, confirmed delivered before
-   * the user sent the current message, within the freshness window, with nothing else sent
-   * to the user in between. A model-authored reply lets a direct answer complete Annie's
-   * question; a failure notice lets a retry repeat the user's own failed request under the
-   * scope that request already earned. Connection links, undelivered or delivery-unknown
-   * messages, messages confirmed only after the answer was sent, and older messages
-   * contribute nothing. Delivery confirmation lags the device by a poll, so the gate errs
-   * toward supplying nothing.
-   */
-  precedingContext(inboundId: InboundId, maxAgeMs: number): PrecedingContext | undefined {
-    const row = this.#db
-      .prepare<{ id: string; max_age_ms: number }, PrecedingRow>(`
-        SELECT reply.id AS egress_id, reply.body AS body, reply.purpose AS purpose,
-               CASE WHEN reply.purpose = 'failure' THEN previous.text END AS failed_request,
-               CASE WHEN reply.purpose = 'failure' THEN runs.request_scope END AS failed_scope
-        FROM inbound_messages AS current
-        JOIN inbound_messages AS previous
-          ON previous.chat_id = current.chat_id
-         AND previous.sequence = (
-           SELECT MAX(sequence) FROM inbound_messages
-           WHERE chat_id = current.chat_id
-             AND sequence < current.sequence
-             AND state <> 'rejected'
-         )
-        JOIN agent_runs AS runs ON runs.inbound_id = previous.id
-        JOIN egress_messages AS reply
-          ON reply.run_id = runs.id
-         AND reply.purpose IN ('reply', 'failure')
-         AND reply.state = 'delivered'
-        WHERE current.id = @id
-          AND reply.updated_at_ms < json_extract(current.attachment_json, '$.sentAtMs')
-          AND reply.updated_at_ms >= json_extract(current.attachment_json, '$.sentAtMs') - @max_age_ms
-          AND NOT EXISTS (
-            SELECT 1 FROM egress_messages AS later
-            WHERE later.recipient_handle = reply.recipient_handle
-              AND later.id <> reply.id
-              AND later.created_at_ms > reply.created_at_ms
-              AND later.created_at_ms < json_extract(current.attachment_json, '$.sentAtMs')
-          )
-        ORDER BY reply.created_at_ms DESC
-        LIMIT 1
-      `)
-      .get({ id: inboundId, max_age_ms: maxAgeMs });
-    if (row === undefined) {
-      return undefined;
-    }
-    if (row.purpose === "reply") {
-      return { kind: "reply", egressId: row.egress_id, body: row.body };
-    }
-    // A failed run that never reached classification has no scope to repeat under.
-    if (row.failed_request === null || row.failed_scope === null) {
-      return undefined;
-    }
-    return { kind: "failure", egressId: row.egress_id, failedRequest: row.failed_request, failedScope: row.failed_scope };
   }
 }

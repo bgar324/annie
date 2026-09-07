@@ -155,7 +155,7 @@ export class AgentLoop {
             : [...messages, { role: "system", content: assistantResponseFormatReminder }];
         this.#runs.beginModelRequest(
           run.id,
-          this.#limits.maxToolRounds + 1 + Number(run.requestScope !== null),
+          this.#limits.maxToolRounds + 1,
         );
         let response;
         try {

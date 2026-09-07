@@ -13,7 +13,6 @@ import {
 import type { TraceStore } from "../tracing/store.js";
 import type { ModelMessage, ModelResponse, ModelToolCall } from "./model.js";
 import type { ToolOperationClass } from "./tools.js";
-import type { RequestScope } from "./request-scope.js";
 
 export type AgentRunPhase = "pending" | "running" | "finalizing" | "completed" | "failed" | "blocked";
 
@@ -32,7 +31,6 @@ export interface AgentRunRecord {
   deadlineAtMs: number;
   finalResponse: string | null;
   failureCode: string | null;
-  requestScope: RequestScope | null;
 }
 
 export interface ToolExecutionRecord {
@@ -59,7 +57,6 @@ interface RunRow {
   deadline_at_ms: number;
   final_response: string | null;
   failure_code: string | null;
-  request_scope: RequestScope | null;
 }
 
 interface MessageRow {
@@ -228,43 +225,6 @@ export class AgentRunStore {
       throw new AgentLimitError("model_request_limit", "The model request or time limit was reached");
     }
     return row.model_requests;
-  }
-
-  setRequestScope(
-    runId: RunId,
-    scope: RequestScope,
-    jobLease: { jobId: string; leaseToken: string },
-  ): void {
-    const transaction = this.#db.transaction(() => {
-      const now = Date.now();
-      const changed = this.#db.prepare<{
-        id: string; scope: RequestScope; job_id: string; lease_token: string; now_ms: number;
-      }>(`
-        UPDATE agent_runs SET request_scope = @scope, updated_at_ms = @now_ms
-        WHERE id = @id AND inbound_id IS NOT NULL AND phase = 'running'
-          AND (request_scope IS NULL OR request_scope = @scope)
-          AND EXISTS (
-            SELECT 1 FROM jobs
-            WHERE id = @job_id AND run_id = @id AND status = 'running'
-              AND lease_token = @lease_token AND lease_expires_at_ms > @now_ms
-          )
-      `).run({
-        id: runId, scope, job_id: jobLease.jobId,
-        lease_token: jobLease.leaseToken, now_ms: now,
-      });
-      if (changed.changes !== 1) {
-        throw new Error("Request scope cannot change or be assigned without the active lease");
-      }
-      this.#traces.appendInTransaction({
-        traceId: this.getRequired(runId).traceId,
-        runId,
-        component: "request_scope",
-        event: "assigned",
-        outcome: scope,
-        data: {},
-      });
-    });
-    transaction.immediate();
   }
 
   appendInitialMessages(runId: RunId, messages: readonly ModelMessage[]): void {
@@ -660,7 +620,7 @@ export class AgentLimitError extends Error {
 
 const runSelect = `
   SELECT id, inbound_id, scheduled_job_id, trace_id, phase, model_requests, tool_calls,
-         provider_writes, deadline_at_ms, final_response, failure_code, request_scope
+         provider_writes, deadline_at_ms, final_response, failure_code
   FROM agent_runs
 `;
 
@@ -684,7 +644,6 @@ function toRun(row: RunRow): AgentRunRecord {
     deadlineAtMs: row.deadline_at_ms,
     finalResponse: row.final_response,
     failureCode: row.failure_code,
-    requestScope: row.request_scope,
   };
 }
 

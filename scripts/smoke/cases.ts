@@ -3,8 +3,6 @@
 // text must earn and the observable outcome; wording is asserted only where a plausible
 // regression would change it.
 import assert from "node:assert/strict";
-import type { RequestScope } from "../../src/agent/request-scope.js";
-import { requestScopeTools } from "../../src/agent/request-scope.js";
 import type { RuntimeConfig } from "../../src/config.js";
 import type { AssistantRuntime } from "../../src/runtime.js";
 import type { GoogleOptions, GoogleWorld, NotionOptions, NotionWorld, SeededExchange } from "./synthetic.js";
@@ -16,7 +14,7 @@ export type Category =
 
 export interface Observation {
   texts: readonly string[];
-  runs: readonly { phase: string; request_scope: string | null }[];
+  runs: readonly { phase: string }[];
   replies: readonly { purpose: string; state: string }[];
   sent: readonly string[];
   tools: readonly { tool_name: string; status: string }[];
@@ -31,8 +29,6 @@ export interface SmokeCase {
   name: string;
   category: Category;
   texts: readonly string[];
-  /** Scope each text must earn; null leaves that text's classification observed, not asserted. */
-  scopes: readonly (RequestScope | null)[];
   history?: readonly string[];
   exchange?: SeededExchange;
   notion?: NotionOptions;
@@ -77,11 +73,6 @@ function noProviderWrite(o: Observation): void {
   assert.equal(o.notion.pages.get("daily"), o.notion.original, "The task page is untouched");
 }
 
-function toolsWithin(o: Observation, scope: RequestScope): void {
-  assert(o.tools.every((tool) => requestScopeTools[scope].includes(tool.tool_name)),
-    `A tool ran outside the ${scope} scope: ${toolNames(o).join(", ")}`);
-}
-
 function answeredInText(o: Observation): void {
   assert(!/couldn't complete|may have accepted/u.test(lastReply(o)), "The user must get an answer, not a failure notice");
 }
@@ -114,12 +105,12 @@ export const cases: readonly SmokeCase[] = [
   // ---- Notion writes -----------------------------------------------------------------
   {
     name: "relative_date_checkbox", category: "notion_write",
-    texts: [requests.relative_date_checkbox], scopes: ["notion_write"],
+    texts: [requests.relative_date_checkbox],
     expect(o) { checkedOff(o, o.notion.yesterday, o.notion.yesterday.replace("[ ]", "[x]")); },
   },
   {
     name: "already_checked_no_op", category: "notion_write",
-    texts: [requests.relative_date_checkbox], scopes: ["notion_write"], notion: { yesterdayChecked: true },
+    texts: [requests.relative_date_checkbox], notion: { yesterdayChecked: true },
     expect(o) {
       noProviderWrite(o);
       assert(o.tools.some((tool) => tool.tool_name.startsWith("notion.") && tool.status === "succeeded"), "The page was read");
@@ -128,7 +119,7 @@ export const cases: readonly SmokeCase[] = [
   },
   {
     name: "add_task", category: "notion_write",
-    texts: [requests.add_task], scopes: ["notion_write"],
+    texts: [requests.add_task],
     expect(o) {
       assert.equal(o.notion.mutations(), 1, "Exactly one provider mutation");
       assert.deepEqual(o.writes, [{ state: "succeeded" }]);
@@ -147,7 +138,7 @@ export const cases: readonly SmokeCase[] = [
   },
   {
     name: "read_failure", category: "notion_write",
-    texts: [requests.mark_restroom], scopes: ["notion_write"], notion: { fetchFails: true },
+    texts: [requests.mark_restroom], notion: { fetchFails: true },
     expect(o) {
       noProviderWrite(o);
       assert(o.tools.some((tool) => tool.tool_name === "notion.fetch" && tool.status === "failed"));
@@ -156,7 +147,7 @@ export const cases: readonly SmokeCase[] = [
   },
   {
     name: "truncated_page_write", category: "notion_write",
-    texts: [requests.mark_restroom], scopes: ["notion_write"], notion: { truncatedFetch: true },
+    texts: [requests.mark_restroom], notion: { truncatedFetch: true },
     expect(o) {
       // An incomplete page can never prove a unique patch, so the write is refused and the
       // user hears why instead of a failure notice.
@@ -167,7 +158,7 @@ export const cases: readonly SmokeCase[] = [
   {
     // Production 2026-09-06: three checkboxes named in one message, one write per response.
     name: "multi_checkbox", category: "notion_write",
-    texts: ["mark off clean restroom, water plants, and clean and organize room on today's list"], scopes: ["notion_write"],
+    texts: ["mark off clean restroom, water plants, and clean and organize room on today's list"],
     expect(o) {
       answeredInText(o);
       assert(o.writes.every((write) => write.state === "succeeded"));
@@ -179,7 +170,7 @@ export const cases: readonly SmokeCase[] = [
   },
   {
     name: "ambiguous_write", category: "notion_write", purpose: "failure", restart: true,
-    texts: [requests.mark_restroom], scopes: ["notion_write"], notion: { writeLoses: true },
+    texts: [requests.mark_restroom], notion: { writeLoses: true },
     expect(o) {
       assert.equal(o.notion.mutations(), 1, "Exactly one provider mutation, including after restart");
       assert.deepEqual(o.writes, [{ state: "ambiguous" }]);
@@ -191,7 +182,7 @@ export const cases: readonly SmokeCase[] = [
   // ---- Notion reads ------------------------------------------------------------------
   {
     name: "list_today", category: "notion_read",
-    texts: ["what's on today's list?"], scopes: ["read"],
+    texts: ["what's on today's list?"],
     expect(o) {
       noProviderWrite(o);
       assert(o.tools.some((tool) => tool.tool_name.startsWith("notion.") && tool.status === "succeeded"), "The page was read");
@@ -200,25 +191,25 @@ export const cases: readonly SmokeCase[] = [
   },
   {
     name: "access_question", category: "notion_read",
-    texts: ['Do you have access to "logit thought dump"'], scopes: ["read"],
-    expect(o) { noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o); },
+    texts: ['Do you have access to "logit thought dump"'],
+    expect(o) { noProviderWrite(o); answeredInText(o); },
   },
   {
     name: "bare_page_name", category: "conversation",
-    texts: ['"Logit notes"'], scopes: [null],
+    texts: ['"Logit notes"'],
     expect(o) {
       // Conversation when the classifier decides; read when it runs out of budget on an odd
       // message. Either way: no write, and a text answer rather than a failure notice.
-      noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o);
+      noProviderWrite(o); answeredInText(o);
     },
   },
 
   // ---- Google reads ------------------------------------------------------------------
   {
     name: "inbox_important", category: "google_read",
-    texts: ["anything important in my inbox?"], scopes: ["read"],
+    texts: ["anything important in my inbox?"],
     expect(o) {
-      noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o);
+      noProviderWrite(o); answeredInText(o);
       assert(o.tools.some((tool) => tool.tool_name === "gmail.search" && tool.status === "succeeded"));
       assert(/assignment|deadline|lee/iu.test(lastReply(o)), "The one urgent mail is surfaced");
       assert(!/ben@example\.test/u.test(lastReply(o)), "The reading account is never shown unasked");
@@ -226,18 +217,18 @@ export const cases: readonly SmokeCase[] = [
   },
   {
     name: "thread_alex", category: "google_read",
-    texts: ["what did alex say about the car wash?"], scopes: ["read"],
+    texts: ["what did alex say about the car wash?"],
     expect(o) {
-      noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o);
+      noProviderWrite(o); answeredInText(o);
       assert(o.tools.some((tool) => tool.tool_name.startsWith("gmail.") && tool.status === "succeeded"));
       assert(/\b10\b/u.test(lastReply(o)), "The latest message in the thread (10, not 9) is what counts");
     },
   },
   {
     name: "calendar_today", category: "google_read",
-    texts: ["what's on my calendar today?"], scopes: ["read"],
+    texts: ["what's on my calendar today?"],
     expect(o) {
-      noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o);
+      noProviderWrite(o); answeredInText(o);
       assert(o.google.calls.some((call) => call.startsWith("calendar.events")));
       assert(/standup/iu.test(lastReply(o)) && /pull day|gym/iu.test(lastReply(o)));
       assert(!/dentist/iu.test(lastReply(o)), "Tomorrow's event stays out of today's answer");
@@ -245,18 +236,18 @@ export const cases: readonly SmokeCase[] = [
   },
   {
     name: "drive_find_doc", category: "google_read",
-    texts: ["find my logit thought dump doc and tell me what's in it"], scopes: ["read"],
+    texts: ["find my logit thought dump doc and tell me what's in it"],
     expect(o) {
-      noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o);
+      noProviderWrite(o); answeredInText(o);
       assert(o.google.calls.some((call) => call.startsWith("drive.")));
       assert(/rep|weekly review/iu.test(lastReply(o)), "The document contents are read, not just found");
     },
   },
   {
     name: "tasks_due", category: "google_read",
-    texts: ["what google tasks are due today?"], scopes: ["read"],
+    texts: ["what google tasks are due today?"],
     expect(o) {
-      noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o);
+      noProviderWrite(o); answeredInText(o);
       assert(o.google.calls.some((call) => call.startsWith("tasks.")));
       assert(/dentist/iu.test(lastReply(o)));
       assert(!/rent/iu.test(lastReply(o)), "Completed tasks stay out");
@@ -264,34 +255,34 @@ export const cases: readonly SmokeCase[] = [
   },
   {
     name: "contact_phone", category: "google_read",
-    texts: ["what's alex's number?"], scopes: ["read"],
+    texts: ["what's alex's number?"],
     expect(o) {
-      noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o);
+      noProviderWrite(o); answeredInText(o);
       assert(lastReply(o).includes("+15550000009") || /555.?000.?0009/u.test(lastReply(o)));
     },
   },
   {
     name: "gmail_failure", category: "google_read",
-    texts: ["anything important in my inbox?"], scopes: ["read"], google: { gmailFails: true },
+    texts: ["anything important in my inbox?"], google: { gmailFails: true },
     expect(o) {
-      noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o);
+      noProviderWrite(o); answeredInText(o);
       assert(o.tools.some((tool) => tool.tool_name === "gmail.search" && tool.status === "failed"));
       assert(!/assignment|deadline/iu.test(lastReply(o)), "Nothing was read, so nothing is reported as read");
     },
   },
   {
     name: "inbox_summary_large", category: "google_read",
-    texts: ["summarize my inbox from the last day"], scopes: ["read"], google: { inboxSize: 40 },
+    texts: ["summarize my inbox from the last day"], google: { inboxSize: 40 },
     expect(o) {
-      noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o);
+      noProviderWrite(o); answeredInText(o);
       assert(lastReply(o).length <= 3_000, "A summary stays an iMessage, not a report");
     },
   },
   {
     name: "cross_provider", category: "google_read",
-    texts: ["is the car wash still on my list, and did alex ever confirm a time?"], scopes: ["read"],
+    texts: ["is the car wash still on my list, and did alex ever confirm a time?"],
     expect(o) {
-      noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o);
+      noProviderWrite(o); answeredInText(o);
       assert(o.tools.some((tool) => tool.tool_name.startsWith("notion.")) && o.tools.some((tool) => tool.tool_name.startsWith("gmail.")),
         "Both providers are consulted for a two-part question");
     },
@@ -299,26 +290,28 @@ export const cases: readonly SmokeCase[] = [
 
   // ---- Follow-ups after failures and after Annie's own question -------------------------
   {
+    // The d658a1a shape: eight unanswered old requests in history, then a bare greeting.
+    // No gate stops the model from acting on history now; the prompt tells it a greeting
+    // asks for nothing. This case measures how well that holds.
     name: "greeting_after_failures", category: "follow_up",
-    texts: ["Hey annie"], scopes: ["conversation"], history: priorFailures,
+    texts: ["Hey annie"], history: priorFailures,
     expect(o) {
       noProviderWrite(o);
-      toolsWithin(o, "read");
       assert(!/https?:\/\//u.test(lastReply(o)));
     },
   },
   {
     name: "status_after_failures", category: "follow_up",
-    texts: ["did that clean restroom task ever get checked off?"], scopes: ["read"], history: priorFailures,
+    texts: ["did that clean restroom task ever get checked off?"], history: priorFailures,
     expect(o) {
-      noProviderWrite(o); toolsWithin(o, "read");
+      noProviderWrite(o);
       assert(!/https?:\/\//u.test(lastReply(o)));
       replyShape(o, { outcomeIsProse: true });
     },
   },
   {
     name: "page_name_after_offer", category: "follow_up",
-    texts: ['"Logit notes"'], scopes: ["notion_write"], exchange: { ...createOffer, ageMs: 120_000, state: "delivered" },
+    texts: ['"Logit notes"'], exchange: { ...createOffer, ageMs: 120_000, state: "delivered" },
     expect(o) {
       // Write tools were granted. Creating at once or first asking where it should live is
       // the model's judgment; both are accepted, a second mutation is not.
@@ -331,34 +324,38 @@ export const cases: readonly SmokeCase[] = [
   },
   {
     name: "yes_after_offer", category: "follow_up",
-    texts: ["yes"], scopes: ["notion_write"], exchange: { ...checkOffer, ageMs: 120_000, state: "delivered" },
+    texts: ["yes"], exchange: { ...checkOffer, ageMs: 120_000, state: "delivered" },
     expect(o) { checkedOff(o, "[ ] Clean restroom", "[x] Clean restroom"); },
   },
   {
     name: "no_after_offer", category: "follow_up",
-    texts: ["no, leave it"], scopes: ["conversation"], exchange: { ...checkOffer, ageMs: 120_000, state: "delivered" },
-    expect(o) { noProviderWrite(o); toolsWithin(o, "read"); },
+    texts: ["no, leave it"], exchange: { ...checkOffer, ageMs: 120_000, state: "delivered" },
+    expect(o) { noProviderWrite(o); },
   },
   {
     name: "greeting_after_offer", category: "follow_up",
-    texts: ["Hey annie"], scopes: ["conversation"], exchange: { ...checkOffer, ageMs: 120_000, state: "delivered" },
-    expect(o) { noProviderWrite(o); toolsWithin(o, "read"); },
+    texts: ["Hey annie"], exchange: { ...checkOffer, ageMs: 120_000, state: "delivered" },
+    expect(o) { noProviderWrite(o); },
   },
   {
+    // With full context there is no freshness gate: "yes" to an offer two hours old is
+    // still the user saying yes. History decides, not a timer.
     name: "yes_after_stale_offer", category: "follow_up",
-    texts: ["yes"], scopes: ["conversation"], exchange: { ...checkOffer, ageMs: 2 * 3_600_000, state: "delivered" },
-    expect(o) { noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o); },
+    texts: ["yes"], exchange: { ...checkOffer, ageMs: 2 * 3_600_000, state: "delivered" },
+    expect(o) { checkedOff(o, "[ ] Clean restroom", "[x] Clean restroom"); },
   },
   {
+    // An offer whose delivery was never confirmed is absent from history, so "yes" has
+    // nothing to answer: no write, and a question back rather than a failure.
     name: "yes_after_undelivered_offer", category: "follow_up",
-    texts: ["yes"], scopes: ["conversation"], exchange: { ...checkOffer, ageMs: 120_000, state: "delivery_unknown" },
-    expect(o) { noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o); },
+    texts: ["yes"], exchange: { ...checkOffer, ageMs: 120_000, state: "delivery_unknown" },
+    expect(o) { noProviderWrite(o); answeredInText(o); },
   },
   {
     // Production 2026-09-06: a write turn failed, the notice was delivered, then "Try again/".
-    // The retry repeats the failed request under the scope it earned; every box named lands.
+    // The failed request is in history; the retry performs it and every box named lands.
     name: "retry_after_failure", category: "follow_up",
-    texts: ["Try again/"], scopes: ["notion_write"],
+    texts: ["Try again/"],
     exchange: {
       question: "mark off clean restroom and water plants on today's list",
       reply: "I couldn't complete that request. Trace: tr_00000000000000000000000000000000",
@@ -373,38 +370,39 @@ export const cases: readonly SmokeCase[] = [
     },
   },
   {
-    // Production 2026-09-06, second shape: Annie's last message was her own conversational
-    // reply, then "Try again". No failure notice and no offer to complete, so no write is
-    // granted; with read tools she reports the page instead of lecturing about format.
+    // Production 2026-09-06, second shape: Annie's last message was her own "send it as one
+    // message" reply, then "Try again". The request is right there in history; she does it.
     name: "retry_after_conversation", category: "follow_up",
-    texts: ["Try again"], scopes: [null],
+    texts: ["Try again"],
     exchange: {
       question: "Try again/",
       reply: "send it over as one message — \"tick off clean restroom and water plants\" — and i'll mark them done.",
       ageMs: 120_000, state: "delivered",
     },
     expect(o) {
-      noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o);
+      answeredInText(o);
       assert(!/one (complete )?message|send it (over )?as|resend/iu.test(lastReply(o)), "No lecture about message format");
+      const page = o.notion.pages.get("daily") ?? "";
+      assert(/\[x\] Clean restroom/u.test(page) && /\[x\] Water plants/u.test(page), "Both named boxes are ticked");
     },
   },
 
   // ---- Plain conversation ------------------------------------------------------------
   {
     name: "thanks", category: "conversation",
-    texts: ["thanks!"], scopes: ["conversation"],
-    expect(o) { noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o); },
+    texts: ["thanks!"],
+    expect(o) { noProviderWrite(o); answeredInText(o); },
   },
   {
     name: "tapback", category: "conversation",
-    texts: ["Liked \u201chey. what do you need?\u201d"], scopes: ["conversation"],
-    expect(o) { noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o); },
+    texts: ["Liked \u201chey. what do you need?\u201d"],
+    expect(o) { noProviderWrite(o); answeredInText(o); },
   },
 
   // ---- Requests outside the tool set: decline honestly, never fail, never pretend --------
   {
     name: "send_email", category: "decline",
-    texts: ["email alex that i'm running 10 minutes late"], scopes: [null],
+    texts: ["email alex that i'm running 10 minutes late"],
     expect(o) {
       noProviderWrite(o); answeredInText(o);
       assert(!/\b(sent|emailed|done)\b/iu.test(lastReply(o)) || /can't|cannot|unable|don't have|no way/iu.test(lastReply(o)),
@@ -413,7 +411,7 @@ export const cases: readonly SmokeCase[] = [
   },
   {
     name: "set_reminder", category: "decline",
-    texts: ["remind me at 5pm to call the dentist"], scopes: [null],
+    texts: ["remind me at 5pm to call the dentist"],
     expect(o) {
       noProviderWrite(o); answeredInText(o);
       assert(/can't|cannot|unable|don't|no reminder|not able|isn't something/iu.test(lastReply(o)),
@@ -424,7 +422,7 @@ export const cases: readonly SmokeCase[] = [
   // ---- Connection links ----------------------------------------------------------------
   {
     name: "connect_google", category: "connect", purpose: "recovery", restart: true,
-    texts: ["connect google"], scopes: ["connect_google"],
+    texts: ["connect google"],
     expect(o) {
       noProviderWrite(o);
       assert.deepEqual(o.tools, [{ tool_name: "connections.connect", status: "succeeded" }]);
@@ -440,7 +438,7 @@ export const cases: readonly SmokeCase[] = [
   // ---- Two messages in one sweep ------------------------------------------------------
   {
     name: "burst_two_items", category: "burst",
-    texts: ["add milk to my list", "and eggs too"], scopes: ["notion_write", null],
+    texts: ["add milk to my list", "and eggs too"],
     expect(o) {
       // Per-chat order holds and each message gets its own delivered reply. The second
       // message's classification is observed, not required: its context arrives only once

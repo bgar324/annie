@@ -9,7 +9,6 @@ import type {
   ModelResponse,
 } from "../src/agent/model.js";
 import { assistantResponseFormatReminder } from "../src/agent/prompt.js";
-import { requestScopeTools, type RequestScope } from "../src/agent/request-scope.js";
 import { AgentRunStore } from "../src/agent/store.js";
 import { ConnectionStore } from "../src/connections/store.js";
 import type { ConnectionCapability } from "../src/connections/types.js";
@@ -63,28 +62,10 @@ afterEach(async () => {
 
 class FakeModel implements AssistantModel {
   readonly requests: ModelRequest[] = [];
-  readonly scopeRequests: ModelRequest[] = [];
   readonly maintenanceRequests: MemoryMaintenanceRequest[] = [];
   readonly responses: ModelResponse[] = [];
-  /**
-   * The current-request scope is a fixture, never a second English classifier:
-   * each test states the scope its inbound text earns, and the JSON-mode
-   * classification request is recorded apart from ordinary loop requests.
-   */
-  scope: RequestScope = "read";
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
-    if (request.responseFormat === "json") {
-      this.scopeRequests.push(request);
-      return {
-        id: `scope_${this.scopeRequests.length}`,
-        content: JSON.stringify({ scope: this.scope }),
-        providerState: null,
-        toolCalls: [],
-        finishReason: "stop",
-        usage: { promptTokens: 8, completionTokens: 4, totalTokens: 12 },
-      };
-    }
     this.requests.push(request);
     return (
       this.responses.shift() ?? {
@@ -440,15 +421,6 @@ describe("production runtime", () => {
     expect(count(item.runtime, "jobs")).toBe(1);
 
     await runNextJob(item.runtime, Date.now() + 10);
-
-    expect(model.scopeRequests).toHaveLength(1);
-    expect(model.scopeRequests[0]?.responseFormat).toBe("json");
-    expect(model.scopeRequests[0]?.tools).toEqual([]);
-    expect(model.scopeRequests[0]?.messages).toHaveLength(2);
-    expect(model.scopeRequests[0]?.messages.at(-1)).toEqual({
-      role: "user",
-      content: "Hello",
-    });
     expect(model.requests).toHaveLength(1);
     expect(model.maintenanceRequests).toHaveLength(0);
     // The registry still carries every provider tool; one request only offers
@@ -464,14 +436,6 @@ describe("production runtime", () => {
       "notion.update_page",
     ];
     expect(item.runtime.tools.definitions().map((tool) => tool.name)).toEqual(providerToolNames);
-    expect(model.requests[0]?.tools.map((tool) => tool.name).sort()).toEqual(
-      [...requestScopeTools.read].sort(),
-    );
-    expect(
-      item.runtime.database.db
-        .prepare<[], { request_scope: string | null }>("SELECT request_scope FROM agent_runs")
-        .get(),
-    ).toEqual({ request_scope: "read" });
 
     const traceId = acceptedTraceId(item.runtime);
     const chronology = item.runtime.traces.list(traceId);
@@ -591,7 +555,6 @@ describe("production runtime", () => {
     const oldText = "- [ ] Car wash";
     const newText = "- [ ] Car wash\n- [ ] Pull day";
     const model = new FakeModel();
-    model.scope = "notion_write";
     model.responses.push(
       toolCallResponse("add_task_fetch", {
         id: "call_add_task_fetch",
@@ -646,21 +609,11 @@ describe("production runtime", () => {
         )
         .get(),
     ).toEqual({ body: "📋 added:\npull day is on the list now.", purpose: "reply" });
-    expect(model.scopeRequests).toHaveLength(1);
-    expect(model.requests[0]?.tools.map((tool) => tool.name).sort()).toEqual(
-      [...requestScopeTools.notion_write].sort(),
-    );
-    expect(
-      item.runtime.database.db
-        .prepare<[], { request_scope: string | null }>("SELECT request_scope FROM agent_runs")
-        .get(),
-    ).toEqual({ request_scope: "notion_write" });
   });
 
   describe("typing indicator", () => {
     it("shows one bubble per turn without spending the run's write", async () => {
       const model = new FakeModel();
-      model.scope = "notion_write";
       model.responses.push(
         toolCallResponse("typing_fetch", {
           id: "call_typing_fetch", name: "notion.fetch",
@@ -703,7 +656,6 @@ describe("production runtime", () => {
 
     it("never lets a failed or interrupted bubble touch the turn", async () => {
       const model = new FakeModel();
-      model.scope = "conversation";
       model.responses.push(finalModelResponse("typing_reply", "hey."));
       const gateway = new FakeGateway();
       gateway.typingError = new MessagingProviderError({ message: "Sendblue HTTP 500", kind: "ambiguous", status: 500 });
@@ -733,7 +685,6 @@ describe("production runtime", () => {
 
   it("sets a requested date through one property update", async () => {
     const model = new FakeModel();
-    model.scope = "notion_write";
     model.responses.push(
       toolCallResponse("due_date_fetch", {
         id: "call_due_date_fetch",
@@ -791,7 +742,6 @@ describe("production runtime", () => {
     },
   ])("completes $label with no provider write", async ({ request, response, scope }) => {
     const model = new FakeModel();
-    model.scope = scope;
     model.responses.push(
       toolCallResponse("no_write_fetch", {
         id: "call_no_write_fetch",
@@ -811,9 +761,6 @@ describe("production runtime", () => {
 
     expect(inboundState(item.runtime)).toBe("done");
     expect(notionClients.writes).toEqual([]);
-    expect(model.requests[0]?.tools.map((tool) => tool.name).sort()).toEqual(
-      [...requestScopeTools[scope]].sort(),
-    );
     expect(count(item.runtime, "tool_executions")).toBe(1);
     expect(
       item.runtime.database.db
@@ -832,7 +779,6 @@ describe("production runtime", () => {
   it("reports a proven no-op as unchanged without dispatching a write", async () => {
     const alreadyChecked = "- [x] Clean restroom";
     const model = new FakeModel();
-    model.scope = "notion_write";
     model.responses.push(
       toolCallResponse("unchanged_fetch", {
         id: "call_unchanged_fetch",
@@ -894,7 +840,6 @@ describe("production runtime", () => {
     const oldText = "- [ ] Car wash";
     const newText = "- [x] Car wash";
     const model = new FakeModel();
-    model.scope = "notion_write";
     model.responses.push(
       toolCallResponse("unproven_write", {
         id: "call_unproven_write",
@@ -958,7 +903,6 @@ describe("production runtime", () => {
 
   it("executes neither of two provider writes in one response and hands the rule back", async () => {
     const model = new FakeModel();
-    model.scope = "notion_write";
     model.responses.push({
       id: "two_writes",
       content: "",
@@ -1025,7 +969,6 @@ describe("production runtime", () => {
       argumentsJson: JSON.stringify({ workspace: "Work", pageId: "page_1", command: "update_content", updates: [{ oldText, newText }] }),
     });
     const model = new FakeModel();
-    model.scope = "notion_write";
     model.responses.push(
       toolCallResponse("seq_fetch", { id: "call_seq_fetch", name: "notion.fetch", argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }) }),
       patch(1, "- [ ] Task 1", "- [x] Task 1"),
@@ -1064,7 +1007,6 @@ describe("production runtime", () => {
       argumentsJson: JSON.stringify({ workspace: "Work", pageId: "page_1", command: "update_content", updates: [{ oldText, newText }] }),
     });
     const model = new FakeModel();
-    model.scope = "notion_write";
     model.responses.push(
       toolCallResponse("stale_fetch", { id: "call_stale_fetch", name: "notion.fetch", argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }) }),
       patch(1, "- [ ] Task 1", "- [x] Task 1"),
@@ -1099,7 +1041,6 @@ describe("production runtime", () => {
       }),
     });
     const model = new FakeModel();
-    model.scope = "notion_write";
     model.responses.push(
       toolCallResponse("batch_fetch", { id: "call_batch_fetch", name: "notion.fetch", argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }) }),
       { ...toolCallResponse("batch_writes", patch(1)), toolCalls: [patch(1), patch(2), patch(3), patch(4)] },
@@ -1126,9 +1067,8 @@ describe("production runtime", () => {
     expect(item.runtime.database.db.prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM write_intents WHERE kind = 'notion_update_page'").get()?.count).toBe(0);
   });
 
-  it("answers a greeting after failed write requests with read tools only and no provider call", async () => {
+  it("answers a greeting after failed write requests with no provider call", async () => {
     const model = new FakeModel();
-    model.scope = "conversation";
     model.responses.push(finalModelResponse("greeting_reply", "hey. what do you need?"));
     const notionClients = new FakeNotionClients(true, notionTaskPage);
     const gateway = new FakeGateway();
@@ -1157,21 +1097,7 @@ describe("production runtime", () => {
       .run();
 
     await runNextJob(item.runtime, Date.now() + 10);
-
-    expect(model.scopeRequests).toHaveLength(1);
-    expect(model.scopeRequests[0]?.responseFormat).toBe("json");
-    expect(model.scopeRequests[0]?.tools).toEqual([]);
-    expect(model.scopeRequests[0]?.messages).toHaveLength(2);
-    expect(model.scopeRequests[0]?.messages.at(-1)).toEqual({
-      role: "user",
-      content: "Hey annie",
-    });
-    expect(JSON.stringify(model.scopeRequests[0]?.messages ?? [])).not.toContain(
-      "clean restroom",
-    );
     expect(model.requests).toHaveLength(1);
-    expect(model.requests[0]?.tools.map((tool) => tool.name).sort()).toEqual([...requestScopeTools.read].sort());
-    expect(model.requests[0]?.tools.map((tool) => tool.name)).not.toContain("notion.update_page");
     expect(model.requests[0]?.messages.filter((message) => message.role === "user")).toEqual([
       { role: "user", content: "Hey annie" },
     ]);
@@ -1196,378 +1122,10 @@ describe("production runtime", () => {
     ).toBe(0);
     expect(
       item.runtime.database.db
-        .prepare<[], { request_scope: string | null }>("SELECT request_scope FROM agent_runs")
-        .get(),
-    ).toEqual({ request_scope: "conversation" });
-    expect(
-      item.runtime.database.db
         .prepare<[], { body: string; purpose: string }>("SELECT body, purpose FROM egress_messages")
         .get(),
     ).toEqual({ body: "hey. what do you need?", purpose: "reply" });
   });
-
-  it.each(["conversation", "read"] as const)(
-    "prepares no tool execution for a Notion write %s scope forbids",
-    async (scope) => {
-      const model = new FakeModel();
-      model.scope = scope;
-      model.responses.push(
-        toolCallResponse("forbidden_write", {
-          id: "call_forbidden_write",
-          name: "notion.update_page",
-          argumentsJson: JSON.stringify({
-            workspace: "Work",
-            pageId: "page_1",
-            command: "update_content",
-            updates: [{ oldText: "- [ ] Car wash", newText: "- [x] Car wash" }],
-          }),
-        }),
-      );
-      const notionClients = new FakeNotionClients(true, notionTaskPage);
-      const gateway = new FakeGateway();
-      const item = await newRuntime(model, gateway, { notionClients });
-      connectNotion(item);
-      gateway.inbox.push(inboundMessage("msg_forbidden_write", { text: "hey annie" }));
-
-      await sweep(item);
-      await runNextJob(item.runtime, Date.now() + 10);
-
-      expect(model.requests[0]?.tools.map((tool) => tool.name)).not.toContain(
-        "notion.update_page",
-      );
-      expect(notionClients.writes).toEqual([]);
-      expect(count(item.runtime, "tool_executions")).toBe(0);
-      expect(
-        item.runtime.database.db
-          .prepare<[], { count: number }>(
-            "SELECT COUNT(*) AS count FROM write_intents WHERE kind NOT LIKE 'sendblue_%'",
-          )
-          .get()?.count,
-      ).toBe(0);
-      expect(
-        item.runtime.database.db
-          .prepare<[], { phase: string; failure_code: string | null }>(
-            "SELECT phase, failure_code FROM agent_runs",
-          )
-          .get(),
-      ).toEqual({ phase: "blocked", failure_code: "tool_not_allowed" });
-      expect(
-        item.runtime.database.db
-          .prepare<[], { purpose: string }>("SELECT purpose FROM egress_messages")
-          .all(),
-      ).toEqual([{ purpose: "failure" }]);
-    },
-  );
-
-  it("keeps a question about an earlier write read-only", async () => {
-    const question = "did you mark clean restroom done?";
-    const model = new FakeModel();
-    model.scope = "read";
-    model.responses.push(
-      toolCallResponse("past_write_fetch", {
-        id: "call_past_write_fetch",
-        name: "notion.fetch",
-        argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
-      }),
-      finalModelResponse(
-        "past_write_answer",
-        "🧐 checked the page:\n› clean restroom is checked off.",
-      ),
-    );
-    const notionClients = new FakeNotionClients(true, notionTaskPage);
-    const gateway = new FakeGateway();
-    const item = await newRuntime(model, gateway, { notionClients });
-    connectNotion(item);
-    gateway.inbox.push(
-      inboundMessage("msg_past_write", { text: "mark clean restroom done" }),
-      inboundMessage("msg_past_write_question", { text: question }),
-    );
-
-    await sweep(item);
-    item.runtime.database.db
-      .prepare("UPDATE inbound_messages SET state = 'blocked' WHERE guid = 'msg_past_write'")
-      .run();
-    item.runtime.database.db
-      .prepare(`
-        UPDATE jobs SET status = 'failed'
-        WHERE type = 'inbound'
-          AND subject_id = (SELECT id FROM inbound_messages WHERE guid = 'msg_past_write')
-      `)
-      .run();
-
-    await runNextJob(item.runtime, Date.now() + 10);
-
-    expect(model.scopeRequests).toHaveLength(1);
-    expect(model.scopeRequests[0]?.messages.at(-1)).toEqual({ role: "user", content: question });
-    expect(model.requests[0]?.tools.map((tool) => tool.name).sort()).toEqual(
-      [...requestScopeTools.read].sort(),
-    );
-    expect(notionClients.writes).toEqual([]);
-    expect(
-      item.runtime.database.db
-        .prepare<[], { count: number }>(
-          "SELECT COUNT(*) AS count FROM write_intents WHERE kind NOT LIKE 'sendblue_%'",
-        )
-        .get()?.count,
-    ).toBe(0);
-    expect(
-      item.runtime.database.db
-        .prepare<[], { request_scope: string | null }>("SELECT request_scope FROM agent_runs")
-        .get(),
-    ).toEqual({ request_scope: "read" });
-  });
-
-  describe("an answer to Annie's last question", () => {
-    const offer = "clean restroom is still unchecked. want me to check it off?";
-
-    async function deliveredOffer(model: FakeModel, gateway: FakeGateway, item: TrackedRuntime): Promise<void> {
-      model.scope = "read";
-      model.responses.push(finalModelResponse("offer_reply", offer));
-      gateway.inbox.push(inboundMessage("msg_offer_question", { text: "is the restroom done?" }));
-      await sweep(item);
-      await drainJobs(item.runtime);
-      expect(
-        item.runtime.database.db
-          .prepare<[], { state: string }>("SELECT state FROM egress_messages")
-          .get(),
-      ).toEqual({ state: "delivered" });
-    }
-
-    async function classifyFollowUp(model: FakeModel, gateway: FakeGateway, item: TrackedRuntime, text: string): Promise<ModelRequest> {
-      model.scope = "conversation";
-      model.responses.push(finalModelResponse("follow_up_reply", "ok."));
-      gateway.inbox.push(inboundMessage("msg_follow_up", { text }));
-      await sweep(item);
-      await runNextJob(item.runtime, Date.now() + 10);
-      const request = model.scopeRequests.at(-1);
-      if (request === undefined) {
-        throw new Error("Expected a classification request");
-      }
-      return request;
-    }
-
-    it("shows the classifier only Annie's delivered reply and the raw answer", async () => {
-      const model = new FakeModel();
-      const gateway = new FakeGateway();
-      const item = await newRuntime(model, gateway, { notionClients: new FakeNotionClients(true, notionTaskPage) });
-      connectNotion(item);
-      await deliveredOffer(model, gateway, item);
-
-      const request = await classifyFollowUp(model, gateway, item, "yes");
-
-      expect(request.messages).toHaveLength(2);
-      expect(request.messages[0]?.content).toContain(`«${offer}»`);
-      expect(request.messages[0]?.content).not.toContain("is the restroom done?");
-      expect(request.messages[1]).toEqual({ role: "user", content: "yes" });
-      expect(
-        item.runtime.traces
-          .list(acceptedTraceIdFor(item.runtime, "msg_follow_up"))
-          .filter((event) => event.event === "preceding_reply")
-          .map((event) => event.outcome),
-      ).toEqual(["reply"]);
-    });
-
-    it.each([
-      {
-        label: "the reply never confirmed delivery",
-        arrange: (item: TrackedRuntime) => {
-          item.runtime.database.db.prepare("UPDATE egress_messages SET state = 'delivery_unknown'").run();
-        },
-      },
-      {
-        label: "the reply is older than the follow-up window",
-        arrange: (item: TrackedRuntime) => {
-          item.runtime.database.db
-            .prepare("UPDATE egress_messages SET created_at_ms = created_at_ms - 31 * 60 * 1000, updated_at_ms = updated_at_ms - 31 * 60 * 1000")
-            .run();
-        },
-      },
-      {
-        label: "delivery was confirmed only after the answer was sent",
-        arrange: (item: TrackedRuntime) => {
-          // Crossed messages: the user's answer left their phone before Annie's question
-          // was known to have arrived, so it cannot be answering it.
-          item.runtime.database.db
-            .prepare("UPDATE egress_messages SET updated_at_ms = updated_at_ms + 60 * 60 * 1000")
-            .run();
-        },
-      },
-      {
-        label: "something else reached the user after the reply",
-        arrange: (item: TrackedRuntime) => {
-          const db = item.runtime.database.db;
-          db.prepare(`
-            INSERT INTO egress_messages(
-              id, run_id, trace_id, recipient_handle, line_handle, body, purpose, state,
-              attempt_count, created_at_ms, updated_at_ms
-            )
-            SELECT 'eg_brief', NULL, 'tr_00000000000000000000000000000001', recipient_handle, line_handle,
-                   'morning brief', 'reply', 'delivered', 1, created_at_ms + 1, created_at_ms + 1
-            FROM egress_messages
-          `).run();
-        },
-      },
-    ])("gives the classifier nothing when $label", async ({ arrange }) => {
-      const model = new FakeModel();
-      const gateway = new FakeGateway();
-      const item = await newRuntime(model, gateway, { notionClients: new FakeNotionClients(true, notionTaskPage) });
-      connectNotion(item);
-      await deliveredOffer(model, gateway, item);
-      arrange(item);
-
-      const request = await classifyFollowUp(model, gateway, item, "yes");
-
-      expect(request.messages).toHaveLength(2);
-      expect(request.messages[0]?.content).not.toContain(offer);
-      expect(
-        item.runtime.traces
-          .list(acceptedTraceIdFor(item.runtime, "msg_follow_up"))
-          .filter((event) => event.event === "preceding_reply")
-          .map((event) => event.outcome),
-      ).toEqual(["none"]);
-    });
-
-    it("offers a delivered failure notice as a retry target, never as Annie's offer", async () => {
-      // Production: a turn failed, the notice was delivered, the user sent "Try again".
-      // The classifier sees the user's own failed request and the scope it earned, so a
-      // retry repeats it; Annie's older offer is not what the user is answering.
-      const model = new FakeModel();
-      const gateway = new FakeGateway();
-      const item = await newRuntime(model, gateway, { notionClients: new FakeNotionClients(true, notionTaskPage) });
-      connectNotion(item);
-      await deliveredOffer(model, gateway, item);
-      model.scope = "notion_write";
-      model.responses.push({
-        id: "empty_reply", content: "", providerState: null, toolCalls: [], finishReason: "stop",
-        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
-      });
-      gateway.inbox.push(inboundMessage("msg_failed_turn", { text: "mark it done" }));
-      await sweep(item);
-      await drainJobs(item.runtime);
-      expect(
-        item.runtime.database.db
-          .prepare<[], { purpose: string }>("SELECT purpose FROM egress_messages ORDER BY created_at_ms DESC LIMIT 1")
-          .get(),
-      ).toEqual({ purpose: "failure" });
-
-      const request = await classifyFollowUp(model, gateway, item, "Try again");
-
-      const policy = request.messages[0]?.content ?? "";
-      expect(policy).not.toContain(offer);
-      expect(policy).toContain("«mark it done»");
-      expect(policy).toContain("was classified notion_write");
-      expect(
-        item.runtime.traces
-          .list(acceptedTraceIdFor(item.runtime, "msg_follow_up"))
-          .filter((event) => event.event === "preceding_reply")
-          .map((event) => event.outcome),
-      ).toEqual(["failure"]);
-    });
-
-    it("gives the classifier nothing after a failure whose run never earned a scope", async () => {
-      // A media-only or otherwise unclassified failure has no scope to repeat under.
-      const model = new FakeModel();
-      const gateway = new FakeGateway();
-      const item = await newRuntime(model, gateway, { notionClients: new FakeNotionClients(true, notionTaskPage) });
-      connectNotion(item);
-      gateway.inbox.push(inboundMessage("msg_media_only", { text: null, hasMedia: true }));
-      await sweep(item);
-      await drainJobs(item.runtime);
-      expect(
-        item.runtime.database.db
-          .prepare<[], { purpose: string }>("SELECT purpose FROM egress_messages ORDER BY created_at_ms DESC LIMIT 1")
-          .get(),
-      ).toEqual({ purpose: "failure" });
-
-      const request = await classifyFollowUp(model, gateway, item, "try again");
-
-      expect(request.messages[0]?.content).not.toContain("failure notice");
-      expect(
-        item.runtime.traces
-          .list(acceptedTraceIdFor(item.runtime, "msg_follow_up"))
-          .filter((event) => event.event === "preceding_reply")
-          .map((event) => event.outcome),
-      ).toEqual(["none"]);
-    });
-  });
-
-  it("reuses a persisted request scope instead of classifying the resumed turn again", async () => {
-    const request = "mark car wash done";
-    const oldText = "- [ ] Car wash";
-    const newText = "- [x] Car wash";
-    const model = new FakeModel();
-    // A second classification would answer with a scope that strips the write
-    // tool, so any re-classification on resume fails this test.
-    model.scope = "conversation";
-    model.responses.push(
-      toolCallResponse("resumed_fetch", {
-        id: "call_resumed_fetch",
-        name: "notion.fetch",
-        argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }),
-      }),
-      toolCallResponse("resumed_write", {
-        id: "call_resumed_write",
-        name: "notion.update_page",
-        argumentsJson: JSON.stringify({
-          workspace: "Work",
-          pageId: "page_1",
-          command: "update_content",
-          updates: [{ oldText, newText }],
-        }),
-      }),
-      finalModelResponse("resumed_done", "✅ done:\n› car wash is checked off."),
-    );
-    const notionClients = new FakeNotionClients(true, notionTaskPage);
-    const gateway = new FakeGateway();
-    const item = await newRuntime(model, gateway, { notionClients });
-    connectNotion(item);
-    gateway.inbox.push(inboundMessage("msg_resumed_scope", { text: request }));
-
-    await sweep(item);
-    const job = requiredJob(item.runtime.queue.claim(Date.now() + 10));
-    const inbound = item.runtime.database.db
-      .prepare<[], { id: string; trace_id: string }>(
-        "SELECT id, trace_id FROM inbound_messages",
-      )
-      .get();
-    if (inbound === undefined) {
-      throw new Error("Expected a resumed-scope inbound");
-    }
-    const runs = new AgentRunStore(item.runtime.database.db, item.runtime.traces);
-    const run = runs.startOrResume({
-      source: { kind: "inbound", inboundId: asInboundId(inbound.id) },
-      traceId: asTraceId(inbound.trace_id),
-      deadlineAtMs: Date.now() + 60_000,
-    });
-    runs.bindJob(run.id, job.id, job.leaseToken);
-    runs.setRequestScope(run.id, "notion_write", {
-      jobId: job.id,
-      leaseToken: job.leaseToken,
-    });
-    const context: JobContext = {
-      signal: new AbortController().signal,
-      nowMs: () => Date.now(),
-      assertLease: () => item.runtime.queue.assertLease(job),
-    };
-
-    await item.runtime.handlers.inbound(job, context);
-    item.runtime.queue.complete(job);
-
-    expect(model.scopeRequests).toEqual([]);
-    expect(runs.getRequired(run.id).requestScope).toBe("notion_write");
-    expect(model.requests[0]?.tools.map((tool) => tool.name).sort()).toEqual(
-      [...requestScopeTools.notion_write].sort(),
-    );
-    expect(notionClients.writes).toHaveLength(1);
-    expect(
-      item.runtime.database.db
-        .prepare<[], { state: string }>(
-          "SELECT state FROM write_intents WHERE kind NOT LIKE 'sendblue_%'",
-        )
-        .all(),
-    ).toEqual([{ state: "succeeded" }]);
-  });
-
 
   it("durably schedules one local eight-AM job across daylight-saving offsets", async () => {
     const item = await newRuntime(new FakeModel(), new FakeGateway(), {
@@ -1954,7 +1512,6 @@ describe("production runtime", () => {
     ]);
     // A scheduled brief never runs through InboundTurnService, so it has no
     // classified request scope.
-    expect(model.scopeRequests).toEqual([]);
     const briefSystemPrompt = model.requests[0]?.messages.find(
       (message) => message.role === "system",
     )?.content;
@@ -2416,7 +1973,6 @@ describe("production runtime", () => {
     expect(health.statusCode).toBe(200);
     expect(webhook.statusCode).toBe(404);
     expect(model.requests).toHaveLength(0);
-    expect(model.scopeRequests).toHaveLength(0);
     expect(model.maintenanceRequests).toHaveLength(0);
     expect(gateway.listCalls).toHaveLength(0);
     expect(gateway.streamOpens).toBe(0);
@@ -2424,63 +1980,8 @@ describe("production runtime", () => {
     expect(gateway.statusReads).toHaveLength(0);
   });
 
-  it.each([
-    { state: "running", scope: "conversation", request: "Hey annie", provider: "notion" },
-    { state: "running", scope: "connect_google", request: "connect google", provider: "notion" },
-    { state: "completed", scope: "connect_google", request: "connect google", provider: "google" },
-  ] as const)("does not fulfill an unauthorized answered connect from a $state run", async (fixture) => {
-    const model = new FakeModel();
-    model.scope = fixture.scope;
-    model.responses.push(finalModelResponse("legacy_final", "Here is your connection link."));
-    const gateway = new FakeGateway();
-    const item = await newRuntime(model, gateway);
-    gateway.inbox.push(inboundMessage("legacy_connect", { text: fixture.request }));
-    await sweep(item);
-    const job = requiredJob(item.runtime.queue.claim(Date.now() + 10));
-    const runs = new AgentRunStore(item.runtime.database.db, item.runtime.traces);
-    const run = runs.startOrResume({
-      source: { kind: "inbound", inboundId: asInboundId(job.subjectId) },
-      traceId: job.traceId,
-      deadlineAtMs: Date.now() + 60_000,
-    });
-    runs.bindJob(run.id, job.id, job.leaseToken);
-    runs.appendInitialMessages(run.id, [{ role: "user", content: fixture.request }]);
-    const call = {
-      id: "answered_legacy_connect",
-      name: "connections.connect",
-      argumentsJson: JSON.stringify({ provider: fixture.provider }),
-    };
-    runs.appendAssistant(run.id, toolCallResponse("legacy_control", call));
-    const execution = runs.prepareTool({
-      runId: run.id, call, operationClass: "read", maximumToolCalls: 16,
-    });
-    runs.markToolRunning(execution.id);
-    const result = { provider: fixture.provider, connectionLinkWillBeAppended: true };
-    runs.finishTool(execution.id, "succeeded", result);
-    runs.appendToolMessage(run.id, call.id, JSON.stringify(result));
-    if (fixture.state === "completed") {
-      runs.complete(run.id, "Here is your connection link.");
-    }
-
-    await item.runtime.handlers.inbound(job, {
-      signal: new AbortController().signal,
-      nowMs: () => Date.now(),
-      assertLease: () => item.runtime.queue.assertLease(job),
-    });
-    item.runtime.queue.complete(job);
-
-    expect(item.runtime.database.db.prepare(
-      "SELECT COUNT(*) AS count FROM oauth_link_tokens",
-    ).get()).toEqual({ count: 0 });
-    expect(item.runtime.database.db.prepare(
-      "SELECT COUNT(*) AS count FROM egress_messages WHERE purpose = 'recovery'",
-    ).get()).toEqual({ count: 0 });
-    expect(model.scopeRequests).toHaveLength(fixture.state === "running" ? 1 : 0);
-  });
-
   it("issues a model-routed connection link once and repeats nothing on resume", async () => {
     const model = new FakeModel();
-    model.scope = "connect_google";
     model.responses.push(
       {
         id: "connect_tool",
@@ -2518,8 +2019,7 @@ describe("production runtime", () => {
       .prepare<[], { body: string }>("SELECT body FROM egress_messages WHERE purpose = 'recovery'")
       .get();
     expect(model.requests).toHaveLength(2);
-    expect(model.scopeRequests).toHaveLength(1);
-    expect(model.requests[0]?.tools.map((tool) => tool.name)).toEqual(["connections.connect"]);
+    expect(model.requests[0]?.tools.map((tool) => tool.name)).toContain("connections.connect");
     expect(model.requests[1]?.messages.at(-2)).toEqual({
       role: "tool",
       content: '{"connectionLinkWillBeAppended":true,"provider":"google"}',
@@ -2544,8 +2044,6 @@ describe("production runtime", () => {
         WHERE type = 'inbound'
       `)
       .run({ now_ms: retryAtMs });
-    // A pre-scope link already issued must remain idempotent after an upgrade.
-    item.runtime.database.db.prepare("UPDATE agent_runs SET request_scope = NULL").run();
     item.runtime.database.db
       .prepare<{ future_ms: number }>(`
         UPDATE jobs SET available_at_ms = @future_ms WHERE type = 'egress_send'
@@ -2581,7 +2079,6 @@ describe("production runtime", () => {
       failure_messages: 0,
     });
     expect(model.requests).toHaveLength(2);
-    expect(model.scopeRequests).toHaveLength(1);
   });
 
   it.each([
@@ -2599,7 +2096,6 @@ describe("production runtime", () => {
     "rejects unsafe model-authored connection-link content %s before issuing a link",
     async (unsafeContent) => {
     const model = new FakeModel();
-    model.scope = "connect_google";
     model.responses.push(
       {
         id: "connect_tool_with_unsafe_answer",
@@ -2648,7 +2144,7 @@ describe("production runtime", () => {
     },
   );
 
-  it("rejects a connection tool the current request scope does not allow", async () => {
+  it("rejects a connection tool that follows another tool call", async () => {
     const model = new FakeModel();
     model.responses.push(
       {
@@ -2712,7 +2208,6 @@ describe("production runtime", () => {
   });
   it("re-evaluates the stateful guard between tool calls in one model response", async () => {
     const model = new FakeModel();
-    model.scope = "connect_notion";
     model.responses.push({
       id: "two_connect_calls_same_response",
       content: "",
@@ -2742,7 +2237,7 @@ describe("production runtime", () => {
     await runNextJob(item.runtime, Date.now() + 10);
 
     expect(model.requests).toHaveLength(1);
-    expect(model.requests[0]?.tools.map((tool) => tool.name)).toEqual(["connections.connect"]);
+    expect(model.requests[0]?.tools.map((tool) => tool.name)).toContain("connections.connect");
     expect(
       item.runtime.database.db
         .prepare<[], { tool_name: string }>(
@@ -2763,46 +2258,6 @@ describe("production runtime", () => {
         .get()?.failure_code,
     ).toBe("tool_not_allowed");
   });
-
-  it("rejects a connect tool whose provider is not the current request's", async () => {
-    const model = new FakeModel();
-    model.scope = "connect_google";
-    model.responses.push(
-      toolCallResponse("mismatched_connect", {
-        id: "call_mismatched_connect",
-        name: "connections.connect",
-        argumentsJson: '{"provider":"notion"}',
-      }),
-    );
-    const gateway = new FakeGateway();
-    const item = await newRuntime(model, gateway);
-    gateway.inbox.push(
-      inboundMessage("msg_mismatched_connect", { text: "connect my google account" }),
-    );
-
-    await sweep(item);
-    await runNextJob(item.runtime, Date.now() + 10);
-
-    expect(count(item.runtime, "tool_executions")).toBe(0);
-    expect(
-      item.runtime.database.db
-        .prepare<[], { count: number }>(
-          "SELECT COUNT(*) AS count FROM oauth_link_tokens WHERE purpose = 'connect'",
-        )
-        .get()?.count,
-    ).toBe(0);
-    expect(
-      item.runtime.database.db
-        .prepare<[], { failure_code: string | null }>("SELECT failure_code FROM agent_runs")
-        .get()?.failure_code,
-    ).toBe("tool_not_allowed");
-    expect(
-      item.runtime.database.db
-        .prepare<[], { purpose: string }>("SELECT purpose FROM egress_messages")
-        .all(),
-    ).toEqual([{ purpose: "failure" }]);
-  });
-
 
   it("lets Annie answer from an authoritative empty connection-tool result", async () => {
     const model = new FakeModel();
@@ -2984,7 +2439,6 @@ describe("production runtime", () => {
     await runNextJob(item.runtime, Date.now() + 10);
 
     expect(model.requests).toHaveLength(0);
-    expect(model.scopeRequests).toHaveLength(0);
     expect(inboundState(item.runtime)).toBe("blocked");
     expect(
       item.runtime.database.db
@@ -3110,7 +2564,6 @@ describe("production runtime", () => {
     item.runtime.queue.complete(job);
 
     expect(model.requests).toHaveLength(0);
-    expect(model.scopeRequests).toHaveLength(0);
     expect(model.maintenanceRequests).toHaveLength(0);
     expect(
       item.runtime.database.db
@@ -3193,7 +2646,6 @@ describe("production runtime", () => {
     await runNextJob(second, Date.now() + 40);
 
     expect(model.requests).toHaveLength(2);
-    expect(model.scopeRequests).toHaveLength(2);
     expect(count(second, "agent_runs")).toBe(2);
     expect(
       second.database.db

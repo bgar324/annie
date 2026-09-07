@@ -58,18 +58,7 @@ const modelCallSchema = z.object({
   response_format: z.object({ type: z.string() }).optional(),
   tools: z.array(z.unknown()).optional(),
 });
-const responseSchema = z.object({
-  choices: z.array(z.object({
-    finish_reason: z.string().nullish(),
-    message: z.object({ content: z.string().nullish() }).loose(),
-  }).loose()).min(1),
-}).loose();
-type ModelCall = z.infer<typeof modelCallSchema> & {
-  kind: "classifier" | "agent" | "memory";
-  durationMs: number;
-  finishReason: string | null;
-  verdict: string | null;
-};
+type ModelCall = z.infer<typeof modelCallSchema> & { kind: "agent" | "memory"; durationMs: number };
 let modelCalls: ModelCall[] = [];
 let blockedRequests = 0;
 globalThis.fetch = async (input, init) => {
@@ -86,14 +75,7 @@ globalThis.fetch = async (input, init) => {
   const body = await response.text();
   if (parsed !== undefined) {
     const head = parsed.messages[0]?.content ?? "";
-    const kind = head.startsWith("You are Annie") ? "agent" : head.startsWith("Maintain the canonical") ? "memory" : "classifier";
-    const choice = response.ok ? responseSchema.safeParse(JSON.parse(body)) : undefined;
-    const first = choice?.success === true ? choice.data.choices[0] : undefined;
-    modelCalls.push({
-      ...parsed, kind, durationMs: Date.now() - startedAt,
-      finishReason: first?.finish_reason ?? null,
-      verdict: kind === "classifier" ? (first?.message.content ?? null) : null,
-    });
+    modelCalls.push({ ...parsed, kind: head.startsWith("Maintain the canonical") ? "memory" : "agent", durationMs: Date.now() - startedAt });
   }
   return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
 };
@@ -127,12 +109,8 @@ interface CaseResult {
   latencyMs: number;
   firstReplyMs: number;
   rounds: number;
-  classifierMs: number[];
   agentMs: number[];
   tools: string[];
-  scopes: (string | null)[];
-  /** Raw classifier output and finish reason, so a scope miss is diagnosable after eviction. */
-  verdicts: string[];
   reply: string;
   error?: string;
   artifacts?: string;
@@ -177,7 +155,7 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
   let runtime = await createRuntime(config, overrides);
   const result: CaseResult = {
     name: smokeCase.name, category: smokeCase.category, iteration, passed: false, passThrough: false,
-    latencyMs: 0, firstReplyMs: 0, rounds: 0, classifierMs: [], agentMs: [], tools: [], scopes: [], verdicts: [], reply: "",
+    latencyMs: 0, firstReplyMs: 0, rounds: 0, agentMs: [], tools: [], reply: "",
   };
   try {
     runtime.localUi.connections.saveAuthorization({
@@ -218,8 +196,8 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
     const db = runtime.database.db;
     const observation: Observation = {
       texts: smokeCase.texts,
-      runs: db.prepare<[], { phase: string; request_scope: string | null }>(`
-        SELECT runs.phase, runs.request_scope FROM agent_runs AS runs
+      runs: db.prepare<[], { phase: string }>(`
+        SELECT runs.phase FROM agent_runs AS runs
         JOIN inbound_messages AS inbound ON inbound.id = runs.inbound_id
         WHERE runs.id <> 'run_offer' ORDER BY inbound.sequence
       `).all(),
@@ -237,12 +215,8 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
     result.latencyMs = (sentAt.at(-1) ?? startedAt) - startedAt;
     result.firstReplyMs = (sentAt[0] ?? startedAt) - startedAt;
     result.rounds = modelCalls.filter((call) => call.kind === "agent").length;
-    result.classifierMs = modelCalls.filter((call) => call.kind === "classifier").map((call) => call.durationMs);
     result.agentMs = modelCalls.filter((call) => call.kind === "agent").map((call) => call.durationMs);
     result.tools = observation.tools.map((tool) => `${tool.tool_name}:${tool.status}`);
-    result.scopes = observation.runs.map((run) => run.request_scope);
-    result.verdicts = modelCalls.filter((call) => call.kind === "classifier")
-      .map((call) => `${call.finishReason ?? "?"}:${(call.verdict ?? "").replace(/\s+/gu, " ").slice(0, 60)}`);
     result.reply = smokeCase.name === "connect_google"
       ? (sent.at(-1) ?? "").replace(/https:\/\/\S+/gu, "[synthetic signed link]")
       : (sent.at(-1) ?? "");
@@ -259,34 +233,8 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
     assert(sent.every((text) => text.trim().length > 0), "Every reply has user-visible text");
     assert.equal(observation.runs.length, smokeCase.texts.length, "Seeded history must never start a run of its own");
     assert.equal(observation.runs.at(-1)?.phase, purpose === "failure" ? "blocked" : "completed");
-    for (const [index, expected] of smokeCase.scopes.entries()) {
-      if (expected !== null) assert.equal(observation.runs[index]?.request_scope, expected, `Classification of text ${index + 1}`);
-    }
-    const scopeCalls = modelCalls.filter((call) => call.kind === "classifier");
     const loopCalls = modelCalls.filter((call) => call.kind === "agent");
-    assert(scopeCalls.length >= smokeCase.texts.length && loopCalls.length >= 1, "Real scope and agent calls happened");
-    for (const call of scopeCalls) {
-      assert.equal(call.response_format?.type, "json_object");
-      assert.equal(call.tools, undefined, "The classifier is offered no tools");
-      assert.equal(call.messages.length, 2, "Classifier sees one policy plus the raw request");
-      assert(smokeCase.texts.includes(call.messages[1]?.content ?? ""), "The classifier sees the raw request");
-      for (const past of seeded) {
-        assert(!call.messages.some((message) => (message.content ?? "").includes(past)), "History must never reach the classifier");
-      }
-      if (smokeCase.exchange !== undefined) {
-        const policy = call.messages[0]?.content ?? "";
-        const fresh = smokeCase.exchange.state === "delivered" && smokeCase.exchange.ageMs < 30 * 60_000;
-        if (smokeCase.exchange.failedScope === undefined) {
-          assert(!policy.includes(smokeCase.exchange.question), "The user's earlier message never reaches the classifier");
-          assert.equal(policy.includes(smokeCase.exchange.reply), fresh, "Only a fresh delivered reply reaches the classifier");
-        } else {
-          // After a failure notice the classifier sees the failed request itself, as data,
-          // never the notice text.
-          assert.equal(policy.includes(smokeCase.exchange.question), fresh, "A fresh failure exposes the failed request to the classifier");
-          assert(!policy.includes(smokeCase.exchange.reply), "The notice text itself never reaches the classifier");
-        }
-      }
-    }
+    assert(loopCalls.length >= 1, "A real agent call happened");
     for (const call of loopCalls) {
       const live = call.messages.filter((message) => message.role === "user");
       assert.equal(live.length, 1, "Only the current inbound is a live user message");
@@ -328,7 +276,6 @@ function summarize(label: string, rows: readonly CaseResult[]): string {
     `latency p50=${String(percentile(latency, 0.5)).padStart(6)}ms p95=${String(percentile(latency, 0.95)).padStart(6)}ms`,
     `rounds p50=${percentile(rows.map((row) => row.rounds), 0.5)}`,
     `agent call p50=${percentile(agent, 0.5)}ms p95=${percentile(agent, 0.95)}ms`,
-    `classifier p50=${percentile(rows.flatMap((row) => row.classifierMs), 0.5)}ms`,
   ].join("  ");
 }
 
