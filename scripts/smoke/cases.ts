@@ -141,7 +141,9 @@ export const cases: readonly SmokeCase[] = [
     texts: [requests.mark_restroom], notion: { fetchFails: true },
     expect(o) {
       noProviderWrite(o);
-      assert(o.tools.some((tool) => tool.tool_name === "notion.fetch" && tool.status === "failed"));
+      // Either read proves the point; the prompt offers notion.search with hydrate or
+      // notion.fetch, so pinning one of them pins a model preference, not the contract.
+      assert(o.tools.some((tool) => tool.tool_name.startsWith("notion.") && tool.status === "failed"));
       answeredInText(o);
     },
   },

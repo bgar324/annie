@@ -63,12 +63,13 @@ describe("assistant prompt", () => {
       Buffer.byteLength(assistantResponseFormatReminder) -
       Buffer.byteLength(memory);
     // Prompt-bloat tripwire, not a provider limit. Raised 4096 → 4352 for the tone line,
-    // → 4608 for the one-retry rule, → 4864 for the never-show-accounts rule, and → 5120
-    // for the act-from-history rule (measured 4914); every raise is a deliberate trade.
-    expect(fixedWireBytes).toBeLessThan(5_120);
+    // → 4608 for the one-retry rule, → 4864 for the never-show-accounts rule, → 5120 for
+    // the act-from-history rule, and → 5376 for the closing brevity rule that cut a
+    // measured reply from 35 words to 21 (measured 5194); every raise is a deliberate trade.
+    expect(fixedWireBytes).toBeLessThan(5_376);
   });
 
-  it("teaches › for list items only and shows an unprefixed closing sentence", () => {
+  it("teaches › for list items only and closes on an unprefixed sentence, not an offer", () => {
     expect(assistantResponseFormatReminder).toContain(`Example:\n${assistantResponseFormatExample}`);
     const lines = assistantResponseFormatExample.split("\n").filter((line) => line.trim() !== "");
     const items = lines.filter((line) => line.startsWith("› "));
@@ -77,7 +78,9 @@ describe("assistant prompt", () => {
     expect(items.length).toBeGreaterThanOrEqual(2);
     expect(headers.length).toBeGreaterThanOrEqual(2);
     expect(sentences).toHaveLength(1);
-    expect(sentences[0]).toMatch(/^[a-z][^›:]*\?$/u);
+    // The closer taught here used to be "want details on either?", so every tool-backed
+    // reply ended by offering more work. A flat statement is the example now.
+    expect(sentences[0]).toMatch(/^[a-z][^›:?]*\.$/u);
     expect(assistantResponseFormatReminder).not.toContain("- ›");
     expect(assistantResponseFormatReminder).not.toContain("**");
     expect(assistantResponseFormatReminder).not.toMatch(/^\s*-/mu);
