@@ -167,8 +167,9 @@ type NotionWriteResult =
       ok: true;
       outcome: "succeeded";
       workspace: { label: string };
-      /** For a content update, carries `page`: the text as applied, the next patch's proof. */
       result: unknown;
+      /** Runtime provenance, persisted on the tool row and never sent to the model. */
+      hidden?: { page: { id: string; text: string; truncated: false } };
     }
   | {
       ok: true;
@@ -597,11 +598,11 @@ export class NotionToolService {
             AND json_extract(pages.value, '$.id') = @page_id
           UNION ALL
           SELECT rowid, json_object('workspace', json_extract(result_json, '$.workspace'),
-                                    'result', json_extract(result_json, '$.result.page')) AS page_json
+                                    'result', json_extract(result_json, '$.hidden.page')) AS page_json
           FROM tool_executions
           WHERE run_id = @run_id AND connection_id = @connection_id
             AND tool_name = 'notion.update_page' AND status = 'succeeded'
-            AND json_extract(result_json, '$.result.page.id') = @page_id
+            AND json_extract(result_json, '$.hidden.page.id') = @page_id
         )
         ORDER BY rowid DESC
         LIMIT 1
@@ -669,7 +670,8 @@ export class NotionToolService {
             ok: true,
             outcome: "succeeded",
             workspace: { label: input.connection.safeLabel },
-            result: input.appliedPage === undefined ? result : { ...(result as object), page: input.appliedPage },
+            result,
+            ...(input.appliedPage === undefined ? {} : { hidden: { page: input.appliedPage } }),
           };
           this.#writes.complete({
             writeId: write.id,

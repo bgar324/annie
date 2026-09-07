@@ -592,8 +592,16 @@ function answeredToolCalls(messages: readonly ModelMessage[]): ReadonlySet<strin
   );
 }
 
+// The transcript copy of a tool result. A `hidden` field is provenance the runtime needs
+// on the persisted row (a write's applied page proves the next patch) and the model does
+// not: echoing a 10 KiB page back after every write grew one production transcript past
+// 38k tokens and cost a 50-second round.
 function boundedToolResult(result: unknown): string {
-  const serialized = canonicalJson(result);
+  const visible =
+    typeof result === "object" && result !== null && !Array.isArray(result) && "hidden" in result
+      ? Object.fromEntries(Object.entries(result).filter(([key]) => key !== "hidden"))
+      : result;
+  const serialized = canonicalJson(visible);
   if (Buffer.byteLength(serialized) <= 131_072) {
     return serialized;
   }

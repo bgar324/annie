@@ -1027,6 +1027,13 @@ describe("production runtime", () => {
     expect(notionClients.pageText).toBe("# Tasks\n- [x] Task 1\n- [ ] Task 1b\n- [ ] Task 2\n");
     const refused = model.requests[3]?.messages.find((message) => message.role === "tool" && message.toolCallId === "call_write_2");
     expect(JSON.parse(refused?.content ?? "null")).toMatchObject({ ok: false, error: { code: "write_target_ambiguous" } });
+    // The applied page proves the next patch from the persisted row; echoing it back to
+    // the model grew a production transcript past 38k tokens, so the transcript copy of a
+    // write result carries no page text.
+    const accepted = model.requests[3]?.messages.find((message) => message.role === "tool" && message.toolCallId === "call_write_1");
+    expect(accepted?.content).not.toContain("Task 2");
+    expect(JSON.parse(accepted?.content ?? "null")).toMatchObject({ ok: true, outcome: "succeeded" });
+    expect(JSON.parse(accepted?.content ?? "null")).not.toHaveProperty("hidden");
   });
 
   it("answers a multi-write response with a rule instead of failing the turn", async () => {
