@@ -70,6 +70,14 @@ export const assistantResponseFormatReminder = [
   ...responseFormatRules,
 ].join("\n");
 
+// The tool budget for this turn is spent. The model must close the turn honestly: what
+// landed, what did not, and what the user can send next.
+export const assistantFinalRoundReminder = [
+  "Rules for the next assistant message:",
+  "No further tool calls are possible in this turn. Answer in plain text now. Report exactly which changes this run's tool results confirm as done, name anything still outstanding, and offer to finish it in a following message. Never describe an unconfirmed change as done.",
+  ...responseFormatRules,
+].join("\n");
+
 export function buildAssistantSystemPrompt(input: {
   memory: string;
   audience: AssistantPromptAudience;

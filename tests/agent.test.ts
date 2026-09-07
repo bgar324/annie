@@ -1187,9 +1187,12 @@ describe("durable bounded agent loop", () => {
     expect(harness.runs.getToolRequired(execution.id).status).toBe("ambiguous");
   });
 
-  it("stops before executing a tool round beyond the configured bound", async () => {
+  it("closes the turn with a text reply when the tool round budget is spent", async () => {
+    // Four checkboxes landed in production and the user was told the request failed. The
+    // cap ends tool use, not the turn: the last round is offered no tools so the model
+    // must report what its results confirm.
     const harness = agentHarness();
-    const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Loop forever");
+    const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Tick them off");
     let executions = 0;
     const registry = new ToolRegistry([
       {
@@ -1200,9 +1203,49 @@ describe("durable bounded agent loop", () => {
         },
       },
     ]);
+    const requests: ModelRequest[] = [];
+    const model = scriptedModel(
+      [
+        toolResponse("first_round", "call_first"),
+        {
+          id: "final_report",
+          content: "✅ ticked the first one; the rest are still open.",
+          providerState: null,
+          toolCalls: [],
+          finishReason: "stop",
+          usage: emptyUsage,
+        },
+      ],
+      requests,
+    );
+    const loop = new AgentLoop({
+      model,
+      tools: registry,
+      runs: harness.runs,
+      writes: harness.writes,
+      limits: { maxToolRounds: 1, maxToolCalls: 4, maxRunMs: 60_000 },
+    });
+
+    const result = await loop.execute({ source: { kind: "inbound", inboundId }, traceId, initialMessages: [{ role: "user", content: "Tick them off" }], });
+
+    expect(result).toMatchObject({
+      outcome: "completed",
+      response: "✅ ticked the first one; the rest are still open.",
+      run: { phase: "completed" },
+    });
+    expect(executions).toBe(1);
+    // The final request offers no tools, so the model cannot ask for another round.
+    expect(requests[0]?.tools).not.toEqual([]);
+    expect(requests[1]?.tools).toEqual([]);
+  });
+
+  it("stops a run that still demands tools with no rounds left", async () => {
+    const harness = agentHarness();
+    const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Loop forever");
+    const registry = new ToolRegistry([echoTool]);
     const model = scriptedModel([
       toolResponse("first_round", "call_first"),
-      toolResponse("second_round", "call_second"),
+      toolResponse("ignores_the_final_round", "call_second"),
     ]);
     const loop = new AgentLoop({
       model,
@@ -1216,7 +1259,6 @@ describe("durable bounded agent loop", () => {
 
     expect(result.outcome).toBe("bounded");
     expect(result.run).toMatchObject({ phase: "blocked", failureCode: "round_limit" });
-    expect(executions).toBe(1);
   });
 
   it("executes six brief reads split across bounded tool rounds", async () => {

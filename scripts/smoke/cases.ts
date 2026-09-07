@@ -166,6 +166,9 @@ export const cases: readonly SmokeCase[] = [
       assert(/\[x\] Clean restroom/u.test(today) && /\[x\] Water plants/u.test(today) && /\[x\] Clean and organize room/u.test(today),
         "All three named boxes are ticked under today");
       assert.equal(o.notion.pages.get("archive"), archivePage);
+      // The reply must report the work, never a failure notice, even at the round cap.
+      assert(/clean restroom/iu.test(lastReply(o)) && /water plants/iu.test(lastReply(o)),
+        "The reply names what was ticked");
     },
   },
   {

@@ -3,7 +3,7 @@ import { ModelSafeError } from "../core/errors.js";
 import type { RunId, TraceId } from "../core/ids.js";
 import { maximumMessageTextCharacters } from "../messages/types.js";
 import type { ChatModel, ModelMessage, ModelToolCall } from "./model.js";
-import { assistantResponseFormatReminder } from "./prompt.js";
+import { assistantFinalRoundReminder, assistantResponseFormatReminder } from "./prompt.js";
 import {
   AgentLimitError,
   AgentRunStore,
@@ -146,13 +146,15 @@ export class AgentLoop {
         const toolRounds = messages.filter(
           (message) => message.role === "assistant" && (message.toolCalls?.length ?? 0) > 0,
         ).length;
-        if (toolRounds > this.#limits.maxToolRounds) {
-          throw new AgentLimitError("round_limit", "The tool round limit was reached");
-        }
+        // The round cap ends tool use, not the turn. Offering no tools forces a text reply,
+        // so a run that did real work reports it instead of discarding it behind a failure
+        // notice: four checkboxes landed and the user was told the request failed.
+        const finalRound = toolRounds >= this.#limits.maxToolRounds;
+        const reminder = finalRound ? assistantFinalRoundReminder : assistantResponseFormatReminder;
         const requestMessages: readonly ModelMessage[] =
-          last?.role === "system" && last.content === assistantResponseFormatReminder
+          last?.role === "system" && last.content === reminder
             ? messages
-            : [...messages, { role: "system", content: assistantResponseFormatReminder }];
+            : [...messages, { role: "system", content: reminder }];
         this.#runs.beginModelRequest(
           run.id,
           this.#limits.maxToolRounds + 1,
@@ -163,7 +165,7 @@ export class AgentLoop {
             traceId: run.traceId,
             runId: run.id,
             messages: requestMessages,
-            tools: toolDefinitions,
+            tools: finalRound ? [] : toolDefinitions,
             signal: runSignal,
           });
         } catch (error) {
@@ -179,7 +181,7 @@ export class AgentLoop {
             "The model returned too many tool calls in one response",
           );
         }
-        if (response.toolCalls.length > 0 && toolRounds >= this.#limits.maxToolRounds) {
+        if (response.toolCalls.length > 0 && finalRound) {
           throw new AgentLimitError("round_limit", "The tool round limit was reached");
         }
       }

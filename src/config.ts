@@ -59,7 +59,7 @@ const runtimeEnvSchema = storageEnvSchema.extend({
   CREDENTIAL_ENCRYPTION_KEY: nonEmpty,
   NOTION_MCP_URL: z.url().default("https://mcp.notion.com/mcp"),
   DAILY_BRIEF_ENABLED: booleanFlag,
-  MAX_AGENT_TOOL_ROUNDS: positiveInteger(6, 12),
+  MAX_AGENT_TOOL_ROUNDS: positiveInteger(12, 24),
   MAX_AGENT_RUN_MS: positiveInteger(120_000, 600_000),
   MAX_AGENT_TOOL_CALLS: positiveInteger(16, 32),
   MEMORY_MAX_BYTES: positiveInteger(16_384, 16_384),
