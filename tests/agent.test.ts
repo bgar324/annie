@@ -1675,6 +1675,78 @@ describe("tool allowlist", () => {
   });
 });
 
+describe("tool argument errors", () => {
+  it("names the fault in the variant the caller aimed at, not every union branch", async () => {
+    // Production: a tasks query with an empty `query` string came back as the calendar
+    // branch's complaints ("must have required property 'timeMin'"), the real fault fell
+    // outside the five-issue budget, the model repeated the same call, and the read failed
+    // twice. The message has to name the field the caller actually got wrong.
+    const registry = new ToolRegistry([
+      {
+        ...echoTool,
+        definition: {
+          name: "probe.search",
+          description: "One product query.",
+          parameters: {
+            type: "object",
+            properties: {
+              query: {
+                oneOf: [
+                  {
+                    type: "object",
+                    properties: { product: { const: "calendar" }, timeMin: { type: "string" }, timeMax: { type: "string" } },
+                    required: ["product", "timeMin", "timeMax"],
+                    additionalProperties: false,
+                  },
+                  {
+                    type: "object",
+                    properties: { product: { const: "tasks" }, text: { type: "string", minLength: 1 } },
+                    required: ["product"],
+                    additionalProperties: false,
+                  },
+                ],
+              },
+            },
+            required: ["query"],
+            additionalProperties: false,
+          },
+        },
+      },
+    ]);
+    await expect(
+      registry.execute({
+        name: "probe.search",
+        argumentsJson: JSON.stringify({ query: { product: "tasks", text: "" } }),
+        context: {
+          runId: newRunId(),
+          traceId: newTraceId(),
+          toolExecutionId: "tool_probe" as never,
+          connectionId: null,
+          replay: false,
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "invalid_arguments",
+      message: expect.stringContaining("/query/text must NOT have fewer than 1 characters"),
+    });
+    await expect(
+      registry.execute({
+        name: "probe.search",
+        argumentsJson: JSON.stringify({ query: { product: "tasks", text: "" } }),
+        context: {
+          runId: newRunId(),
+          traceId: newTraceId(),
+          toolExecutionId: "tool_probe_2" as never,
+          connectionId: null,
+          replay: false,
+        },
+      }),
+    ).rejects.toMatchObject({
+      message: expect.not.stringContaining("timeMin"),
+    });
+  });
+});
+
 const emptyUsage = {
   promptTokens: null,
   completionTokens: null,

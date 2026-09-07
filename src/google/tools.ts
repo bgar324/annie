@@ -35,12 +35,21 @@ const rfc3339Schema = z
   .min(1)
   .max(64)
   .refine(isRfc3339DateTime, "Must be an RFC 3339 date-time with Z or an explicit offset");
+// "No text filter" is expressible only by omission, so the model sends "" and, once told
+// that fails, invents a word that matches nothing. An empty filter is no filter.
+const optionalTextSchema = (maximum: number) =>
+  z
+    .string()
+    .trim()
+    .max(maximum)
+    .transform((value) => (value === "" ? undefined : value))
+    .optional();
 const calendarQuerySchema = z
   .object({
     product: z.literal("calendar"),
     timeMin: rfc3339Schema,
     timeMax: rfc3339Schema,
-    query: z.string().trim().min(1).max(256).optional(),
+    query: optionalTextSchema(256),
     maxResults: z.number().int().min(1).max(20).default(10),
   })
   .strict()
@@ -50,7 +59,7 @@ const calendarQuerySchema = z
 const driveQuerySchema = z
   .object({
     product: z.literal("drive"),
-    text: z.string().trim().min(1).max(200).optional(),
+    text: optionalTextSchema(200),
     modifiedAfter: rfc3339Schema.optional(),
     modifiedBefore: rfc3339Schema.optional(),
     maxResults: z.number().int().min(1).max(20).default(10),
@@ -70,7 +79,7 @@ const contactsQuerySchema = z
 const tasksQuerySchema = z
   .object({
     product: z.literal("tasks"),
-    query: z.string().trim().min(1).max(200).optional(),
+    query: optionalTextSchema(200),
     dueBefore: rfc3339Schema.optional(),
     includeCompleted: z.boolean().default(false),
     maxResults: z.number().int().min(1).max(20).default(10),
@@ -938,7 +947,7 @@ const searchJsonSchema = {
               product: { const: "calendar" },
               timeMin: timestampJsonSchema,
               timeMax: timestampJsonSchema,
-              query: { type: "string", minLength: 1, maxLength: 256 },
+              query: { type: "string", maxLength: 256 },
               maxResults: maximumResultsJsonSchema,
             },
             required: ["product", "timeMin", "timeMax"],
@@ -948,7 +957,7 @@ const searchJsonSchema = {
             type: "object",
             properties: {
               product: { const: "drive" },
-              text: { type: "string", minLength: 1, maxLength: 200 },
+              text: { type: "string", maxLength: 200 },
               modifiedAfter: timestampJsonSchema,
               modifiedBefore: timestampJsonSchema,
               maxResults: maximumResultsJsonSchema,
@@ -970,7 +979,7 @@ const searchJsonSchema = {
             type: "object",
             properties: {
               product: { const: "tasks" },
-              query: { type: "string", minLength: 1, maxLength: 200 },
+              query: { type: "string", maxLength: 200 },
               dueBefore: timestampJsonSchema,
               includeCompleted: { type: "boolean", default: false },
               maxResults: maximumResultsJsonSchema,
