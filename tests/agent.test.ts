@@ -1214,12 +1214,7 @@ describe("durable bounded agent loop", () => {
       tools: registry,
       runs: harness.runs,
       writes: harness.writes,
-      limits: {
-        maxToolRounds: 1,
-        maxToolCalls: 4,
-        maxProviderWrites: 1,
-        maxRunMs: 60_000,
-      },
+      limits: { maxToolRounds: 1, maxToolCalls: 4, maxRunMs: 60_000 },
     });
 
     const result = await loop.execute({ source: { kind: "inbound", inboundId }, traceId, initialMessages: [{ role: "user", content: "Loop forever" }], });
@@ -1841,7 +1836,7 @@ describe("current-request scope", () => {
       tools: new ToolRegistry([echoTool]),
       runs: harness.runs,
       writes: harness.writes,
-      limits: { maxToolRounds: 1, maxToolCalls: 4, maxProviderWrites: 1, maxRunMs: 60_000 },
+      limits: { maxToolRounds: 1, maxToolCalls: 4, maxRunMs: 60_000 },
     });
 
     const result = await loop.execute({
@@ -1896,7 +1891,7 @@ describe("current-request scope", () => {
       tools: registry,
       runs: harness.runs,
       writes: harness.writes,
-      limits: { maxToolRounds: 1, maxToolCalls: 4, maxProviderWrites: 1, maxRunMs: 60_000 },
+      limits: { maxToolRounds: 1, maxToolCalls: 4, maxRunMs: 60_000 },
     });
 
     const result = await loop.execute({
@@ -2094,12 +2089,7 @@ function createAgentLoop(
     tools,
     runs,
     writes,
-    limits: {
-      maxToolRounds: 4,
-      maxToolCalls: 8,
-      maxProviderWrites: 2,
-      maxRunMs: 60_000,
-    },
+    limits: { maxToolRounds: 4, maxToolCalls: 8, maxRunMs: 60_000 },
   });
 }
 

@@ -23,7 +23,6 @@ type ToolCallGuard = (
 export interface AgentLoopLimits {
   maxToolRounds: number;
   maxToolCalls: number;
-  maxProviderWrites: number;
   maxRunMs: number;
 }
 
@@ -321,18 +320,10 @@ export class AgentLoop {
           throw new AmbiguousWriteResumeError();
         }
       }
-      if (
-        operationClass === "write" &&
-        this.#runs.getRequired(run.id).providerWrites >=
-          (run.source.kind === "inbound"
-            ? Math.min(1, this.#limits.maxProviderWrites)
-            : this.#limits.maxProviderWrites)
-      ) {
-        const result = { ok: false, error: { code: "write_limit", message: "Provider write limit reached" } };
-        this.#runs.finishTool(execution.id, "not_executed", result);
-        this.#runs.appendToolMessage(run.id, call.id, canonicalJson(result));
-        continue;
-      }
+      // No mutation count: every write is still bounded by same-run page proof, one write
+      // per response, the run's tool-call and round limits, and the ambiguity stop. A
+      // count on top of those guarded nothing and turned "tick off these four" into one
+      // tick and an apology.
       if (execution.status === "validated") {
         this.#runs.markToolRunning(execution.id);
       }

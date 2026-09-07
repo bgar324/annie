@@ -62,7 +62,6 @@ const runtimeEnvSchema = storageEnvSchema.extend({
   MAX_AGENT_TOOL_ROUNDS: positiveInteger(6, 12),
   MAX_AGENT_RUN_MS: positiveInteger(120_000, 600_000),
   MAX_AGENT_TOOL_CALLS: positiveInteger(16, 32),
-  MAX_AGENT_WRITES: positiveInteger(2, 8),
   MEMORY_MAX_BYTES: positiveInteger(16_384, 16_384),
   RECENT_MESSAGE_LIMIT: positiveInteger(20, 100),
   WORKER_POLL_MS: positiveInteger(250, 60_000),
@@ -133,7 +132,6 @@ export interface RuntimeConfig extends StorageConfig {
     maxAgentToolRounds: number;
     maxAgentRunMs: number;
     maxAgentToolCalls: number;
-    maxAgentWrites: number;
     memoryMaxBytes: number;
     recentMessageLimit: number;
     workerPollMs: number;
@@ -241,7 +239,6 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
       maxAgentToolRounds: parsed.MAX_AGENT_TOOL_ROUNDS,
       maxAgentRunMs: parsed.MAX_AGENT_RUN_MS,
       maxAgentToolCalls: parsed.MAX_AGENT_TOOL_CALLS,
-      maxAgentWrites: parsed.MAX_AGENT_WRITES,
       memoryMaxBytes: parsed.MEMORY_MAX_BYTES,
       recentMessageLimit: parsed.RECENT_MESSAGE_LIMIT,
       workerPollMs: parsed.WORKER_POLL_MS,

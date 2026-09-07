@@ -221,14 +221,19 @@ class FakeNotionClients implements NotionClientProvider {
   readonly fetches: Record<string, unknown>[] = [];
   readonly writes: Array<{ name: string; argumentsValue: Record<string, unknown> }> = [];
 
+  /** The page as the provider holds it; a patch mutates it so a later read sees the change. */
+  pageText: string;
+
   constructor(
     readonly allowWrites = false,
-    readonly fetchText = "",
+    fetchText = "",
     readonly searchResults: readonly Record<string, unknown>[] = [
       { id: "page_1", title: "Project page" },
     ],
     readonly searchTruncated = false,
-  ) {}
+  ) {
+    this.pageText = fetchText;
+  }
 
   async withSession<T>(
     connectionId: ConnectionId,
@@ -243,6 +248,10 @@ class FakeNotionClients implements NotionClientProvider {
       call: async (name, argumentsValue) => {
         if (this.allowWrites && ["notion-create-pages", "notion-update-page"].includes(name)) {
           this.writes.push({ name, argumentsValue });
+          const updates = argumentsValue.content_updates as { old_str: string; new_str: string }[] | undefined;
+          if (updates?.[0] !== undefined) {
+            this.pageText = this.pageText.replace(updates[0].old_str, updates[0].new_str);
+          }
           return {
             content: [
               {
@@ -258,7 +267,7 @@ class FakeNotionClients implements NotionClientProvider {
         }
         if (name === "notion-fetch") {
           this.fetches.push(argumentsValue);
-          return { content: [{ type: "text", text: this.fetchText }] };
+          return { content: [{ type: "text", text: this.pageText }] };
         }
         if (name !== "notion-search") {
           throw new Error(`The runtime made an unexpected Notion call: ${name}`);
@@ -1008,120 +1017,74 @@ describe("production runtime", () => {
     ).toEqual({ purpose: "reply" });
   });
 
-  it("returns a second write as a tool error without losing the first result", async () => {
-    const request = "create a launch plan page";
-    const createArgumentsJson = JSON.stringify({
-      workspace: "Work",
-      properties: { title: "Launch plan" },
+  it("lands several sequential writes in one turn, one per response", async () => {
+    // "Tick off these three": fetch once, then one write per response, each proven against
+    // the same-run page read. No count stops the third.
+    const patch = (index: number, oldText: string, newText: string) => toolCallResponse(`write_${index}`, {
+      id: `call_write_${index}`, name: "notion.update_page",
+      argumentsJson: JSON.stringify({ workspace: "Work", pageId: "page_1", command: "update_content", updates: [{ oldText, newText }] }),
     });
-    const firstCall = {
-      id: "call_create_before_resume",
-      name: "notion.create_page",
-      argumentsJson: createArgumentsJson,
-    };
     const model = new FakeModel();
     model.scope = "notion_write";
-    model.responses.push(finalModelResponse("limit_explained", "The page was created once."));
+    model.responses.push(
+      toolCallResponse("seq_fetch", { id: "call_seq_fetch", name: "notion.fetch", argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }) }),
+      patch(1, "- [ ] Task 1", "- [x] Task 1"),
+      patch(2, "- [ ] Task 2", "- [x] Task 2"),
+      patch(3, "- [ ] Task 3", "- [x] Task 3"),
+      finalModelResponse("seq_done", "✅ all three checked off."),
+    );
+    const notionClients = new FakeNotionClients(true, "# Tasks\n- [ ] Task 1\n- [ ] Task 2\n- [ ] Task 3\n");
     const gateway = new FakeGateway();
-    const notionClients = new FakeNotionClients(true);
     const item = await newRuntime(model, gateway, { notionClients });
     connectNotion(item);
-    gateway.inbox.push(inboundMessage("msg_durable_single_use", { text: request }));
+    gateway.inbox.push(inboundMessage("msg_sequential", { text: "mark off tasks 1, 2 and 3" }));
+
     await sweep(item);
-    const job = requiredJob(item.runtime.queue.claim(Date.now() + 10));
-    const inbound = item.runtime.database.db
-      .prepare<[], { id: string; trace_id: string }>(
-        "SELECT id, trace_id FROM inbound_messages",
-      )
-      .get();
-    if (inbound === undefined) {
-      throw new Error("Expected durable single-use inbound");
-    }
-    const runs = new AgentRunStore(item.runtime.database.db, item.runtime.traces);
-    const run = runs.startOrResume({
-      source: { kind: "inbound", inboundId: asInboundId(inbound.id) },
-      traceId: asTraceId(inbound.trace_id),
-      deadlineAtMs: Date.now() + 60_000,
-    });
-    runs.bindJob(run.id, job.id, job.leaseToken);
-    runs.appendInitialMessages(run.id, [{ role: "user", content: request }]);
-    runs.appendAssistant(run.id, toolCallResponse("first_write_response", firstCall));
-    const firstExecution = runs.prepareTool({
-      runId: run.id,
-      call: firstCall,
-      operationClass: "write",
-      maximumToolCalls: 16,
-    });
-    runs.markToolRunning(firstExecution.id);
-    const connection = item.runtime.database.db
-      .prepare<[], { id: ConnectionId; credential_generation: number }>(
-        "SELECT id, credential_generation FROM connections WHERE provider = 'notion'",
-      )
-      .get();
-    if (connection === undefined) {
-      throw new Error("Expected durable single-use Notion connection");
-    }
-    const writeResult = {
-      ok: true,
-      outcome: "succeeded",
-      workspace: { label: "Work" },
-      result: { pages: [{ id: "created_1" }] },
-    };
-    const writes = new WriteStore(item.runtime.database.db, item.runtime.traces);
-    const write = writes.prepare({
-      traceId: run.traceId,
-      kind: "notion_create_page",
-      request: { pages: [{ properties: { title: "Launch plan" } }] },
-      safeSummary: { propertyCount: 1, contentBytes: 0 },
-      runId: run.id,
-      toolExecutionId: firstExecution.id,
-      connectionId: connection.id,
-      connectionGeneration: connection.credential_generation,
-    });
-    writes.beginAttempt({
-      writeId: write.id,
-      traceId: run.traceId,
-      jobLease: { jobId: job.id, leaseToken: job.leaseToken, nowMs: Date.now() },
-    });
-    writes.complete({
-      writeId: write.id,
-      traceId: run.traceId,
-      state: "succeeded",
-      normalizedResult: writeResult,
-      providerReference: { id: "created_1" },
-    });
-    runs.appendToolMessage(run.id, firstCall.id, JSON.stringify(writeResult));
-    runs.appendAssistant(
-      run.id,
-      toolCallResponse("second_write_response", {
-        id: "call_create_after_resume",
-        name: "notion.create_page",
-        argumentsJson: createArgumentsJson,
-      }),
-    );
-    const context: JobContext = {
-      signal: new AbortController().signal,
-      nowMs: () => Date.now(),
-      assertLease: () => item.runtime.queue.assertLease(job),
-    };
+    await drainJobs(item.runtime);
 
-    await item.runtime.handlers.inbound(job, context);
-    item.runtime.queue.complete(job);
-
-    expect(runs.getRequired(run.id).phase).toBe("completed");
-    expect(notionClients.writes).toEqual([]);
+    expect(notionClients.writes.map((write) => write.name)).toEqual(["notion-update-page", "notion-update-page", "notion-update-page"]);
     expect(
       item.runtime.database.db
-        .prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM write_intents WHERE kind = 'notion_create_page'")
-        .get()?.count,
-    ).toBe(1);
-    const limited = model.requests[0]?.messages.find(
-      (message) => message.role === "tool" && message.toolCallId === "call_create_after_resume",
-    );
-    expect(JSON.parse(limited?.content ?? "null")).toMatchObject({
-      ok: false,
-      error: { code: "write_limit" },
+        .prepare<[], { state: string }>("SELECT state FROM write_intents WHERE kind = 'notion_update_page' ORDER BY created_at_ms")
+        .all(),
+    ).toEqual([{ state: "succeeded" }, { state: "succeeded" }, { state: "succeeded" }]);
+    expect(item.runtime.database.db.prepare<[], { provider_writes: number }>("SELECT provider_writes FROM agent_runs").get())
+      .toEqual({ provider_writes: 3 });
+    expect(item.runtime.database.db.prepare<[], { purpose: string; body: string }>("SELECT purpose, body FROM egress_messages").get())
+      .toEqual({ purpose: "reply", body: "✅ all three checked off." });
+  });
+
+  it("proves a second patch against the page as the first patch left it", async () => {
+    // After patch one turns "- [ ] Task 1" into "- [x] Task 1", a second patch that still
+    // names the consumed span must be refused, and one naming the new span must pass.
+    // Without carrying the applied text forward, both would be checked against the stale
+    // pre-write read: the stale one accepted, the fresh one refused.
+    const patch = (index: number, oldText: string, newText: string) => toolCallResponse(`write_${index}`, {
+      id: `call_write_${index}`, name: "notion.update_page",
+      argumentsJson: JSON.stringify({ workspace: "Work", pageId: "page_1", command: "update_content", updates: [{ oldText, newText }] }),
     });
+    const model = new FakeModel();
+    model.scope = "notion_write";
+    model.responses.push(
+      toolCallResponse("stale_fetch", { id: "call_stale_fetch", name: "notion.fetch", argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }) }),
+      patch(1, "- [ ] Task 1", "- [x] Task 1"),
+      patch(2, "- [ ] Task 1", "- [ ] Task 1\n- [ ] Task 1b"),
+      patch(3, "- [x] Task 1", "- [x] Task 1\n- [ ] Task 1b"),
+      finalModelResponse("stale_done", "✅ done."),
+    );
+    const notionClients = new FakeNotionClients(true, "# Tasks\n- [ ] Task 1\n- [ ] Task 2\n");
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item);
+    gateway.inbox.push(inboundMessage("msg_stale_span", { text: "tick task 1 then add task 1b under it" }));
+
+    await sweep(item);
+    await drainJobs(item.runtime);
+
+    expect(notionClients.writes).toHaveLength(2);
+    expect(notionClients.pageText).toBe("# Tasks\n- [x] Task 1\n- [ ] Task 1b\n- [ ] Task 2\n");
+    const refused = model.requests[3]?.messages.find((message) => message.role === "tool" && message.toolCallId === "call_write_2");
+    expect(JSON.parse(refused?.content ?? "null")).toMatchObject({ ok: false, error: { code: "write_target_ambiguous" } });
   });
 
   it("answers a multi-write response with a rule instead of failing the turn", async () => {

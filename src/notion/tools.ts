@@ -167,6 +167,7 @@ type NotionWriteResult =
       ok: true;
       outcome: "succeeded";
       workspace: { label: string };
+      /** For a content update, carries `page`: the text as applied, the next patch's proof. */
       result: unknown;
     }
   | {
@@ -538,6 +539,16 @@ export class NotionToolService {
         result: { pageId: input.pageId },
       };
     }
+    // A succeeded content patch knows exactly what the page now says: the old span
+    // replaced at its one position. That applied text rides on the write's own result and
+    // becomes the latest same-run read, so a following patch is proven against the page
+    // as it truly is: a span the first patch consumed is rejected as absent, and one it
+    // introduced is available. A property update leaves the text untouched.
+    const applied =
+      page.text === undefined ? undefined
+      : input.command === "update_content" ? page.text.replace(input.updates[0].oldText, input.updates[0].newText)
+      : input.command === "replace_content" ? input.newContent
+      : page.text;
     return this.#write({
       connection,
       context,
@@ -548,6 +559,7 @@ export class NotionToolService {
         command: input.command,
         pageId: input.pageId,
       },
+      ...(applied === undefined ? {} : { appliedPage: { id: input.pageId, text: applied, truncated: false as const } }),
     });
   }
 
@@ -583,6 +595,13 @@ export class NotionToolService {
           WHERE executions.run_id = @run_id AND executions.connection_id = @connection_id
             AND executions.tool_name = 'notion.search' AND executions.status = 'succeeded'
             AND json_extract(pages.value, '$.id') = @page_id
+          UNION ALL
+          SELECT rowid, json_object('workspace', json_extract(result_json, '$.workspace'),
+                                    'result', json_extract(result_json, '$.result.page')) AS page_json
+          FROM tool_executions
+          WHERE run_id = @run_id AND connection_id = @connection_id
+            AND tool_name = 'notion.update_page' AND status = 'succeeded'
+            AND json_extract(result_json, '$.result.page.id') = @page_id
         )
         ORDER BY rowid DESC
         LIMIT 1
@@ -616,6 +635,7 @@ export class NotionToolService {
     writeKind: "notion_create_page" | "notion_update_page";
     argumentsValue: Record<string, unknown>;
     safeSummary: unknown;
+    appliedPage?: { id: string; text: string; truncated: false };
   }): Promise<NotionWriteResult> {
     return this.#clients.withSession(
       input.connection.id,
@@ -649,7 +669,7 @@ export class NotionToolService {
             ok: true,
             outcome: "succeeded",
             workspace: { label: input.connection.safeLabel },
-            result,
+            result: input.appliedPage === undefined ? result : { ...(result as object), page: input.appliedPage },
           };
           this.#writes.complete({
             writeId: write.id,

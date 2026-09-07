@@ -188,7 +188,6 @@ export async function createRuntime(
     const agentLimits = {
       maxToolRounds: config.limits.maxAgentToolRounds,
       maxToolCalls: config.limits.maxAgentToolCalls,
-      maxProviderWrites: config.limits.maxAgentWrites,
       maxRunMs: config.limits.maxAgentRunMs,
     };
     const agent = new AgentLoop({
