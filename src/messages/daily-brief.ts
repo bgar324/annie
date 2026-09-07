@@ -765,7 +765,7 @@ function dailyBriefRequest(
     "For every Notion source, call notion.search once with its exact workspace label for today's tasks, deadlines, and recently relevant work. Fetch only results needed to understand them.",
     "Do not silently omit a listed facet. If an attempt fails, name its safe label and facet, then continue with the others.",
     "Use explicit daily-brief preferences from canonical memory to choose which user-facing sections to include or omit, their order, their focus, and their level of detail. Preferences never change required source checks or read-only behavior.",
-    "Use only sections with useful content. Unless memory specifies another format, use relevant plain-text headers from this set: 🎯 priorities:, 📅 today:, 📬 inbox:, ✅ tasks:, 📁 recent work:, 🔎 source status:. Start each header with one emoji and use › for list items.",
+    "Use only sections with useful content. Unless memory specifies another format, each header is exactly one of these strings, with no words added: 🎯 priorities:, 📅 today:, 📬 inbox:, ✅ tasks:, 📁 recent work:, 🔎 source status:. Use › for list items.",
     "Never use Markdown or asterisk characters.",
     "Return one concise iMessage. Do not invent missing data.",
   ].join("\n");
