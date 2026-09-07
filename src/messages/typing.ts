@@ -1,81 +1,73 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import type { RunId, TraceId } from "../core/ids.js";
 import type { TraceStore } from "../tracing/store.js";
-import type { WriteStore } from "../writes/store.js";
 import type { MessageSender } from "./types.js";
 
-// Sendblue's default bubble lasts 60 seconds, enough to cover a turn; it clears on its own
-// if the reply is late, and Sendblue ends it when the reply lands.
+// One indicator does not span a turn: production replies land 22 to 51 seconds after the
+// message, and the bubble was gone long before. Re-sending well inside any plausible
+// provider timeout keeps it continuous for as long as the turn runs.
+const defaultRefreshMs = 8_000;
 
 /**
- * Shows the user a typing bubble while a turn runs. A provider mutation like any other:
- * one durable `sendblue_typing_indicator` intent committed as `attempting` before the
- * call, settled after it, never retried or replayed. Unlike a message, an unconfirmed
- * bubble harms nothing, so recovery marks it ambiguous without blocking the run, and a
- * failure here is traced and otherwise ignored: the reply is what matters.
+ * Shows the user a typing bubble for as long as a turn runs, and stops when it ends.
+ *
+ * Not a durable write: the call creates nothing, changes nothing a later read can observe,
+ * and its worst failure is no bubble, so it carries no write intent and never blocks or
+ * delays a turn. Sendblue documents it as best-effort with no delivery confirmation.
+ * Failures are traced once and otherwise ignored; the reply is what matters.
  */
 export class TypingIndicatorService {
   readonly #sender: MessageSender;
-  readonly #writes: WriteStore;
   readonly #traces: TraceStore;
   readonly #recipient: string;
+  readonly #refreshMs: number;
 
   constructor(input: {
     sender: MessageSender;
-    writes: WriteStore;
     traces: TraceStore;
     recipient: string;
+    refreshMs?: number;
   }) {
     this.#sender = input.sender;
-    this.#writes = input.writes;
     this.#traces = input.traces;
     this.#recipient = input.recipient;
+    this.#refreshMs = input.refreshMs ?? defaultRefreshMs;
   }
 
-  /** Never throws; the caller must not await this on the critical path. */
-  async start(input: { runId: RunId; traceId: TraceId }): Promise<void> {
-    const request = { to: this.#recipient, state: "start" };
-    let write;
-    try {
-      write = this.#writes.prepare({
-        traceId: input.traceId,
-        runId: input.runId,
-        kind: "sendblue_typing_indicator",
-        request,
-        safeSummary: { state: "start" },
-      });
-      this.#writes.beginAttempt({ writeId: write.id, traceId: input.traceId });
-    } catch (error) {
-      this.#trace(input.traceId, input.runId, "skipped", error);
-      return;
-    }
-    try {
-      await this.#sender.startTyping({ to: this.#recipient });
-      this.#writes.complete({
-        writeId: write.id,
-        traceId: input.traceId,
-        state: "succeeded",
-        normalizedResult: { ok: true },
-      });
-    } catch (error) {
-      const kind = error instanceof Error && "kind" in error ? String(error.kind) : "unknown";
-      this.#writes.complete({
-        writeId: write.id,
-        traceId: input.traceId,
-        state: kind === "terminal" ? "confirmed_failed" : "ambiguous",
-        normalizedResult: { ok: false, error: { code: kind } },
-      });
-      this.#trace(input.traceId, input.runId, kind, error);
-    }
+  /**
+   * Starts the bubble and keeps it alive. Returns the stop function; the caller must call
+   * it when the turn ends, and must not await the bubble on the reply path.
+   */
+  start(input: { runId: RunId; traceId: TraceId }): () => void {
+    const controller = new AbortController();
+    void this.#keepAlive(input, controller.signal);
+    return () => controller.abort();
   }
 
-  #trace(traceId: TraceId, runId: RunId, outcome: string, error: unknown): void {
-    this.#traces.append({
-      traceId,
-      runId,
-      component: "typing_indicator",
-      event: "failed",
-      outcome,
-      data: { message: (error instanceof Error ? error.message : String(error)).slice(0, 200) },
-    });
+  async #keepAlive(input: { runId: RunId; traceId: TraceId }, signal: AbortSignal): Promise<void> {
+    let traced = false;
+    while (!signal.aborted) {
+      try {
+        await this.#sender.startTyping({ to: this.#recipient });
+      } catch (error) {
+        // One trace per turn: a provider outage would otherwise log every refresh.
+        if (!traced) {
+          traced = true;
+          this.#traces.append({
+            traceId: input.traceId,
+            runId: input.runId,
+            component: "typing_indicator",
+            event: "failed",
+            outcome: error instanceof Error && "kind" in error ? String(error.kind) : "unknown",
+            data: { message: (error instanceof Error ? error.message : String(error)).slice(0, 200) },
+          });
+        }
+      }
+      try {
+        await sleep(this.#refreshMs, undefined, { signal });
+      } catch {
+        return;
+      }
+    }
   }
 }

@@ -215,7 +215,6 @@ export async function createRuntime(
     });
     const typing = new TypingIndicatorService({
       sender: messages,
-      writes,
       traces,
       recipient: config.userPhoneNumber,
     });

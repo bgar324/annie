@@ -14,8 +14,7 @@ export type WriteKind =
   | "gmail_send_draft"
   | "notion_create_page"
   | "notion_update_page"
-  | "sendblue_send_message"
-  | "sendblue_typing_indicator";
+  | "sendblue_send_message";
 
 export type WriteState =
   | "prepared"
@@ -462,9 +461,7 @@ export class WriteStore {
             `)
             .run({ id: row.tool_execution_id, now_ms: now });
         }
-        // A typing indicator is a provider mutation and keeps its honest ambiguous record,
-        // but an unconfirmed bubble harms nothing: it must never block the run it belongs to.
-        if (row.run_id !== null && row.kind !== "sendblue_typing_indicator") {
+        if (row.run_id !== null) {
           this.#db
             .prepare<{ id: string; write_id: string; now_ms: number }>(`
               UPDATE agent_runs

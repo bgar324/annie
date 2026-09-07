@@ -99,6 +99,7 @@ export class InboundTurnService {
     }
     const userMessage = inbound.text?.trim() ?? "";
     context.assertLease();
+    let stopTyping: (() => void) | undefined;
     try {
       if (inbound.state === "done") {
         this.#finishAlreadyCompletedTurn(inbound);
@@ -119,11 +120,10 @@ export class InboundTurnService {
         deadlineAtMs: Date.now() + this.#config.limits.maxAgentRunMs,
       });
       this.#runs.bindJob(run.id, job.id, job.leaseToken);
-      // Fire-and-forget by design: the bubble never gates the reply. The service settles
-      // its own intent and swallows its own failures. A resumed run already showed one.
-      if (run.modelRequests === 0) {
-        void this.#typing.start({ runId: run.id, traceId: run.traceId });
-      }
+      // Fire-and-forget by design: the bubble never gates the reply and swallows its own
+      // failures. It lives exactly as long as this turn, including a resumed one, which
+      // is working just as hard as a first attempt.
+      stopTyping = this.#typing.start({ runId: run.id, traceId: run.traceId });
       const memory = await this.#memory.load();
       const history = this.#history.loadBefore(inbound.id);
       const initialMessages: readonly ModelMessage[] = [
@@ -184,6 +184,8 @@ export class InboundTurnService {
         ...(run === undefined ? {} : { runId: run.id }),
         replyToGuid: inbound.guid,
       });
+    } finally {
+      stopTyping?.();
     }
   }
 

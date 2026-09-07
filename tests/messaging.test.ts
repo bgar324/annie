@@ -1,5 +1,6 @@
 import { getEventListeners } from "node:events";
 import { readdirSync, rmSync } from "node:fs";
+import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadRuntimeConfig, type RuntimeConfig } from "../src/config.js";
 import {
@@ -16,6 +17,7 @@ import { MessageEgressService } from "../src/messages/egress.js";
 import { FailureNotificationService } from "../src/messages/failure.js";
 import { MessageIngressService } from "../src/messages/inbound.js";
 import { SendblueReceiver } from "../src/messages/receiver.js";
+import { TypingIndicatorService } from "../src/messages/typing.js";
 import {
   MessagingProviderError,
   type DeliveryResource,
@@ -997,6 +999,47 @@ describe("startup write recovery", () => {
       expect.arrayContaining(["write.ambiguous", "queue.blocked", "egress.acceptance_unknown"]),
     );
     expect(harness.queue.claim(Date.now() + 10_000)).toBeUndefined();
+  });
+});
+
+describe("typing indicator", () => {
+  it("re-sends the bubble until the turn stops it, and traces one failure per turn", async () => {
+    // Production replies land 22 to 51 seconds after the message. One indicator does not
+    // cover that, so the bubble has to be refreshed for as long as the run is working.
+    const harness = createMessagingHarness();
+    const traceId = newTraceId();
+    const runId = "run_typing" as RunId;
+    const sent: { to: string }[] = [];
+    let failNext = true;
+    const typing = new TypingIndicatorService({
+      sender: {
+        send: () => { throw new Error("The bubble must not send messages"); },
+        getStatus: () => { throw new Error("The bubble must not poll status"); },
+        startTyping: async (input) => {
+          sent.push(input);
+          if (failNext) {
+            failNext = false;
+            throw new MessagingProviderError({ message: "Sendblue HTTP 500", kind: "transient", status: 500 });
+          }
+        },
+      },
+      traces: harness.traces,
+      recipient: harness.config.userPhoneNumber,
+      refreshMs: 1,
+    });
+
+    const stop = typing.start({ runId, traceId });
+    await vi.waitFor(() => expect(sent.length).toBeGreaterThanOrEqual(3));
+    stop();
+    const afterStop = sent.length;
+    await sleep(20);
+
+    // A failed refresh keeps the loop alive but is traced once, not once per attempt.
+    expect(sent.every((request) => request.to === harness.config.userPhoneNumber)).toBe(true);
+    expect(sent.length).toBe(afterStop);
+    expect(harness.traces.list(traceId).map((event) => `${event.component}.${event.event}`)).toEqual([
+      "typing_indicator.failed",
+    ]);
   });
 });
 

@@ -637,7 +637,7 @@ describe("production runtime", () => {
       await sweep(item);
       await drainJobs(item.runtime);
 
-      // The bubble is a durable, settled provider attempt, and the user's one write still went through.
+      // The bubble is not a durable write: no intent, no cost to the user's one write.
       expect(gateway.typingStarts).toEqual([{ to: userNumber }]);
       expect(
         item.runtime.database.db
@@ -645,16 +645,13 @@ describe("production runtime", () => {
             "SELECT kind, state FROM write_intents WHERE kind <> 'sendblue_send_message' ORDER BY created_at_ms",
           )
           .all(),
-      ).toEqual([
-        { kind: "sendblue_typing_indicator", state: "succeeded" },
-        { kind: "notion_update_page", state: "succeeded" },
-      ]);
+      ).toEqual([{ kind: "notion_update_page", state: "succeeded" }]);
       expect(item.runtime.database.db.prepare<[], { provider_writes: number }>("SELECT provider_writes FROM agent_runs").get())
         .toEqual({ provider_writes: 1 });
       expect(notionClients.writes).toHaveLength(1);
     });
 
-    it("never lets a failed or interrupted bubble touch the turn", async () => {
+    it("never lets a failed bubble touch the turn", async () => {
       const model = new FakeModel();
       model.responses.push(finalModelResponse("typing_reply", "hey."));
       const gateway = new FakeGateway();
@@ -666,20 +663,12 @@ describe("production runtime", () => {
       await sweep(item);
       await drainJobs(item.runtime);
 
+      // The reply lands and nothing is left open to recover. (The trace of the failed
+      // bubble is evicted with the rest of a fully successful turn.)
       expect(egressState(item.runtime)).toBe("delivered");
-      expect(item.runtime.database.db.prepare<[], { state: string }>("SELECT state FROM write_intents WHERE kind = 'sendblue_typing_indicator'").get())
-        .toEqual({ state: "ambiguous" });
-
-      // A crash between the attempt and its settlement: recovery marks the bubble ambiguous,
-      // as it does every open attempt, but the run it belongs to is not blocked by it.
-      const runId = item.runtime.database.db.prepare<[], { id: string }>("SELECT id FROM agent_runs").get()?.id;
-      item.runtime.database.db.prepare("UPDATE write_intents SET state = 'attempting' WHERE kind = 'sendblue_typing_indicator'").run();
-      item.runtime.database.db.prepare("UPDATE agent_runs SET phase = 'running'").run();
-      const writes = new WriteStore(item.runtime.database.db, item.runtime.traces);
-      writes.recoverOpenAttempts();
-      expect(item.runtime.database.db.prepare<{ id: string }, { phase: string; ambiguous_write_id: string | null }>(
-        "SELECT phase, ambiguous_write_id FROM agent_runs WHERE id = @id",
-      ).get({ id: runId ?? "" })).toEqual({ phase: "running", ambiguous_write_id: null });
+      expect(item.runtime.database.db.prepare<[], { count: number }>(
+        "SELECT COUNT(*) AS count FROM write_intents WHERE kind NOT LIKE 'notion_%' AND kind <> 'sendblue_send_message'",
+      ).get()).toEqual({ count: 0 });
     });
   });
 
