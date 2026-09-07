@@ -319,28 +319,37 @@ export interface SeededExchange {
   reply: string;
   ageMs: number;
   state: "delivered" | "delivery_unknown";
+  /** A failed turn: the request earned this scope, then the failure notice was delivered. */
+  failedScope?: "notion_write" | "read";
 }
 
 // One completed exchange right before the current message: Annie's delivered (or not)
-// model-authored reply to the previous accepted message, aged as the case requires.
+// model-authored reply, or a delivered failure notice for the user's own request, aged as
+// the case requires.
 export function seedDeliveredExchange(db: Db, exchange: SeededExchange): void {
   const at = Date.now() - exchange.ageMs;
   const trace = newTraceId();
+  const failed = exchange.failedScope !== undefined;
   insertInbound(db, {
     inbound: "in_offer", delivery: "wd_offer", provider: "sb_offer", sequence: 1_000,
-    state: "done", text: exchange.question, trace, at,
+    state: failed ? "blocked" : "done", text: exchange.question, trace, at,
   });
-  const run = { run: "run_offer", inbound: "in_offer", egress: "eg_offer", trace, at, reply: exchange.reply, state: exchange.state, chat: user, handle: line };
+  const run = {
+    run: "run_offer", inbound: "in_offer", egress: "eg_offer", trace, at, reply: exchange.reply, state: exchange.state,
+    chat: user, handle: line, phase: failed ? "blocked" : "completed", scope: exchange.failedScope ?? "read",
+    finalResponse: failed ? null : exchange.reply, failureCode: failed ? "tool_not_allowed" : null,
+    purpose: failed ? "failure" : "reply",
+  };
   db.prepare<typeof run>(`
     INSERT INTO agent_runs(
       id, inbound_id, trace_id, phase, deadline_at_ms, memory_maintenance_status,
-      final_response, request_scope, created_at_ms, updated_at_ms
-    ) VALUES (@run, @inbound, @trace, 'completed', @at, 'unchanged', @reply, 'read', @at, @at)
+      final_response, failure_code, request_scope, created_at_ms, updated_at_ms
+    ) VALUES (@run, @inbound, @trace, @phase, @at, 'unchanged', @finalResponse, @failureCode, @scope, @at, @at)
   `).run(run);
   db.prepare<typeof run>(`
     INSERT INTO egress_messages(
       id, run_id, trace_id, recipient_handle, line_handle, body, purpose, state,
       attempt_count, created_at_ms, updated_at_ms
-    ) VALUES (@egress, @run, @trace, @chat, @handle, @reply, 'reply', @state, 1, @at, @at)
+    ) VALUES (@egress, @run, @trace, @chat, @handle, @reply, @purpose, @state, 1, @at, @at)
   `).run(run);
 }

@@ -354,6 +354,24 @@ export const cases: readonly SmokeCase[] = [
     texts: ["yes"], scopes: ["conversation"], exchange: { ...checkOffer, ageMs: 120_000, state: "delivery_unknown" },
     expect(o) { noProviderWrite(o); assert.deepEqual(o.tools, []); answeredInText(o); },
   },
+  {
+    // Production 2026-09-06: a write turn failed, the notice was delivered, then "Try again/".
+    // The retry repeats the failed request under the scope it earned; every box named lands.
+    name: "retry_after_failure", category: "follow_up",
+    texts: ["Try again/"], scopes: ["notion_write"],
+    exchange: {
+      question: "mark off clean restroom and water plants on today's list",
+      reply: "I couldn't complete that request. Trace: tr_00000000000000000000000000000000",
+      ageMs: 120_000, state: "delivered", failedScope: "notion_write",
+    },
+    expect(o) {
+      answeredInText(o);
+      assert(o.writes.length >= 1 && o.writes.every((write) => write.state === "succeeded"), "The retry performs the failed request");
+      const page = o.notion.pages.get("daily") ?? "";
+      assert(/\[x\] Clean restroom/u.test(page) && /\[x\] Water plants/u.test(page), "Both named boxes are ticked");
+      assert.equal(o.notion.pages.get("archive"), archivePage);
+    },
+  },
 
   // ---- Plain conversation ------------------------------------------------------------
   {

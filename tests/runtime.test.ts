@@ -1363,7 +1363,7 @@ describe("production runtime", () => {
           .list(acceptedTraceIdFor(item.runtime, "msg_follow_up"))
           .filter((event) => event.event === "preceding_reply")
           .map((event) => event.outcome),
-      ).toEqual(["included"]);
+      ).toEqual(["reply"]);
     });
 
     it.each([
@@ -1426,7 +1426,10 @@ describe("production runtime", () => {
       ).toEqual(["none"]);
     });
 
-    it("gives the classifier nothing when the last message got a failure notice", async () => {
+    it("offers a delivered failure notice as a retry target, never as Annie's offer", async () => {
+      // Production: a turn failed, the notice was delivered, the user sent "Try again".
+      // The classifier sees the user's own failed request and the scope it earned, so a
+      // retry repeats it; Annie's older offer is not what the user is answering.
       const model = new FakeModel();
       const gateway = new FakeGateway();
       const item = await newRuntime(model, gateway, { notionClients: new FakeNotionClients(true, notionTaskPage) });
@@ -1446,9 +1449,44 @@ describe("production runtime", () => {
           .get(),
       ).toEqual({ purpose: "failure" });
 
-      const request = await classifyFollowUp(model, gateway, item, "yes");
+      const request = await classifyFollowUp(model, gateway, item, "Try again");
 
-      expect(request.messages[0]?.content).not.toContain(offer);
+      const policy = request.messages[0]?.content ?? "";
+      expect(policy).not.toContain(offer);
+      expect(policy).toContain("«mark it done»");
+      expect(policy).toContain("was classified notion_write");
+      expect(
+        item.runtime.traces
+          .list(acceptedTraceIdFor(item.runtime, "msg_follow_up"))
+          .filter((event) => event.event === "preceding_reply")
+          .map((event) => event.outcome),
+      ).toEqual(["failure"]);
+    });
+
+    it("gives the classifier nothing after a failure whose run never earned a scope", async () => {
+      // A media-only or otherwise unclassified failure has no scope to repeat under.
+      const model = new FakeModel();
+      const gateway = new FakeGateway();
+      const item = await newRuntime(model, gateway, { notionClients: new FakeNotionClients(true, notionTaskPage) });
+      connectNotion(item);
+      gateway.inbox.push(inboundMessage("msg_media_only", { text: null, hasMedia: true }));
+      await sweep(item);
+      await drainJobs(item.runtime);
+      expect(
+        item.runtime.database.db
+          .prepare<[], { purpose: string }>("SELECT purpose FROM egress_messages ORDER BY created_at_ms DESC LIMIT 1")
+          .get(),
+      ).toEqual({ purpose: "failure" });
+
+      const request = await classifyFollowUp(model, gateway, item, "try again");
+
+      expect(request.messages[0]?.content).not.toContain("failure notice");
+      expect(
+        item.runtime.traces
+          .list(acceptedTraceIdFor(item.runtime, "msg_follow_up"))
+          .filter((event) => event.event === "preceding_reply")
+          .map((event) => event.outcome),
+      ).toEqual(["none"]);
     });
   });
 

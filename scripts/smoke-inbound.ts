@@ -275,9 +275,16 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
       }
       if (smokeCase.exchange !== undefined) {
         const policy = call.messages[0]?.content ?? "";
-        assert(!policy.includes(smokeCase.exchange.question), "The user's earlier message never reaches the classifier");
         const fresh = smokeCase.exchange.state === "delivered" && smokeCase.exchange.ageMs < 30 * 60_000;
-        assert.equal(policy.includes(smokeCase.exchange.reply), fresh, "Only a fresh delivered reply reaches the classifier");
+        if (smokeCase.exchange.failedScope === undefined) {
+          assert(!policy.includes(smokeCase.exchange.question), "The user's earlier message never reaches the classifier");
+          assert.equal(policy.includes(smokeCase.exchange.reply), fresh, "Only a fresh delivered reply reaches the classifier");
+        } else {
+          // After a failure notice the classifier sees the failed request itself, as data,
+          // never the notice text.
+          assert.equal(policy.includes(smokeCase.exchange.question), fresh, "A fresh failure exposes the failed request to the classifier");
+          assert(!policy.includes(smokeCase.exchange.reply), "The notice text itself never reaches the classifier");
+        }
       }
     }
     for (const call of loopCalls) {

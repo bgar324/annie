@@ -208,12 +208,12 @@ export class InboundTurnService {
       return run.requestScope;
     }
     this.#runs.beginModelRequest(run.id, this.#config.limits.maxAgentToolRounds + 2);
-    const preceding = this.#history.precedingDeliveredReply(inbound.id, followUpWindowMs);
+    const preceding = this.#history.precedingContext(inbound.id, followUpWindowMs);
     this.#traces.append({
       traceId: run.traceId,
       component: "request_scope",
       event: "preceding_reply",
-      outcome: preceding === undefined ? "none" : "included",
+      outcome: preceding === undefined ? "none" : preceding.kind,
       runId: run.id,
       data: preceding === undefined ? {} : { egressId: preceding.egressId },
     });
@@ -222,7 +222,7 @@ export class InboundTurnService {
       traceId: run.traceId,
       runId: run.id,
       userMessage,
-      ...(preceding === undefined ? {} : { precedingReply: preceding.body }),
+      ...(preceding === undefined ? {} : { preceding }),
       signal: AbortSignal.timeout(Math.max(1, run.deadlineAtMs - Date.now())),
     });
     context.assertLease();

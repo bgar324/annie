@@ -15,10 +15,23 @@ interface HistoryRow {
   delivered_link: number;
 }
 
-interface PrecedingReplyRow {
+interface PrecedingRow {
   egress_id: EgressId;
   body: string;
+  purpose: "reply" | "failure";
+  failed_request: string | null;
+  failed_scope: string | null;
 }
+
+/**
+ * What the current message may be reacting to. `reply`: Annie's delivered question or
+ * offer, so a direct answer completes it. `failure`: a delivered failure notice for the
+ * user's own previous request, so "try again" repeats that request under the scope it
+ * already earned.
+ */
+export type PrecedingContext =
+  | { kind: "reply"; egressId: EgressId; body: string }
+  | { kind: "failure"; egressId: EgressId; failedRequest: string; failedScope: string };
 
 export class ConversationHistoryStore {
   readonly #db: Database.Database;
@@ -117,22 +130,22 @@ export class ConversationHistoryStore {
   }
 
   /**
-   * The one reply the current message can be answering: the delivered model-authored reply
+   * The one message the current one can be reacting to: what Annie delivered in response
    * to the immediately preceding accepted message in this chat, confirmed delivered before
    * the user sent the current message, within the freshness window, with nothing else sent
-   * to the user in between. Failure notices, connection links, undelivered or
-   * delivery-unknown replies, replies confirmed only after the answer was sent, and older
-   * replies contribute nothing, so an answer can complete only a question Annie is known
-   * to have just asked. Delivery confirmation lags the device by a poll, so the gate errs
+   * to the user in between. A model-authored reply lets a direct answer complete Annie's
+   * question; a failure notice lets a retry repeat the user's own failed request under the
+   * scope that request already earned. Connection links, undelivered or delivery-unknown
+   * messages, messages confirmed only after the answer was sent, and older messages
+   * contribute nothing. Delivery confirmation lags the device by a poll, so the gate errs
    * toward supplying nothing.
    */
-  precedingDeliveredReply(
-    inboundId: InboundId,
-    maxAgeMs: number,
-  ): { egressId: EgressId; body: string } | undefined {
+  precedingContext(inboundId: InboundId, maxAgeMs: number): PrecedingContext | undefined {
     const row = this.#db
-      .prepare<{ id: string; max_age_ms: number }, PrecedingReplyRow>(`
-        SELECT reply.id AS egress_id, reply.body AS body
+      .prepare<{ id: string; max_age_ms: number }, PrecedingRow>(`
+        SELECT reply.id AS egress_id, reply.body AS body, reply.purpose AS purpose,
+               CASE WHEN reply.purpose = 'failure' THEN previous.text END AS failed_request,
+               CASE WHEN reply.purpose = 'failure' THEN runs.request_scope END AS failed_scope
         FROM inbound_messages AS current
         JOIN inbound_messages AS previous
           ON previous.chat_id = current.chat_id
@@ -145,7 +158,7 @@ export class ConversationHistoryStore {
         JOIN agent_runs AS runs ON runs.inbound_id = previous.id
         JOIN egress_messages AS reply
           ON reply.run_id = runs.id
-         AND reply.purpose = 'reply'
+         AND reply.purpose IN ('reply', 'failure')
          AND reply.state = 'delivered'
         WHERE current.id = @id
           AND reply.updated_at_ms < json_extract(current.attachment_json, '$.sentAtMs')
@@ -161,6 +174,16 @@ export class ConversationHistoryStore {
         LIMIT 1
       `)
       .get({ id: inboundId, max_age_ms: maxAgeMs });
-    return row === undefined ? undefined : { egressId: row.egress_id, body: row.body };
+    if (row === undefined) {
+      return undefined;
+    }
+    if (row.purpose === "reply") {
+      return { kind: "reply", egressId: row.egress_id, body: row.body };
+    }
+    // A failed run that never reached classification has no scope to repeat under.
+    if (row.failed_request === null || row.failed_scope === null) {
+      return undefined;
+    }
+    return { kind: "failure", egressId: row.egress_id, failedRequest: row.failed_request, failedScope: row.failed_scope };
   }
 }
