@@ -13,8 +13,11 @@ const readTools = [
   "gmail.search", "gmail.read_thread", "google.search", "google.read",
   "notion.search", "notion.fetch", "connections.list",
 ];
+// Only writes and connection links need authorization from the current message. Reads
+// mutate nothing, so every turn gets them: a classifier miss on a two-word message costs
+// at most a spurious lookup, never a lecture about message format.
 export const requestScopeTools: Readonly<Record<RequestScope, readonly string[]>> = {
-  conversation: [],
+  conversation: readTools,
   read: readTools,
   notion_write: [...readTools, "notion.create_page", "notion.update_page"],
   connect_google: ["connections.connect"],

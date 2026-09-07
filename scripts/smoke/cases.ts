@@ -303,7 +303,7 @@ export const cases: readonly SmokeCase[] = [
     texts: ["Hey annie"], scopes: ["conversation"], history: priorFailures,
     expect(o) {
       noProviderWrite(o);
-      assert.deepEqual(o.tools, [], "A greeting executes no provider tool at all");
+      toolsWithin(o, "read");
       assert(!/https?:\/\//u.test(lastReply(o)));
     },
   },
@@ -337,22 +337,22 @@ export const cases: readonly SmokeCase[] = [
   {
     name: "no_after_offer", category: "follow_up",
     texts: ["no, leave it"], scopes: ["conversation"], exchange: { ...checkOffer, ageMs: 120_000, state: "delivered" },
-    expect(o) { noProviderWrite(o); assert.deepEqual(o.tools, []); },
+    expect(o) { noProviderWrite(o); toolsWithin(o, "read"); },
   },
   {
     name: "greeting_after_offer", category: "follow_up",
     texts: ["Hey annie"], scopes: ["conversation"], exchange: { ...checkOffer, ageMs: 120_000, state: "delivered" },
-    expect(o) { noProviderWrite(o); assert.deepEqual(o.tools, []); },
+    expect(o) { noProviderWrite(o); toolsWithin(o, "read"); },
   },
   {
     name: "yes_after_stale_offer", category: "follow_up",
     texts: ["yes"], scopes: ["conversation"], exchange: { ...checkOffer, ageMs: 2 * 3_600_000, state: "delivered" },
-    expect(o) { noProviderWrite(o); assert.deepEqual(o.tools, []); answeredInText(o); },
+    expect(o) { noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o); },
   },
   {
     name: "yes_after_undelivered_offer", category: "follow_up",
     texts: ["yes"], scopes: ["conversation"], exchange: { ...checkOffer, ageMs: 120_000, state: "delivery_unknown" },
-    expect(o) { noProviderWrite(o); assert.deepEqual(o.tools, []); answeredInText(o); },
+    expect(o) { noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o); },
   },
   {
     // Production 2026-09-06: a write turn failed, the notice was delivered, then "Try again/".
@@ -372,17 +372,33 @@ export const cases: readonly SmokeCase[] = [
       assert.equal(o.notion.pages.get("archive"), archivePage);
     },
   },
+  {
+    // Production 2026-09-06, second shape: Annie's last message was her own conversational
+    // reply, then "Try again". No failure notice and no offer to complete, so no write is
+    // granted; with read tools she reports the page instead of lecturing about format.
+    name: "retry_after_conversation", category: "follow_up",
+    texts: ["Try again"], scopes: [null],
+    exchange: {
+      question: "Try again/",
+      reply: "send it over as one message — \"tick off clean restroom and water plants\" — and i'll mark them done.",
+      ageMs: 120_000, state: "delivered",
+    },
+    expect(o) {
+      noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o);
+      assert(!/one (complete )?message|send it (over )?as|resend/iu.test(lastReply(o)), "No lecture about message format");
+    },
+  },
 
   // ---- Plain conversation ------------------------------------------------------------
   {
     name: "thanks", category: "conversation",
     texts: ["thanks!"], scopes: ["conversation"],
-    expect(o) { noProviderWrite(o); assert.deepEqual(o.tools, []); answeredInText(o); },
+    expect(o) { noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o); },
   },
   {
     name: "tapback", category: "conversation",
     texts: ["Liked \u201chey. what do you need?\u201d"], scopes: ["conversation"],
-    expect(o) { noProviderWrite(o); assert.deepEqual(o.tools, []); answeredInText(o); },
+    expect(o) { noProviderWrite(o); toolsWithin(o, "read"); answeredInText(o); },
   },
 
   // ---- Requests outside the tool set: decline honestly, never fail, never pretend --------

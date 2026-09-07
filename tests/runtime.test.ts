@@ -1126,7 +1126,7 @@ describe("production runtime", () => {
     expect(item.runtime.database.db.prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM write_intents WHERE kind = 'notion_update_page'").get()?.count).toBe(0);
   });
 
-  it("answers a greeting after failed write requests with no tools and no provider call", async () => {
+  it("answers a greeting after failed write requests with read tools only and no provider call", async () => {
     const model = new FakeModel();
     model.scope = "conversation";
     model.responses.push(finalModelResponse("greeting_reply", "hey. what do you need?"));
@@ -1170,7 +1170,8 @@ describe("production runtime", () => {
       "clean restroom",
     );
     expect(model.requests).toHaveLength(1);
-    expect(model.requests[0]?.tools).toEqual([]);
+    expect(model.requests[0]?.tools.map((tool) => tool.name).sort()).toEqual([...requestScopeTools.read].sort());
+    expect(model.requests[0]?.tools.map((tool) => tool.name)).not.toContain("notion.update_page");
     expect(model.requests[0]?.messages.filter((message) => message.role === "user")).toEqual([
       { role: "user", content: "Hey annie" },
     ]);

@@ -3,7 +3,7 @@ import { ModelSafeError } from "../core/errors.js";
 import type { RunId, TraceId } from "../core/ids.js";
 import { maximumMessageTextCharacters } from "../messages/types.js";
 import type { ChatModel, ModelMessage, ModelToolCall } from "./model.js";
-import { assistantResponseFormatReminder, assistantTextOnlyReminder } from "./prompt.js";
+import { assistantResponseFormatReminder } from "./prompt.js";
 import {
   AgentLimitError,
   AgentRunStore,
@@ -149,27 +149,21 @@ export class AgentLoop {
         if (toolRounds > this.#limits.maxToolRounds) {
           throw new AgentLimitError("round_limit", "The tool round limit was reached");
         }
-        const reminder =
-          toolDefinitions.length === 0 ? assistantTextOnlyReminder : assistantResponseFormatReminder;
         const requestMessages: readonly ModelMessage[] =
-          last?.role === "system" && last.content === reminder
+          last?.role === "system" && last.content === assistantResponseFormatReminder
             ? messages
-            : [...messages, { role: "system", content: reminder }];
+            : [...messages, { role: "system", content: assistantResponseFormatReminder }];
         this.#runs.beginModelRequest(
           run.id,
           this.#limits.maxToolRounds + 1 + Number(run.requestScope !== null),
         );
         let response;
         try {
-          // A run offered no tools can only word a reply: nothing to look up, nothing to
-          // change, so high reasoning buys 15–35 s of deliberation over a greeting or a
-          // decline. Tool-bearing runs keep the configured effort.
           response = await this.#model.complete({
             traceId: run.traceId,
             runId: run.id,
             messages: requestMessages,
             tools: toolDefinitions,
-            ...(toolDefinitions.length === 0 ? { reasoningEffort: "medium" as const } : {}),
             signal: runSignal,
           });
         } catch (error) {

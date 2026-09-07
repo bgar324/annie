@@ -68,9 +68,9 @@ describe("assistant prompt", () => {
       Buffer.byteLength(assistantResponseFormatReminder) -
       Buffer.byteLength(memory);
     // Prompt-bloat tripwire, not a provider limit. Raised 4096 → 4352 for the tone line,
-    // 4352 → 4608 for the one-retry rule, and 4608 → 4864 for the never-show-accounts rule;
-    // every raise is a deliberate trade.
-    expect(fixedWireBytes).toBeLessThan(4_864);
+    // → 4608 for the one-retry rule, → 4864 for the never-show-accounts rule, and → 5120
+    // for the act-from-history rule (measured 4914); every raise is a deliberate trade.
+    expect(fixedWireBytes).toBeLessThan(5_120);
   });
 
   it("teaches › for list items only and shows an unprefixed closing sentence", () => {
@@ -1692,7 +1692,8 @@ describe("current-request scope", () => {
         scope === "notion_write",
       );
     }
-    expect(requestScopeTools.conversation).toEqual([]);
+    // Reads mutate nothing, so every inbound scope carries them; only writes are gated.
+    expect(requestScopeTools.conversation).toEqual(requestScopeTools.read);
     expect(requestScopeTools.connect_google).toEqual(["connections.connect"]);
     expect(requestScopeTools.connect_notion).toEqual(["connections.connect"]);
   });
