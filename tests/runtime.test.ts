@@ -947,7 +947,7 @@ describe("production runtime", () => {
     ).toEqual({ purpose: "reply" });
   });
 
-  it("rejects two provider writes in one response before either is prepared", async () => {
+  it("executes neither of two provider writes in one response and hands the rule back", async () => {
     const model = new FakeModel();
     model.scope = "notion_write";
     model.responses.push({
@@ -976,7 +976,7 @@ describe("production runtime", () => {
       ],
       finishReason: "tool_calls",
       usage: { promptTokens: 10, completionTokens: 20, totalTokens: 30 },
-    });
+    }, finalModelResponse("two_writes_reply", "one thing at a time — which first?"));
     const notionClients = new FakeNotionClients(true, notionTaskPage);
     const gateway = new FakeGateway();
     const item = await newRuntime(model, gateway, { notionClients });
@@ -989,19 +989,23 @@ describe("production runtime", () => {
     await runNextJob(item.runtime, Date.now() + 10);
 
     expect(notionClients.writes).toEqual([]);
-    expect(count(item.runtime, "tool_executions")).toBe(0);
+    expect(
+      item.runtime.database.db
+        .prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM write_intents WHERE kind LIKE 'notion_%'")
+        .get()?.count,
+    ).toBe(0);
     expect(
       item.runtime.database.db
         .prepare<[], { phase: string; failure_code: string | null }>(
           "SELECT phase, failure_code FROM agent_runs",
         )
         .get(),
-    ).toEqual({ phase: "blocked", failure_code: "tool_not_allowed" });
+    ).toEqual({ phase: "completed", failure_code: null });
     expect(
       item.runtime.database.db
         .prepare<[], { purpose: string }>("SELECT purpose FROM egress_messages")
         .get(),
-    ).toEqual({ purpose: "failure" });
+    ).toEqual({ purpose: "reply" });
   });
 
   it("returns a second write as a tool error without losing the first result", async () => {
@@ -1118,6 +1122,45 @@ describe("production runtime", () => {
       ok: false,
       error: { code: "write_limit" },
     });
+  });
+
+  it("answers a multi-write response with a rule instead of failing the turn", async () => {
+    // Production: "mark off gym, room, pull day, transcripts" came back as four
+    // notion.update_page calls in one response and the whole turn became a failure notice.
+    const patch = (index: number) => ({
+      id: `call_batch_${index}`,
+      name: "notion.update_page",
+      argumentsJson: JSON.stringify({
+        workspace: "Work", pageId: "page_1", command: "update_content",
+        updates: [{ oldText: `- [ ] Task ${index}`, newText: `- [x] Task ${index}` }],
+      }),
+    });
+    const model = new FakeModel();
+    model.scope = "notion_write";
+    model.responses.push(
+      toolCallResponse("batch_fetch", { id: "call_batch_fetch", name: "notion.fetch", argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }) }),
+      { ...toolCallResponse("batch_writes", patch(1)), toolCalls: [patch(1), patch(2), patch(3), patch(4)] },
+      finalModelResponse("batch_reply", "one at a time it is — which first?"),
+    );
+    const notionClients = new FakeNotionClients(true, "# Tasks\n- [ ] Task 1\n- [ ] Task 2\n- [ ] Task 3\n- [ ] Task 4\n");
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, { notionClients });
+    connectNotion(item);
+    gateway.inbox.push(inboundMessage("msg_batch", { text: "mark off tasks 1 through 4" }));
+
+    await sweep(item);
+    await drainJobs(item.runtime);
+
+    expect(notionClients.writes).toEqual([]);
+    expect(egressState(item.runtime)).toBe("delivered");
+    expect(item.runtime.database.db.prepare<[], { purpose: string; body: string }>("SELECT purpose, body FROM egress_messages").get())
+      .toEqual({ purpose: "reply", body: "one at a time it is — which first?" });
+    // Every write in the batch was answered with the rule, none prepared an intent.
+    const answers = model.requests[2]?.messages
+      .filter((message) => message.role === "tool" && message.toolCallId.startsWith("call_batch_") && message.toolCallId !== "call_batch_fetch")
+      .map((message) => JSON.parse(message.content) as { error: { code: string } });
+    expect(answers?.map((answer) => answer.error.code)).toEqual(["write_batch", "write_batch", "write_batch", "write_batch"]);
+    expect(item.runtime.database.db.prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM write_intents WHERE kind = 'notion_update_page'").get()?.count).toBe(0);
   });
 
   it("answers a greeting after failed write requests with no tools and no provider call", async () => {

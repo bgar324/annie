@@ -66,7 +66,7 @@ const responseFormatRules = [
 
 export const assistantResponseFormatReminder = [
   "Rules for the next assistant message:",
-  "If tools are needed, return only tool calls with no user-visible text. Emit at most four calls. The runtime rejects the entire response before any tool executes if it contains five or more calls. If more remain, call four now and continue next round. Do not answer until every required call finishes. A failed provider read gets one corrected retry at most; then report it.",
+  "If tools are needed, return only tool calls with no user-visible text. Emit at most four read calls, or exactly one write call on its own; a response with several writes executes none. If more remain, continue next round. Do not answer until every required call finishes. A failed provider read gets one corrected retry at most; then report it.",
   ...responseFormatRules,
 ].join("\n");
 

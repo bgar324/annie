@@ -227,12 +227,36 @@ export class AgentLoop {
     }
     const writeCalls = pending.filter(
       (call) => this.#tools.operationClass(call.name) === "write",
-    ).length;
-    if (writeCalls > 1) {
-      throw new AgentLimitError(
-        "tool_not_allowed",
-        "One response may request at most one provider write",
-      );
+    );
+    if (writeCalls.length > 1) {
+      // "Tick off these four" arrives as four writes in one response. None executes:
+      // each write call is answered with the rule so the model resubmits one at a time,
+      // and the turn continues. Ending the run here turned an ordinary request into a
+      // failure notice.
+      const result = {
+        ok: false,
+        error: {
+          code: "write_batch",
+          message: "One response may request at most one provider write. Send the first write alone, then the next after its result.",
+        },
+      };
+      for (const call of writeCalls) {
+        const execution = this.#runs.prepareTool({
+          runId: run.id,
+          call,
+          operationClass: "write",
+          maximumToolCalls: this.#limits.maxToolCalls,
+        });
+        if (execution.status === "validated") {
+          this.#runs.finishTool(execution.id, "not_executed", result);
+        }
+        this.#runs.appendToolMessage(run.id, call.id, canonicalJson(execution.result ?? result));
+      }
+      const reads = pending.filter((call) => this.#tools.operationClass(call.name) !== "write");
+      if (reads.length === 0) {
+        return;
+      }
+      return this.#executeTools(run, this.#runs.loadMessages(run.id), reads, replay, jobLease, allowedToolNames, toolCallGuard, signal);
     }
     const parallel =
       pending.length > 1 &&

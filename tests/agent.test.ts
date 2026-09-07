@@ -1301,11 +1301,7 @@ describe("durable bounded agent loop", () => {
     expect(executions).toBe(6);
     expect(requests).toHaveLength(3);
     expect(
-      requests.every((request) =>
-        request.messages
-          .at(-1)
-          ?.content.includes("The runtime rejects the entire response before any tool executes"),
-      ),
+      requests.every((request) => request.messages.at(-1)?.content === assistantResponseFormatReminder),
     ).toBe(true);
   });
 

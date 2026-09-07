@@ -165,6 +165,18 @@ export const cases: readonly SmokeCase[] = [
     },
   },
   {
+    // Production 2026-09-06: three checkboxes named in one message. The one-mutation cap
+    // means at most one lands this turn; what must not happen is a failure notice.
+    name: "multi_checkbox", category: "notion_write",
+    texts: ["mark off clean restroom, water plants, and clean and organize room on today's list"], scopes: ["notion_write"],
+    expect(o) {
+      answeredInText(o);
+      assert(o.notion.mutations() <= 1, "At most the one permitted mutation");
+      assert(o.writes.every((write) => write.state === "succeeded"));
+      assert.equal(o.notion.pages.get("archive"), archivePage);
+    },
+  },
+  {
     name: "ambiguous_write", category: "notion_write", purpose: "failure", restart: true,
     texts: [requests.mark_restroom], scopes: ["notion_write"], notion: { writeLoses: true },
     expect(o) {
