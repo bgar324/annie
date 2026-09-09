@@ -13,11 +13,14 @@ import {
   type ClaimedJob,
   type QueueStore,
 } from "../queue/store.js";
+import type { ProviderFetch } from "../providers/fetch.js";
 import type { JobContext } from "../queue/worker.js";
 import type { TraceProjector } from "../tracing/jsonl.js";
 import type { TraceStore } from "../tracing/store.js";
 import type { EgressSendPolicy, MessageEgressService } from "./egress.js";
 import type { FailureNotificationService } from "./failure.js";
+import { maximumMessageTextCharacters } from "./types.js";
+import { dailyWeatherLine } from "./weather.js";
 
 const briefHour = 8;
 const catchUpWindowMs = 2 * 60 * 60 * 1_000;
@@ -106,6 +109,7 @@ export class DailyBriefService {
   readonly #traces: TraceStore;
   readonly #projector: TraceProjector;
   readonly #formatter: Intl.DateTimeFormat;
+  readonly #weatherFetch: ProviderFetch | undefined;
 
   constructor(input: {
     db: Database.Database;
@@ -119,6 +123,7 @@ export class DailyBriefService {
     queue: QueueStore;
     traces: TraceStore;
     projector: TraceProjector;
+    weatherFetch?: ProviderFetch;
   }) {
     this.#db = input.db;
     this.#config = input.config;
@@ -127,6 +132,7 @@ export class DailyBriefService {
     this.#memory = input.memory;
     this.#connections = input.connections;
     this.#egress = input.egress;
+    this.#weatherFetch = input.weatherFetch;
     this.#failures = input.failures;
     this.#queue = input.queue;
     this.#traces = input.traces;
@@ -347,10 +353,27 @@ export class DailyBriefService {
         });
         return;
       }
+      const existingReply = this.#db
+        .prepare<{ trace_id: string }, { body: string }>(
+          "SELECT body FROM egress_messages WHERE trace_id = @trace_id AND purpose = 'reply' LIMIT 1",
+        ).get({ trace_id: job.traceId });
+      let text = existingReply?.body ?? result.response;
+      if (existingReply === undefined) {
+        const weather = await dailyWeatherLine({
+          date: payload.localDate, traceId: job.traceId, traces: this.#traces, signal: context.signal,
+          ...(this.#weatherFetch === undefined ? {} : { fetchImpl: this.#weatherFetch }),
+        });
+        context.assertLease();
+        const withWeather = `${weather}\n\n${text}`;
+        if (withWeather.length <= maximumMessageTextCharacters) text = withWeather;
+        else this.#traces.append({
+          traceId: job.traceId, component: "daily_weather", event: "omitted", outcome: "message_limit",
+        });
+      }
       this.#egress.planReply({
         traceId: job.traceId,
         recipient: this.#config.userPhoneNumber,
-        text: result.response,
+        text,
         runId: result.run.id,
         sendPolicy: this.#sendPolicy(payload.scheduledForMs, result.run),
       });

@@ -82,6 +82,8 @@ The production registry remains exactly eight tools. For a daily brief, `AgentLo
 
 The handler rechecks the local date and catch-up deadline before any provider work. A daily-origin egress job carries a durable completion deadline and enabled-state requirement. Before opening a Sendblue attempt, the egress handler cancels a still-prepared stale or disabled message and records a confirmed non-write. It never cancels or repeats a write once provider dispatch may have started.
 
+Each completed daily brief gets one West Covina forecast line prepended by `src/messages/weather.ts`, outside the model and its tool registry. The National Weather Service `/points/34.0686,-117.939` lookup supplies the current grid endpoint; the forecast uses the scheduled Los Angeles date, that day's conditions, high and precipitation probability, and the following night's low, all in Fahrenheit. Both traced GETs share a five-second deadline and the worker's cancellation signal. Missing or invalid weather produces `West Covina: weather unavailable.` without blocking the account summary; an unknown precipitation probability is not treated as zero. Weather is not available as an inbound tool, and daily briefs remain read-only. Reply preparation persists the assembled text; a reclaimed job reuses it without another weather request. If the extra line would exceed the existing iMessage limit, weather is omitted rather than truncating the account summary. Forecast data are public NWS data: https://www.weather.gov/documentation/services-web-api.
+
 ## Agent boundary and limits
 
 The model receives:

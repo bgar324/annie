@@ -29,7 +29,7 @@ import type {
 import type { NotionClientProvider, NotionSession } from "../src/notion/client.js";
 import type { ClaimedJob, JobType } from "../src/queue/store.js";
 import type { JobContext } from "../src/queue/worker.js";
-import { createRuntime, type AssistantModel, type AssistantRuntime } from "../src/runtime.js";
+import { createRuntime, type AssistantModel, type AssistantRuntime, type RuntimeOverrides } from "../src/runtime.js";
 import {
   MessagingProviderError,
   type DeliveryResource,
@@ -1358,7 +1358,7 @@ describe("production runtime", () => {
     });
   });
 
-  it("covers every healthy account through the scheduled read-only tool allowlist", async () => {
+  it.each([true, false])("keeps daily source coverage and delivery when weather availability is %s", async (weatherAvailable) => {
     const model = new FakeModel();
     model.responses.push(
       {
@@ -1455,11 +1455,22 @@ describe("production runtime", () => {
     const gmailClients = new FakeGmailClients();
     const googleWorkspaceClients = new FakeGoogleWorkspaceClients();
     const notionClients = new FakeNotionClients();
+    let weatherRequests = 0;
     const item = await newRuntime(model, new FakeGateway(), {
       dailyBriefEnabled: true,
       gmailClients,
       googleWorkspaceClients,
       notionClients,
+      weatherFetch: async () => {
+        weatherRequests += 1;
+        if (!weatherAvailable) return new Response("", { status: 503 });
+        return Response.json(weatherRequests === 1
+          ? { properties: { forecast: "https://api.weather.gov/gridpoints/LOX/166,44/forecast", timeZone: "America/Los_Angeles" } }
+          : { properties: { periods: [
+            { startTime: "2026-06-02T06:00:00-07:00", endTime: "2026-06-02T18:00:00-07:00", isDaytime: true, temperature: 95, temperatureUnit: "F", shortForecast: "Overcast", probabilityOfPrecipitation: { value: 1 } },
+            { startTime: "2026-06-02T18:00:00-07:00", endTime: "2026-06-03T06:00:00-07:00", isDaytime: false, temperature: 74, temperatureUnit: "F", shortForecast: "Overcast", probabilityOfPrecipitation: { value: 2 } },
+          ] } });
+      },
     });
     const connections = new ConnectionStore(
       item.runtime.database.db,
@@ -1497,6 +1508,14 @@ describe("production runtime", () => {
     }
 
     await runNextJob(item.runtime, scheduled.scheduledForMs + 1);
+    expect(weatherRequests).toBe(weatherAvailable ? 2 : 1);
+    // Reclaim after a crash between egress preparation and job settlement. The forecast
+    // and completed model reply must not be regenerated or prefixed a second time.
+    item.runtime.database.db.prepare("UPDATE jobs SET status = 'pending', available_at_ms = ? WHERE id = ?")
+      .run(scheduled.scheduledForMs + 2, scheduled.jobId);
+    await runNextJob(item.runtime, scheduled.scheduledForMs + 3);
+    expect(weatherRequests).toBe(weatherAvailable ? 2 : 1);
+    expect(model.requests).toHaveLength(3);
 
     expect(model.requests[0]?.tools.map((tool) => tool.name)).toEqual([
       "gmail.search",
@@ -1553,7 +1572,9 @@ describe("production runtime", () => {
       item.runtime.database.db
         .prepare<[], { body: string }>("SELECT body FROM egress_messages WHERE purpose = 'reply'")
         .get(),
-    ).toEqual({ body: "good morning. nothing urgent across your connected accounts." });
+    ).toEqual({ body: `${weatherAvailable
+      ? "☁️ West Covina: overcast, high 95°F / low 74°F, 1% chance of rain."
+      : "🌡️ West Covina: weather unavailable."}\n\ngood morning. nothing urgent across your connected accounts.` });
     expect(
       item.runtime.database.db
         .prepare<[], { kind: string }>("SELECT kind FROM write_intents")
@@ -2686,6 +2707,7 @@ interface RuntimeTestOptions {
   gmailClients?: GmailClientProvider;
   notionClients?: NotionClientProvider;
   googleWorkspaceClients?: GoogleWorkspaceClientProvider;
+  weatherFetch?: RuntimeOverrides["weatherFetch"];
 }
 
 async function newRuntime(
@@ -2710,6 +2732,7 @@ async function newRuntime(
       ? {}
       : { googleWorkspaceClients: options.googleWorkspaceClients }),
     ...(options.notionClients === undefined ? {} : { notionClients: options.notionClients }),
+    weatherFetch: options.weatherFetch ?? (async () => new Response("", { status: 503 })),
     logger: false,
   });
   await runtime.app.ready();

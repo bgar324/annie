@@ -40,6 +40,7 @@ import { OAuthAttemptStore } from "./oauth/attempts.js";
 import { registerGoogleOAuth } from "./oauth/google.js";
 import { ConnectLinkService } from "./oauth/links.js";
 import { registerNotionOAuth } from "./oauth/notion.js";
+import type { ProviderFetch } from "./providers/fetch.js";
 import { QueueStore } from "./queue/store.js";
 import {
   DurableWorker,
@@ -67,6 +68,7 @@ export interface RuntimeOverrides {
   gmailClients?: GmailClientProvider;
   googleWorkspaceClients?: GoogleWorkspaceClientProvider;
   notionClients?: NotionClientProvider;
+  weatherFetch?: ProviderFetch;
   logger?: false;
 }
 
@@ -230,6 +232,7 @@ export async function createRuntime(
       queue,
       traces,
       projector,
+      ...(overrides.weatherFetch === undefined ? {} : { weatherFetch: overrides.weatherFetch }),
     });
     const turn = new InboundTurnService({
       db: database.db,
