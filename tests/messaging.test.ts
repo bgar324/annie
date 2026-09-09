@@ -18,7 +18,6 @@ import { FailureNotificationService } from "../src/messages/failure.js";
 import { MessageIngressService } from "../src/messages/inbound.js";
 import { SendblueReceiver } from "../src/messages/receiver.js";
 import { TypingIndicatorService } from "../src/messages/typing.js";
-import { dailyWeatherLine } from "../src/messages/weather.js";
 import {
   MessagingProviderError,
   type DeliveryResource,
@@ -955,54 +954,6 @@ describe("Sendblue egress", () => {
         .filter((event) => event.event === "reconciliation_status_failed")
         .map((event) => event.providerRequestId),
     ).toEqual(["req_status_failed"]);
-  });
-});
-
-describe("daily weather", () => {
-  const period = (start: string, end: string, isDaytime: boolean, temperature: number, probability: number | null = 1) => ({
-    startTime: start, endTime: end, isDaytime, temperature, temperatureUnit: "F",
-    shortForecast: "Overcast", probabilityOfPrecipitation: { value: probability },
-  });
-
-  it.each(["-07:00", "-08:00"])("uses the requested local day and following night at offset %s", async (offset) => {
-    const harness = createMessagingHarness();
-    const date = offset === "-07:00" ? "2026-09-09" : "2026-12-09";
-    const traceId = newTraceId();
-    let requests = 0;
-    const line = await dailyWeatherLine({
-      date, traceId, traces: harness.traces, signal: new AbortController().signal,
-      fetchImpl: async (_request, init) => {
-        expect(init?.signal?.aborted).toBe(false);
-        expect(harness.traces.list(traceId).at(-1)?.event).toBe("request_attempted");
-        requests += 1;
-        return Response.json(requests === 1
-          ? { properties: { forecast: "https://api.weather.gov/gridpoints/LOX/166,44/forecast", timeZone: "America/Los_Angeles" } }
-          : { properties: { periods: [
-            period(`${date}T01:00:00${offset}`, `${date}T06:00:00${offset}`, false, 60),
-            period(`${date}T06:00:00${offset}`, `${date}T18:00:00${offset}`, true, 95),
-            period(`${date}T18:00:00${offset}`, `${date}T23:59:00${offset}`, false, 74),
-          ] } });
-      },
-    });
-    expect(line).toBe("☁️ West Covina: overcast, high 95°F / low 74°F, 1% chance of rain.");
-    expect(requests).toBe(2);
-  });
-
-  it.each([false, true])("does not invent weather or zero rain probability when data is missing: %s", async (missingDate) => {
-    const harness = createMessagingHarness();
-    let requests = 0;
-    const line = await dailyWeatherLine({
-      date: missingDate ? "2026-09-10" : "2026-09-09", traceId: newTraceId(),
-      traces: harness.traces, signal: new AbortController().signal,
-      fetchImpl: async () => Response.json(++requests === 1
-        ? { properties: { forecast: "https://api.weather.gov/gridpoints/LOX/166,44/forecast", timeZone: "America/Los_Angeles" } }
-        : { properties: { periods: [
-          period("2026-09-09T06:00:00-07:00", "2026-09-09T18:00:00-07:00", true, 95, null),
-          period("2026-09-09T18:00:00-07:00", "2026-09-10T06:00:00-07:00", false, 74),
-        ] } }),
-    });
-    expect(line).toBe(missingDate ? "🌡️ West Covina: weather unavailable."
-      : "☁️ West Covina: overcast, high 95°F / low 74°F, rain chance unavailable.");
   });
 });
 

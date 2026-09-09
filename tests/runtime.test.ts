@@ -1509,8 +1509,8 @@ describe("production runtime", () => {
 
     await runNextJob(item.runtime, scheduled.scheduledForMs + 1);
     expect(weatherRequests).toBe(weatherAvailable ? 2 : 1);
-    // Reclaim after a crash between egress preparation and job settlement. The forecast
-    // and completed model reply must not be regenerated or prefixed a second time.
+    // Reclaim after a crash between egress preparation and job settlement. The stored
+    // forecast context and completed model reply must not be regenerated.
     item.runtime.database.db.prepare("UPDATE jobs SET status = 'pending', available_at_ms = ? WHERE id = ?")
       .run(scheduled.scheduledForMs + 2, scheduled.jobId);
     await runNextJob(item.runtime, scheduled.scheduledForMs + 3);
@@ -1572,9 +1572,7 @@ describe("production runtime", () => {
       item.runtime.database.db
         .prepare<[], { body: string }>("SELECT body FROM egress_messages WHERE purpose = 'reply'")
         .get(),
-    ).toEqual({ body: `${weatherAvailable
-      ? "☁️ West Covina: overcast, high 95°F / low 74°F, 1% chance of rain."
-      : "🌡️ West Covina: weather unavailable."}\n\ngood morning. nothing urgent across your connected accounts.` });
+    ).toEqual({ body: "good morning. nothing urgent across your connected accounts." });
     expect(
       item.runtime.database.db
         .prepare<[], { kind: string }>("SELECT kind FROM write_intents")
