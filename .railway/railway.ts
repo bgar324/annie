@@ -6,8 +6,8 @@ export default defineRailway(() => {
     source: github("bgar324/annie", { checkSuites: false }),
     replicas: { "ams": 1 },
     healthcheck: "/health",
-    healthcheckTimeout: 30,
-    deploy: { sleepApplication: true, startCommand: "node dist/main.js" },
+    healthcheckTimeout: 120,
+    deploy: { sleepApplication: true, startCommand: "node --max-old-space-size=256 dist/main.js" },
     volumeMounts: { "/app/data": benVolume },
     env: { CREDENTIAL_ENCRYPTION_KEY: preserve(), DAILY_BRIEF_ENABLED: preserve(), DEEPSEEK_API_KEY: preserve(), DEEPSEEK_BASE_URL: preserve(), DEEPSEEK_MODEL: preserve(), DEEPSEEK_REASONING_EFFORT: preserve(), GOOGLE_CLIENT_ID: preserve(), GOOGLE_CLIENT_SECRET: preserve(), LOCAL_UI_ENABLED: preserve(), LOCAL_UI_PORT: preserve(), LOG_LEVEL: preserve(), NODE_ENV: preserve(), NOTION_MCP_URL: preserve(), PUBLIC_BASE_URL: preserve(), RAILWAY_DEPLOYMENT_DRAINING_SECONDS: preserve(), SENDBLUE_API_KEY_ID: preserve(), SENDBLUE_API_SECRET_KEY: preserve(), SENDBLUE_BASE_URL: preserve(), SENDBLUE_FROM_NUMBER: preserve(), SENDBLUE_WEBHOOK_SECRET: preserve(), USER_PHONE_NUMBER: preserve(), WAKE_BROKER_URL: preserve(), WAKE_SECRET: preserve() },
   });

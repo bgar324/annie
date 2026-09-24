@@ -13,7 +13,7 @@ Prepare the Sendblue Free Sandbox before the first deploy:
 Then deploy:
 
 1. Create a Railway service from this repository. Railway detects and builds the root `Dockerfile`.
-2. In the service deployment settings, keep one replica and enable Serverless. Set the health-check path to `/health` with a 30-second timeout. Use `ON_FAILURE` with five retries. Clear any temporary maintenance start command so the image starts `node dist/main.js`.
+2. In the service deployment settings, keep one replica and enable Serverless. Set the health-check path to `/health` with a 120-second startup window. Use `ON_FAILURE` with five retries. Replace any temporary maintenance command with `node --max-old-space-size=256 dist/main.js` to leave native-memory headroom within the Free plan.
 3. Add a persistent volume mounted at `/app/data`.
 4. Do not set `RAILWAY_VOLUME_MOUNT_PATH`, `DATA_DIR`, or `RAILWAY_RUN_UID`. Railway provides the mount path. The image starts as root only to prepare the volume, then it drops to `node`.
 5. Assign a public HTTPS domain. Set `PUBLIC_BASE_URL` to its origin without a trailing path.
