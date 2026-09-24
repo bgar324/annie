@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   MemoryMaintenanceRequest,
   MemoryMaintenanceResponse,
@@ -35,7 +35,6 @@ import {
   type DeliveryResource,
   type InboundMessage,
   type InboundPage,
-  type InboundWakeStream,
   type MessageGateway,
 } from "../src/messages/types.js";
 import { WriteStore } from "../src/writes/store.js";
@@ -289,12 +288,9 @@ class FakeGateway implements MessageGateway {
   readonly statusReads: string[] = [];
   readonly listErrors: Error[] = [];
   readonly sendErrors: Error[] = [];
-  streamOpens = 0;
   sendStatus: DeliveryResource["status"] = "pending";
   deliveryStatus: DeliveryResource["status"] = "delivered";
   statusError: Error | undefined;
-  #pendingWakes = 0;
-  #wakeWaiter: (() => void) | undefined;
   #listWaiters: (() => void)[] = [];
 
   async listInbound(input: {
@@ -326,10 +322,6 @@ class FakeGateway implements MessageGateway {
     };
   }
 
-  async openInboundWakeStream(signal: AbortSignal): Promise<InboundWakeStream> {
-    this.streamOpens += 1;
-    return { events: this.#wakeEvents(signal), requestId: `req_stream_${this.streamOpens}` };
-  }
 
   async send(input: { to: string; text: string; replyTo?: string }): Promise<DeliveryResource> {
     this.sends.push(input);
@@ -375,34 +367,6 @@ class FakeGateway implements MessageGateway {
     return promise;
   }
 
-  /** Mimics one `message.received` server-sent event reaching the receiver. */
-  emitWake(): void {
-    this.#pendingWakes += 1;
-    const waiter = this.#wakeWaiter;
-    this.#wakeWaiter = undefined;
-    waiter?.();
-  }
-
-  async *#wakeEvents(signal: AbortSignal): AsyncGenerator<void> {
-    while (!signal.aborted) {
-      if (this.#pendingWakes > 0) {
-        this.#pendingWakes -= 1;
-        yield;
-        continue;
-      }
-      const { promise, resolve } = Promise.withResolvers<void>();
-      const done = () => {
-        signal.removeEventListener("abort", done);
-        if (this.#wakeWaiter === done) {
-          this.#wakeWaiter = undefined;
-        }
-        resolve();
-      };
-      this.#wakeWaiter = done;
-      signal.addEventListener("abort", done, { once: true });
-      await promise;
-    }
-  }
 }
 
 describe("production runtime", () => {
@@ -1971,7 +1935,7 @@ describe("production runtime", () => {
     expect(inboundState(item.runtime)).toBe("done");
   });
 
-  it("starts without contacting Sendblue or the model and exposes no inbound webhook", async () => {
+  it("starts without provider traffic and rejects unauthenticated webhook hints", async () => {
     const model = new FakeModel();
     const gateway = new FakeGateway();
     const item = await newRuntime(model, gateway);
@@ -1980,17 +1944,16 @@ describe("production runtime", () => {
     const health = await item.runtime.app.inject({ method: "GET", url: "/health" });
     const webhook = await item.runtime.app.inject({
       method: "POST",
-      url: "/webhooks/messages",
+      url: "/webhooks/sendblue",
       headers: { "content-type": "application/json" },
       payload: JSON.stringify({ event: "message.received" }),
     });
 
     expect(health.statusCode).toBe(200);
-    expect(webhook.statusCode).toBe(404);
+    expect(webhook.statusCode).toBe(401);
     expect(model.requests).toHaveLength(0);
     expect(model.maintenanceRequests).toHaveLength(0);
     expect(gateway.listCalls).toHaveLength(0);
-    expect(gateway.streamOpens).toBe(0);
     expect(gateway.sends).toHaveLength(0);
     expect(gateway.statusReads).toHaveLength(0);
   });
@@ -2671,32 +2634,66 @@ describe("production runtime", () => {
     ).toBe(2);
   });
 
-  it("ingests a message the wake stream announces and stops on shutdown", async () => {
+  it("schedules completed inbound recovery even after its ordinary attempt cap", async () => {
+    const gateway = new FakeGateway();
+    const item = await newRuntime(new FakeModel(), gateway);
+    gateway.inbox.push(inboundMessage("msg_completed_recovery"));
+    await sweep(item);
+    const job = item.runtime.queue.claim();
+    if (job === undefined) throw new Error("Expected the inbound job");
+    const runs = new AgentRunStore(item.runtime.database.db, item.runtime.traces);
+    const run = runs.startOrResume({
+      source: { kind: "inbound", inboundId: asInboundId(job.subjectId) },
+      traceId: job.traceId,
+      deadlineAtMs: Date.now() + 120_000,
+    });
+    const dueAt = Date.now() + 600_000;
+    item.runtime.database.db.prepare("UPDATE inbound_messages SET state = 'done' WHERE id = ?").run(job.subjectId);
+    item.runtime.database.db.prepare("UPDATE agent_runs SET phase = 'completed' WHERE id = ?").run(run.id);
+    item.runtime.database.db.prepare(
+      "UPDATE jobs SET status = 'pending', attempts = 100, lease_token = NULL, lease_expires_at_ms = NULL, available_at_ms = ? WHERE id = ?",
+    ).run(dueAt, job.id);
+    expect(item.runtime.queue.nextWakeAt()).toBe(dueAt);
+    expect(item.runtime.queue.claim(dueAt)?.id).toBe(job.id);
+  });
+
+  it("sweeps a message announced by an authenticated webhook and stops on shutdown", async () => {
     const gateway = new FakeGateway();
     const item = await newRuntime(new FakeModel(), gateway);
     const controller = new AbortController();
     const startupSweep = gateway.nextList();
     const running = item.runtime.receiver.run(controller.signal);
-
-    await startupSweep;
-    expect(gateway.streamOpens).toBe(1);
-    expect(count(item.runtime, "inbound_messages")).toBe(0);
-
-    const wakeSweep = gateway.nextList();
-    gateway.inbox.push(inboundMessage("msg_wake"));
-    const wokeAtMs = Date.now();
-    gateway.emitWake();
-    await wakeSweep;
-    const wakeLatencyMs = Date.now() - wokeAtMs;
-
-    controller.abort();
-    await running;
-
-    // The receiver also sweeps on a five-second fallback interval, so landing
-    // far inside it is what proves the stream event drove this sweep.
-    expect(wakeLatencyMs).toBeLessThan(2_500);
-    expect(count(item.runtime, "inbound_messages")).toBe(1);
-    expect(count(item.runtime, "jobs")).toBe(1);
+    try {
+      await startupSweep;
+      expect(count(item.runtime, "inbound_messages")).toBe(0);
+      gateway.inbox.push(inboundMessage("msg_wake"));
+      const response = await item.runtime.app.inject({
+        method: "POST",
+        url: "/webhooks/sendblue",
+        headers: { "sb-signing-secret": item.config.sendblue.webhookSecret ?? "" },
+        payload: {
+          from_number: userNumber,
+          number: userNumber,
+          to_number: lineNumber,
+          sendblue_number: lineNumber,
+          is_outbound: false,
+          service: "iMessage",
+          status: "RECEIVED",
+          message_type: "message",
+          group_id: "",
+          message_handle: "msg_wake",
+          content: "Untrusted webhook text must not become the request",
+        },
+      });
+      expect(response.statusCode).toBe(200);
+      await vi.waitFor(() => expect(count(item.runtime, "inbound_messages")).toBe(1));
+      expect(count(item.runtime, "jobs")).toBe(1);
+      expect(item.runtime.database.db.prepare("SELECT text FROM inbound_messages").get())
+        .toEqual({ text: gateway.inbox[0]?.text });
+    } finally {
+      controller.abort();
+      await running;
+    }
   });
 });
 
@@ -2772,6 +2769,8 @@ function runtimeConfig(directory: string): RuntimeConfig {
     DATA_DIR: directory,
     SENDBLUE_API_KEY_ID: "sendblue_test_key_id",
     SENDBLUE_API_SECRET_KEY: "sendblue_test_secret_key",
+    SENDBLUE_WEBHOOK_SECRET: "synthetic_webhook_secret_32_characters",
+    WAKE_SECRET: "synthetic_scheduled_wake_secret_32_characters",
     SENDBLUE_FROM_NUMBER: lineNumber,
     SENDBLUE_BASE_URL: "https://api.sendblue.example",
     USER_PHONE_NUMBER: userNumber,

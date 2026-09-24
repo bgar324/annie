@@ -287,6 +287,73 @@ export class QueueStore {
     return transaction.immediate();
   }
 
+  // The earliest instant at which claim() could hand work to the worker, so an external
+  // scheduler can wake this process instead of polling. Candidates that cannot run yet are
+  // omitted and the job that unblocks them supplies the deadline instead: a memory job
+  // waiting on a delivery receipt, or a job behind an earlier inbound, must never pin the
+  // schedule to a permanently overdue instant.
+  nextWakeAt(nowMs = Date.now()): number | undefined {
+    const row = this.#db
+      .prepare<
+        { max_attempts: number; reconcile_max_attempts: number },
+        { deadline: number | null }
+      >(`
+        SELECT MIN(deadline) AS deadline FROM (
+          SELECT lease_expires_at_ms AS deadline
+          FROM jobs
+          WHERE status = 'running' AND lease_expires_at_ms IS NOT NULL
+
+          UNION ALL
+
+          SELECT candidate.available_at_ms AS deadline
+          FROM jobs AS candidate
+          WHERE candidate.status = 'pending'
+            AND (
+              candidate.attempts < CASE candidate.type
+                WHEN 'egress_reconcile' THEN @reconcile_max_attempts
+                ELSE @max_attempts
+              END
+              OR (
+                candidate.type = 'inbound'
+                AND EXISTS (
+                  SELECT 1
+                  FROM inbound_messages AS inbound
+                  JOIN agent_runs AS runs ON runs.inbound_id = inbound.id
+                  WHERE inbound.id = candidate.subject_id
+                    AND inbound.state = 'done'
+                    AND runs.phase = 'completed'
+                )
+              )
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM jobs AS active
+              WHERE active.chat_id = candidate.chat_id
+                AND active.status = 'running'
+            )
+            AND NOT (${awaitingDeliveryReceiptSql("candidate")})
+            AND (
+              candidate.inbound_sequence IS NULL
+              OR NOT EXISTS (
+                SELECT 1 FROM jobs AS earlier
+                WHERE earlier.chat_id = candidate.chat_id
+                  AND earlier.inbound_sequence < candidate.inbound_sequence
+                  AND earlier.status IN ('pending', 'running')
+                  AND NOT (${awaitingDeliveryReceiptSql("earlier")})
+              )
+            )
+        )
+      `)
+      .get({
+        max_attempts: this.#maxAttempts,
+        reconcile_max_attempts: maximumEgressReconcileAttempts,
+      });
+    const deadline = row?.deadline ?? null;
+    if (deadline === null) {
+      return undefined;
+    }
+    return Math.max(deadline, nowMs);
+  }
+
   assertLease(job: ClaimedJob, nowMs = Date.now()): void {
     const row = this.#db
       .prepare<

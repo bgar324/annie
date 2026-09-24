@@ -34,10 +34,6 @@ export interface InboundPage {
   requestId?: string;
 }
 
-export interface InboundWakeStream {
-  events: AsyncIterable<void>;
-  requestId?: string;
-}
 
 export interface DeliveryResource {
   messageHandle: string;
@@ -53,7 +49,6 @@ export interface InboundMessageSource {
     offset: number;
     signal: AbortSignal;
   }): Promise<InboundPage>;
-  openInboundWakeStream(signal: AbortSignal): Promise<InboundWakeStream>;
 }
 
 export interface MessageSender {

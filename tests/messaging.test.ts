@@ -1,6 +1,7 @@
 import { getEventListeners } from "node:events";
 import { readdirSync, rmSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
+import fastify, { type FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadRuntimeConfig, type RuntimeConfig } from "../src/config.js";
 import {
@@ -23,9 +24,9 @@ import {
   type DeliveryResource,
   type InboundMessage,
   type InboundPage,
-  type InboundWakeStream,
   type MessageGateway,
 } from "../src/messages/types.js";
+import { registerSendblueWebhook } from "../src/messages/webhook.js";
 import { QueueCapacityError, QueueStore, type ClaimedJob } from "../src/queue/store.js";
 import { DurableWorker } from "../src/queue/worker.js";
 import { TraceEvictionService } from "../src/tracing/eviction.js";
@@ -58,9 +59,7 @@ class FakeSendblueGateway implements MessageGateway {
   inbox: InboundMessage[] = [];
   maxPageSize = pageSize;
   listError: MessagingProviderError | undefined;
-  streamError: MessagingProviderError | undefined;
-  wakeEventCount = 0;
-  streamOpens = 0;
+  onList: ((offset: number) => void) | undefined;
   sendHandle = "msg_handle_1";
   sendStatus: DeliveryResource["status"] = "pending";
   sendError: MessagingProviderError | undefined;
@@ -91,6 +90,7 @@ class FakeSendblueGateway implements MessageGateway {
       limit: input.limit,
       offset: input.offset,
     });
+    this.onList?.(input.offset);
     this.#listWaiters = this.#listWaiters.filter((waiter) => {
       if (this.listRequests.length < waiter.count) {
         return true;
@@ -108,17 +108,6 @@ class FakeSendblueGateway implements MessageGateway {
       messages: visible.slice(input.offset, input.offset + Math.min(input.limit, this.maxPageSize)),
       total: visible.length,
       requestId: `req_list_${this.listRequests.length}`,
-    };
-  }
-
-  async openInboundWakeStream(signal: AbortSignal): Promise<InboundWakeStream> {
-    this.streamOpens += 1;
-    if (this.streamError !== undefined) {
-      throw this.streamError;
-    }
-    return {
-      events: wakeEvents(this.wakeEventCount, signal),
-      requestId: `req_stream_${this.streamOpens}`,
     };
   }
 
@@ -158,25 +147,13 @@ class FakeSendblueGateway implements MessageGateway {
   }
 }
 
-async function* wakeEvents(count: number, signal: AbortSignal): AsyncGenerator<void> {
-  for (let index = 0; index < count; index += 1) {
-    if (signal.aborted) {
-      return;
-    }
-    yield undefined;
-  }
-  await new Promise<void>((resolve) => {
-    if (signal.aborted) {
-      resolve();
-      return;
-    }
-    signal.addEventListener("abort", () => resolve(), { once: true });
-  });
-}
-
 const harnesses: MessagingHarness[] = [];
+const webhookApps: FastifyInstance[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  for (const app of webhookApps.splice(0)) {
+    await app.close();
+  }
   for (const harness of harnesses.splice(0)) {
     for (const receiver of harness.receivers.splice(0)) {
       receiver.close();
@@ -259,8 +236,8 @@ describe("Sendblue inbound sweep", () => {
       .prepare<[], { trace_id: string }>("SELECT trace_id FROM inbound_messages")
       .get()?.trace_id;
     expect(traceFiles).toContain(`${acceptedTraceId}.jsonl`);
-    // Only the accepted turn and the rotating poll trace remain; the duplicate
-    // observation was evicted.
+    // Only the accepted turn and the sweep that ingested it remain; the duplicate
+    // observation and the second, empty sweep were evicted.
     expect(traceFiles).toHaveLength(2);
   });
 
@@ -292,62 +269,182 @@ describe("Sendblue inbound sweep", () => {
     expect(cursorRow(harness).updated_at_ms).toBe(baselineMs + 1_000);
   });
 
-  it("treats a stream event as a wake hint that never becomes a message", async () => {
+  it("stays idle without provider calls until a durable hint arrives", async () => {
     const harness = createMessagingHarness();
-    harness.gateway.wakeEventCount = 3;
     const receiver = createReceiver(harness);
     receiver.initialize(Date.now());
     const controller = new AbortController();
 
     const running = receiver.run(controller.signal);
+    await harness.gateway.listedAtLeast(1);
+    await sleep(25);
+
+    // The startup recovery sweep is the only provider call an idle receiver makes.
+    expect(harness.gateway.listRequests).toHaveLength(1);
+    expect(receiver.nextWakeAt()).toBeUndefined();
+    expect(hintRows(harness)).toEqual([]);
+
+    harness.gateway.inbox = [inboundMessage({ id: "msg_hinted" })];
+    receiver.requestWake("msg_hinted");
     await harness.gateway.listedAtLeast(2);
+    await sleep(25);
+
+    expect(harness.gateway.listRequests).toHaveLength(2);
+    expect(inboundRows(harness).map((row) => row.provider_message_id)).toEqual(["msg_hinted"]);
+    expect(hintRows(harness)).toEqual([]);
+
     controller.abort();
     await running;
+  });
 
-    expect(harness.gateway.streamOpens).toBe(1);
-    expect(spooledEvents(harness, "sendblue_stream")).toHaveLength(0);
+  it("keeps a hint durable across a restart until a sweep answers it", async () => {
+    const harness = createMessagingHarness();
+    const baselineMs = Date.now();
+    harness.gateway.inbox = [inboundMessage({ id: "msg_crash", updatedAtMs: baselineMs + 1_000 })];
+    const before = createReceiver(harness);
+    before.initialize(baselineMs);
+    before.requestWake("msg_crash", baselineMs);
+    before.close();
+
+    const after = createReceiver(harness);
+    after.initialize(baselineMs);
+
+    expect(after.nextWakeAt()).toBe(baselineMs);
+    expect(hintRows(harness).map((row) => row.provider_message_id)).toEqual(["msg_crash"]);
+
+    await after.sweepOnce(new AbortController().signal);
+
+    expect(inboundRows(harness).map((row) => row.provider_message_id)).toEqual(["msg_crash"]);
+    expect(hintRows(harness)).toEqual([]);
+  });
+
+  it("keeps a hint that lands while its sweep is already listing", async () => {
+    const harness = createMessagingHarness();
+    const baselineMs = Date.now();
+    harness.gateway.inbox = [inboundMessage({ id: "msg_first", updatedAtMs: baselineMs + 1_000 })];
+    const receiver = createReceiver(harness);
+    receiver.initialize(baselineMs);
+    receiver.requestWake("msg_first", baselineMs);
+    harness.gateway.onList = () => {
+      harness.gateway.onList = undefined;
+      receiver.requestWake("msg_second", baselineMs + 10);
+    };
+
+    await receiver.sweepOnce(new AbortController().signal);
+
+    // The page was already in flight, so it proves nothing about the second message.
+    expect(harness.gateway.listRequests).toHaveLength(1);
+    expect(hintRows(harness).map((row) => row.provider_message_id)).toEqual(["msg_second"]);
+
+    harness.gateway.inbox.push(
+      inboundMessage({ id: "msg_second", updatedAtMs: baselineMs + 2_000 }),
+    );
+    await receiver.sweepOnce(new AbortController().signal);
+
+    expect(inboundRows(harness).map((row) => row.provider_message_id)).toEqual([
+      "msg_first",
+      "msg_second",
+    ]);
+    expect(hintRows(harness)).toEqual([]);
+  });
+
+  it("keeps a repeated plain wake that lands while its own sweep is running", async () => {
+    const harness = createMessagingHarness();
+    const baselineMs = Date.now();
+    const receiver = createReceiver(harness);
+    receiver.initialize(baselineMs);
+    receiver.requestWake(undefined, baselineMs);
+    harness.gateway.onList = () => {
+      harness.gateway.onList = undefined;
+      receiver.requestWake(undefined, baselineMs + 10);
+    };
+
+    await receiver.sweepOnce(new AbortController().signal);
+
+    expect(hintRows(harness).map((row) => row.id)).toEqual(["sweep"]);
+
+    await receiver.sweepOnce(new AbortController().signal);
+
+    expect(hintRows(harness)).toEqual([]);
+  });
+
+  it("retries a hint the list has not shown yet and never invents its message", async () => {
+    const harness = createMessagingHarness();
+    const baselineMs = Date.now();
+    const receiver = createReceiver(harness);
+    receiver.initialize(baselineMs);
+    receiver.requestWake("msg_invisible", baselineMs);
+
+    await receiver.sweepOnce(new AbortController().signal);
+
+    expect(hintRows(harness).map((row) => [row.provider_message_id, row.attempts])).toEqual([
+      ["msg_invisible", 1],
+    ]);
+    expect(hintRows(harness)[0]?.due_at_ms).toBeGreaterThan(baselineMs);
+    // A claimed id is not evidence: nothing about it became durable work.
     expect(countRows(harness, "inbound_messages")).toBe(0);
     expect(countRows(harness, "webhook_deliveries")).toBe(0);
+
+    harness.gateway.inbox = [
+      inboundMessage({ id: "msg_invisible", updatedAtMs: baselineMs + 1_000 }),
+    ];
+    await receiver.sweepOnce(new AbortController().signal);
+
+    expect(inboundRows(harness).map((row) => row.provider_message_id)).toEqual(["msg_invisible"]);
+    expect(hintRows(harness)).toEqual([]);
   });
 
-  it("evicts the trace of a clean stream rotation without projecting it", async () => {
+  it("abandons a hint the authoritative list never shows", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createMessagingHarness();
+      const receiver = createReceiver(harness);
+      receiver.initialize(Date.now());
+      receiver.requestWake("msg_phantom");
+
+      for (let sweep = 0; sweep < 6; sweep += 1) {
+        await receiver.sweepOnce(new AbortController().signal);
+        vi.advanceTimersByTime(60_000);
+      }
+
+      expect(hintRows(harness)).toEqual([]);
+      expect(countRows(harness, "inbound_messages")).toBe(0);
+      expect(countRows(harness, "webhook_deliveries")).toBe(0);
+      expect(spooledEvents(harness, "sendblue_poll").map((event) => event.event)).toContain(
+        "hint_abandoned",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a hint through a transient list failure and ingests on the retry", async () => {
     const harness = createMessagingHarness();
-    harness.gateway.wakeEventCount = 1;
+    const baselineMs = Date.now();
     const receiver = createReceiver(harness);
-    receiver.initialize(Date.now());
-    const controller = new AbortController();
-
-    const running = receiver.run(controller.signal);
-    await harness.gateway.listedAtLeast(2);
-    controller.abort();
-    await running;
-
-    expect(spooledEvents(harness, "sendblue_stream")).toHaveLength(0);
-    const traceFiles = readdirSync(harness.config.traceDir).filter((name) =>
-      name.endsWith(".jsonl"),
-    );
-    expect(traceFiles).toHaveLength(0);
-  });
-
-  it("keeps the trace of a failed stream rotation for debugging", async () => {
-    const harness = createMessagingHarness();
-    harness.gateway.streamError = new MessagingProviderError({
-      message: "stream unavailable",
+    receiver.initialize(baselineMs);
+    harness.gateway.inbox = [
+      inboundMessage({ id: "msg_outage", updatedAtMs: baselineMs + 1_000 }),
+    ];
+    harness.gateway.listError = new MessagingProviderError({
+      message: "sendblue unavailable",
       kind: "transient",
-      retryAfterMs: 10,
+      retryAfterMs: 5,
     });
-    const receiver = createReceiver(harness);
-    receiver.initialize(Date.now());
+    receiver.requestWake("msg_outage", baselineMs);
     const controller = new AbortController();
 
     const running = receiver.run(controller.signal);
+    await harness.gateway.listedAtLeast(1);
+    harness.gateway.listError = undefined;
     await harness.gateway.listedAtLeast(2);
+    await sleep(25);
+
+    expect(inboundRows(harness).map((row) => row.provider_message_id)).toEqual(["msg_outage"]);
+    expect(hintRows(harness)).toEqual([]);
+
     controller.abort();
     await running;
-
-    expect(
-      spooledEvents(harness, "sendblue_stream").map((event) => event.event),
-    ).toContain("stream_failed");
   });
 
   it("rejects any message that is not the exact trusted sender on the exact line", () => {
@@ -425,6 +522,200 @@ describe("Sendblue inbound sweep", () => {
   });
 });
 
+describe("Sendblue wake webhook", () => {
+  const webhookSecret = "sb_signing_secret_value";
+
+  it("commits a durable hint before acknowledging, without ingesting anything", async () => {
+    const harness = createMessagingHarness();
+    const receiver = createReceiver(harness);
+    receiver.initialize(Date.now());
+    const app = createWebhookApp(harness, receiver, webhookSecret);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/webhooks/sendblue",
+      headers: { "sb-signing-secret": webhookSecret },
+      payload: wireMessage({ message_handle: "msg_hook" }),
+    });
+
+    // The hint is committed by the time the acknowledgement leaves.
+    expect(response.statusCode).toBe(200);
+    expect(hintRows(harness).map((row) => row.provider_message_id)).toEqual(["msg_hook"]);
+    expect(receiver.nextWakeAt()).toBeLessThanOrEqual(Date.now());
+    // The callback is a reason to look, never message data, and it touches no network.
+    expect(countRows(harness, "webhook_deliveries")).toBe(0);
+    expect(countRows(harness, "inbound_messages")).toBe(0);
+    expect(harness.gateway.listRequests).toEqual([]);
+  });
+
+  it("ingests what the authoritative list shows, not what the callback claimed", async () => {
+    const harness = createMessagingHarness();
+    const baselineMs = Date.now();
+    const receiver = createReceiver(harness);
+    receiver.initialize(baselineMs);
+    const app = createWebhookApp(harness, receiver, webhookSecret);
+    harness.gateway.inbox = [
+      inboundMessage({ id: "msg_hook", text: "listed text", updatedAtMs: baselineMs + 1_000 }),
+    ];
+
+    await app.inject({
+      method: "POST",
+      url: "/webhooks/sendblue",
+      headers: { "sb-signing-secret": webhookSecret },
+      payload: wireMessage({ message_handle: "msg_hook", content: "callback text" }),
+    });
+    await receiver.sweepOnce(new AbortController().signal);
+
+    expect(inboundRows(harness).map((row) => [row.provider_message_id, row.text])).toEqual([
+      ["msg_hook", "listed text"],
+    ]);
+    expect(hintRows(harness)).toEqual([]);
+  });
+
+  it("refuses every callback that does not present the exact secret", async () => {
+    const harness = createMessagingHarness();
+    const receiver = createReceiver(harness);
+    receiver.initialize(Date.now());
+    const app = createWebhookApp(harness, receiver, webhookSecret);
+
+    const responses = await Promise.all(
+      [
+        undefined,
+        "",
+        webhookSecret.slice(0, -1),
+        `${webhookSecret}x`,
+        webhookSecret.toUpperCase(),
+      ].map((presented) =>
+        app.inject({
+          method: "POST",
+          url: "/webhooks/sendblue",
+          headers: presented === undefined ? {} : { "sb-signing-secret": presented },
+          payload: wireMessage({ message_handle: "msg_forged" }),
+        }),
+      ),
+    );
+
+    expect(responses.map((response) => response.statusCode)).toEqual([401, 401, 401, 401, 401]);
+    expect(hintRows(harness)).toEqual([]);
+  });
+
+  it("answers 503 and commits nothing while no webhook secret is configured", async () => {
+    const harness = createMessagingHarness();
+    const receiver = createReceiver(harness);
+    receiver.initialize(Date.now());
+    const app = createWebhookApp(harness, receiver, undefined);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/webhooks/sendblue",
+      headers: { "sb-signing-secret": webhookSecret },
+      payload: wireMessage({ message_handle: "msg_unconfigured" }),
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(hintRows(harness)).toEqual([]);
+  });
+
+  it("ignores an authenticated callback for another sender, line, or shape", async () => {
+    const harness = createMessagingHarness();
+    const receiver = createReceiver(harness);
+    receiver.initialize(Date.now());
+    const app = createWebhookApp(harness, receiver, webhookSecret);
+    const foreign = [
+      { from_number: "+15557778888" },
+      { number: "+15557778888" },
+      { sendblue_number: "+15553334444" },
+      { to_number: "+15553334444" },
+      { is_outbound: true },
+      { status: "DELIVERED" },
+      { service: "SMS" },
+      { message_type: "group", group_id: "grp_1" },
+      { group_id: "grp_1" },
+    ];
+
+    const responses = await Promise.all(
+      foreign.map((overrides, index) =>
+        app.inject({
+          method: "POST",
+          url: "/webhooks/sendblue",
+          headers: { "sb-signing-secret": webhookSecret },
+          payload: wireMessage({ message_handle: `msg_foreign_${index}`, ...overrides }),
+        }),
+      ),
+    );
+
+    expect(responses.map((response) => response.statusCode)).toEqual(foreign.map(() => 204));
+    expect(hintRows(harness)).toEqual([]);
+  });
+
+  it("accepts the live one-to-one shape, whose group id is an empty string", async () => {
+    const harness = createMessagingHarness();
+    const receiver = createReceiver(harness);
+    receiver.initialize(Date.now());
+    const app = createWebhookApp(harness, receiver, webhookSecret);
+
+    const responses = await Promise.all(
+      [{ group_id: "" }, { group_id: null }, { group_id: undefined }].map((overrides, index) =>
+        app.inject({
+          method: "POST",
+          url: "/webhooks/sendblue",
+          headers: { "sb-signing-secret": webhookSecret },
+          payload: wireMessage({ message_handle: `msg_one_to_one_${index}`, ...overrides }),
+        }),
+      ),
+    );
+
+    expect(responses.map((response) => response.statusCode)).toEqual([200, 200, 200]);
+    expect(hintRows(harness).map((row) => row.provider_message_id)).toEqual([
+      "msg_one_to_one_0",
+      "msg_one_to_one_1",
+      "msg_one_to_one_2",
+    ]);
+  });
+
+  it("still schedules a sweep when an authenticated payload is unreadable", async () => {
+    const harness = createMessagingHarness();
+    const receiver = createReceiver(harness);
+    receiver.initialize(Date.now());
+    const app = createWebhookApp(harness, receiver, webhookSecret);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/webhooks/sendblue",
+      headers: { "sb-signing-secret": webhookSecret },
+      payload: { unexpected: "shape" },
+    });
+
+    // A payload change must never silently drop a message: the sweep still happens,
+    // it just carries no claim to look for.
+    expect(response.statusCode).toBe(202);
+    expect(hintRows(harness).map((row) => [row.id, row.provider_message_id])).toEqual([
+      ["sweep", null],
+    ]);
+  });
+
+  it("withholds the acknowledgement when the hint cannot be committed", async () => {
+    const harness = createMessagingHarness();
+    const receiver = createReceiver(harness);
+    receiver.initialize(Date.now());
+    const app = createWebhookApp(harness, receiver, webhookSecret);
+    // The acknowledgement is what stops Sendblue retrying, so it has to be downstream
+    // of the durable commit: with the hint store gone, nothing may be acknowledged.
+    harness.database.handle.db.exec(
+      "ALTER TABLE sendblue_wake_hints RENAME TO sendblue_wake_hints_unavailable",
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/webhooks/sendblue",
+      headers: { "sb-signing-secret": webhookSecret },
+      payload: wireMessage({ message_handle: "msg_uncommittable" }),
+    });
+
+    expect(response.statusCode).toBe(500);
+  });
+});
+
 describe("Sendblue API requests", () => {
   it("authenticates every list with the key pair, the configured base URL, and server-side filters", async () => {
     const harness = createMessagingHarness();
@@ -483,49 +774,6 @@ describe("Sendblue API requests", () => {
       status: "RECEIVED",
       updated_at_gte: new Date(1_700_000_000_000).toISOString(),
     });
-    expect(request.headers.get("sb-api-key-id")).toBe("sb_test_key_id");
-    expect(request.headers.get("sb-api-secret-key")).toBe("sb_test_secret_key");
-  });
-
-  it("opens an authenticated message-received event stream as a wake hint", async () => {
-    const harness = createMessagingHarness();
-    const calls: Request[] = [];
-    const gateway = new SendblueGateway(
-      harness.config,
-      stubFetch(
-        calls,
-        () =>
-          new Response(
-            `data: ${JSON.stringify({
-              id: "event_1",
-              type: "message.received",
-              occurred_at: new Date(1_700_000_000_000).toISOString(),
-              version: 1,
-              data: { message_handle: "msg_1" },
-            })}\n\n`,
-            {
-              headers: {
-                "content-type": "text/event-stream",
-                "x-request-id": "req_stream_1",
-              },
-            },
-          ),
-      ),
-    );
-
-    const stream = await gateway.openInboundWakeStream(new AbortController().signal);
-    const wakes: void[] = [];
-    for await (const wake of stream.events) {
-      wakes.push(wake);
-    }
-
-    expect(wakes).toEqual([undefined]);
-    expect(stream.requestId).toBe("req_stream_1");
-    const request = requiredRequest(calls[0]);
-    const url = new URL(request.url);
-    expect(url.pathname).toBe("/api/v2/events");
-    expect(url.searchParams.get("types")).toBe("message.received");
-    expect(request.headers.get("accept")).toBe("text/event-stream");
     expect(request.headers.get("sb-api-key-id")).toBe("sb_test_key_id");
     expect(request.headers.get("sb-api-secret-key")).toBe("sb_test_secret_key");
   });
@@ -1505,6 +1753,23 @@ function createReceiver(harness: MessagingHarness): SendblueReceiver {
   return receiver;
 }
 
+function createWebhookApp(
+  harness: MessagingHarness,
+  receiver: SendblueReceiver,
+  secret: string | undefined,
+): FastifyInstance {
+  const app = fastify({ logger: false });
+  registerSendblueWebhook({
+    app,
+    receiver,
+    secret,
+    lineNumber: harness.config.sendblue.fromNumber,
+    trustedSender: harness.config.userPhoneNumber,
+  });
+  webhookApps.push(app);
+  return app;
+}
+
 function testRuntimeConfig(database: TestDatabase): RuntimeConfig {
   return loadRuntimeConfig({
     NODE_ENV: "test",
@@ -1693,6 +1958,23 @@ function cursorRow(harness: MessagingHarness): { updated_at_ms: number; recovere
     throw new Error("Expected the Sendblue ingress cursor");
   }
   return row;
+}
+
+interface WakeHintRow {
+  id: string;
+  provider_message_id: string | null;
+  due_at_ms: number;
+  attempts: number;
+  request_count: number;
+}
+
+function hintRows(harness: MessagingHarness): WakeHintRow[] {
+  return harness.database.handle.db
+    .prepare<[], WakeHintRow>(`
+      SELECT id, provider_message_id, due_at_ms, attempts, request_count
+      FROM sendblue_wake_hints ORDER BY id
+    `)
+    .all();
 }
 
 interface InboundRow {

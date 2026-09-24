@@ -1,5 +1,5 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
-import { Auth } from "googleapis";
+import { CodeChallengeMethod, OAuth2Client, type OAuth2ClientOptions } from "google-auth-library";
 import { z } from "zod";
 import { GOOGLE_WORKSPACE_READ_SCOPES, type RuntimeConfig } from "../config.js";
 import type { ConnectionStore } from "../connections/store.js";
@@ -71,7 +71,7 @@ export function registerGoogleOAuth(input: {
               state,
               nonce,
               code_challenge: codeChallenge,
-              code_challenge_method: Auth.CodeChallengeMethod.S256,
+              code_challenge_method: CodeChallengeMethod.S256,
             }),
             context: {},
           }),
@@ -265,9 +265,9 @@ function finalizeGoogleConnection(
 
 export function createGoogleOAuthClient(
   config: RuntimeConfig,
-  endpoints?: Auth.OAuth2ClientOptions["endpoints"],
-): Auth.OAuth2Client {
-  const client = new Auth.OAuth2Client({
+  endpoints?: OAuth2ClientOptions["endpoints"],
+): OAuth2Client {
+  const client = new OAuth2Client({
     clientId: config.google.clientId,
     clientSecret: config.google.clientSecret,
     redirectUri: config.google.callbackUrl,
@@ -288,7 +288,7 @@ export function createGoogleOAuthClient(
 }
 
 async function actualGoogleScopes(
-  oauth: Auth.OAuth2Client,
+  oauth: OAuth2Client,
   tokenScopes: string | null | undefined,
   accessToken: string | null | undefined,
   beforeTokenInfo: () => void,

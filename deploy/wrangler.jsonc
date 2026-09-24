@@ -1,0 +1,35 @@
+{
+  // Annie's external wake broker. Deploy from the repository root:
+  //   wrangler deploy -c deploy/wrangler.jsonc
+  //   wrangler secret put WAKE_SECRET -c deploy/wrangler.jsonc
+  // WAKE_SECRET is the shared bearer token for both directions and is never stored here.
+  "name": "annie-wake-broker",
+  "main": "wake-broker.mjs",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "vars": {
+    // Public application endpoint; the bearer secret is what protects it.
+    "APP_WAKE_URL": "https://ben-production-af63.up.railway.app/internal/wake"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "WAKE_BROKER",
+        "class_name": "WakeBroker"
+      }
+    ]
+  },
+  // SQLite-backed Durable Objects are the storage class available on the free plan. The object
+  // holds one wake deadline and its alarm; no application data ever reaches it.
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["WakeBroker"]
+    }
+  ],
+  // Hourly alarm repair only. This never calls the application: it re-arms an alarm that the
+  // platform lost and leaves the stored deadline untouched.
+  "triggers": {
+    "crons": ["17 * * * *"]
+  }
+}

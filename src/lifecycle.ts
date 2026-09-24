@@ -100,6 +100,7 @@ export async function runAssistantProcess(input: {
       settleActor(runtime.worker.run(abort.signal)),
       settleActor(runtime.receiver.run(abort.signal)),
       settleActor(runtime.dailyBrief.run(abort.signal)),
+      settleActor(runtime.wakeScheduler.run(abort.signal)),
     ]).then(() => {
       if (actorFailed) {
         throw firstActorFailure;

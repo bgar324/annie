@@ -850,6 +850,33 @@ const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE write_intents_v10 RENAME TO write_intents;
     `,
   },
+  {
+    // The receiver no longer polls Sendblue on a timer: an authenticated webhook or a
+    // scheduled broker wake commits a hint here before it is acknowledged, and the hint
+    // survives until an authoritative page proves the message was listed. A hint is a
+    // reason to sweep, never message content: the only provider data it carries is the
+    // claimed message id used to look for a committed delivery row.
+    version: 11,
+    sql: `
+      CREATE TABLE sendblue_wake_hints (
+        id TEXT PRIMARY KEY,
+        provider_message_id TEXT CHECK (
+          provider_message_id IS NULL
+          OR (length(provider_message_id) BETWEEN 1 AND 128)
+        ),
+        due_at_ms INTEGER NOT NULL CHECK (due_at_ms >= 0),
+        attempts INTEGER NOT NULL CHECK (attempts >= 0),
+        expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms >= 0),
+        -- Bumped by every requestWake. A sweep clears only the exact request it
+        -- claimed, so a wake that lands mid-sweep keeps the row and earns its own.
+        request_count INTEGER NOT NULL CHECK (request_count > 0),
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE INDEX sendblue_wake_hints_due ON sendblue_wake_hints(due_at_ms);
+    `,
+  },
 ];
 
 export function runMigrations(

@@ -1,4 +1,4 @@
-import Sendblue, { APIError, APIUserAbortError } from "sendblue";
+import Sendblue, { APIError } from "sendblue";
 import { z } from "zod";
 import type { RuntimeConfig } from "../config.js";
 import {
@@ -6,7 +6,6 @@ import {
   type DeliveryResource,
   type InboundMessage,
   type InboundPage,
-  type InboundWakeStream,
   type MessageGateway,
 } from "./types.js";
 
@@ -87,15 +86,6 @@ const statusDeliverySchema = deliverySchema
 const typingSchema = z
   .object({ status: z.enum(["SENT", "ERROR"]).nullish(), error_message: z.string().max(4_096).nullish() })
   .loose();
-const eventSchema = z
-  .object({
-    id: z.string().min(1).max(512),
-    occurred_at: isoTimestamp,
-    type: z.string().min(1).max(128),
-    version: z.literal(1),
-    data: z.record(z.string(), z.unknown()),
-  })
-  .loose();
 const maximumApiResponseBytes = 4 * 1_024 * 1_024;
 
 export class SendblueGateway implements MessageGateway {
@@ -170,19 +160,6 @@ export class SendblueGateway implements MessageGateway {
     }
   }
 
-  async openInboundWakeStream(signal: AbortSignal): Promise<InboundWakeStream> {
-    try {
-      const { data: stream, response } = await this.#client.events
-        .stream({ types: "message.received" }, { signal, maxRetries: 0 })
-        .withResponse();
-      return {
-        events: validatedWakeEvents(stream, signal),
-        ...requestId(response),
-      };
-    } catch (error) {
-      throw normalizeMessagingError(error, false);
-    }
-  }
 
   async send(input: { to: string; text: string; replyTo?: string }): Promise<DeliveryResource> {
     try {
@@ -313,27 +290,6 @@ function deliveryStatus(value: z.infer<typeof deliveryStatusSchema>): DeliveryRe
   }
 }
 
-async function* validatedWakeEvents(
-  stream: AsyncIterable<unknown>,
-  signal: AbortSignal,
-): AsyncGenerator<void> {
-  try {
-    for await (const rawEvent of stream) {
-      if (signal.aborted) {
-        return;
-      }
-      const event = parseResponse(eventSchema, rawEvent, false);
-      if (event.type === "message.received") {
-        yield undefined;
-      }
-    }
-  } catch (error) {
-    if (signal.aborted || error instanceof APIUserAbortError) {
-      return;
-    }
-    throw normalizeMessagingError(error, false);
-  }
-}
 
 function parseResponse<T extends z.ZodType>(
   schema: T,

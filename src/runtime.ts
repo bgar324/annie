@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import fastify, { type FastifyInstance } from "fastify";
 import { AgentLoop } from "./agent/loop.js";
 import { DeepSeekChatModel } from "./agent/deepseek.js";
@@ -28,6 +29,8 @@ import { FailureNotificationService } from "./messages/failure.js";
 import { TypingIndicatorService } from "./messages/typing.js";
 import { MessageIngressService } from "./messages/inbound.js";
 import { SendblueReceiver } from "./messages/receiver.js";
+import { registerSendblueWebhook } from "./messages/webhook.js";
+import { WakeScheduler } from "./messages/wake-scheduler.js";
 import { InboundTurnService } from "./messages/turn.js";
 import {
   MessagingProviderError,
@@ -84,6 +87,7 @@ export interface AssistantRuntime {
   worker: DurableWorker;
   receiver: SendblueReceiver;
   dailyBrief: DailyBriefService;
+  wakeScheduler: WakeScheduler;
   handlers: JobHandlers;
   queue: QueueStore;
   traces: TraceStore;
@@ -351,6 +355,33 @@ export async function createRuntime(
       logger: overrides.logger === false ? false : { level: config.logLevel },
       bodyLimit: 1_048_576,
     });
+    registerSendblueWebhook({
+      app,
+      receiver,
+      secret: config.sendblue.webhookSecret,
+      lineNumber: config.sendblue.fromNumber,
+      trustedSender: config.userPhoneNumber,
+    });
+    const wakeScheduler = new WakeScheduler({
+      queue,
+      receiver,
+      dailyBrief,
+      traces,
+      brokerUrl: config.wake.brokerUrl,
+      secret: config.wake.secret,
+    });
+    app.post("/internal/wake", { bodyLimit: 1_024 }, async (request, reply) => {
+      if (config.wake.secret === undefined) {
+        return reply.code(503).send({ ok: false });
+      }
+      const received = Buffer.from(request.headers.authorization ?? "");
+      const expected = Buffer.from(`Bearer ${config.wake.secret}`);
+      if (received.length !== expected.length || !timingSafeEqual(received, expected)) {
+        return reply.code(401).send({ ok: false });
+      }
+      receiver.requestWake();
+      return reply.code(202).send({ ok: true });
+    });
     let ready = false;
     app.get("/health", async (_request, reply) => {
       if (!ready) {
@@ -402,6 +433,7 @@ export async function createRuntime(
       eviction,
       tools,
       dailyBrief,
+      wakeScheduler,
       handlers,
       localUi: { connections, links, memory },
       isReady() {

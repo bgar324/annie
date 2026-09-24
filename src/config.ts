@@ -43,6 +43,9 @@ const runtimeEnvSchema = storageEnvSchema.extend({
   SENDBLUE_API_SECRET_KEY: nonEmpty,
   SENDBLUE_FROM_NUMBER: e164Number,
   SENDBLUE_BASE_URL: z.url().default("https://api.sendblue.co"),
+  SENDBLUE_WEBHOOK_SECRET: nonEmpty.min(32).optional(),
+  WAKE_BROKER_URL: z.url().optional(),
+  WAKE_SECRET: nonEmpty.min(32).optional(),
   USER_PHONE_NUMBER: e164Number,
 
   PUBLIC_BASE_URL: z.url(),
@@ -102,9 +105,14 @@ export interface RuntimeConfig extends StorageConfig {
     apiSecretKey: string;
     fromNumber: string;
     baseUrl: string;
+    webhookSecret: string | undefined;
   };
   userPhoneNumber: string;
   publicBaseUrl: string;
+  wake: {
+    brokerUrl: string | undefined;
+    secret: string | undefined;
+  };
   deepseek: {
     apiKey: string;
     model: string;
@@ -197,6 +205,16 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
   validateProviderUrl(parsed.SENDBLUE_BASE_URL, "SENDBLUE_BASE_URL", parsed.NODE_ENV);
   validateProviderUrl(parsed.DEEPSEEK_BASE_URL, "DEEPSEEK_BASE_URL", parsed.NODE_ENV);
   validateProviderUrl(parsed.NOTION_MCP_URL, "NOTION_MCP_URL", parsed.NODE_ENV);
+  if (parsed.WAKE_BROKER_URL !== undefined) {
+    validateProviderUrl(parsed.WAKE_BROKER_URL, "WAKE_BROKER_URL", parsed.NODE_ENV);
+  }
+  if (parsed.NODE_ENV === "production") {
+    for (const name of ["SENDBLUE_WEBHOOK_SECRET", "WAKE_BROKER_URL", "WAKE_SECRET"] as const) {
+      if (parsed[name] === undefined) {
+        throw new Error(`${name} is required in production`);
+      }
+    }
+  }
 
 
   return {
@@ -209,9 +227,11 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
       apiSecretKey: parsed.SENDBLUE_API_SECRET_KEY,
       fromNumber: parsed.SENDBLUE_FROM_NUMBER,
       baseUrl: trimTrailingSlash(parsed.SENDBLUE_BASE_URL),
+      webhookSecret: parsed.SENDBLUE_WEBHOOK_SECRET,
     },
     userPhoneNumber: parsed.USER_PHONE_NUMBER,
     publicBaseUrl,
+    wake: { brokerUrl: parsed.WAKE_BROKER_URL, secret: parsed.WAKE_SECRET },
     deepseek: {
       apiKey: parsed.DEEPSEEK_API_KEY,
       model: parsed.DEEPSEEK_MODEL,
@@ -253,6 +273,8 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
       parsed.DEEPSEEK_API_KEY,
       parsed.GOOGLE_CLIENT_SECRET,
       parsed.CREDENTIAL_ENCRYPTION_KEY,
+      ...(parsed.SENDBLUE_WEBHOOK_SECRET === undefined ? [] : [parsed.SENDBLUE_WEBHOOK_SECRET]),
+      ...(parsed.WAKE_SECRET === undefined ? [] : [parsed.WAKE_SECRET]),
     ],
   };
 }

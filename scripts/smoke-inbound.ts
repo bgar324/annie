@@ -139,7 +139,6 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
       const matches = inbox.filter((message) => message.updatedAtMs >= input.updatedAtGteMs);
       return { messages: matches.slice(input.offset, input.offset + input.limit), total: matches.length };
     },
-    async openInboundWakeStream() { throw new Error("Smoke never opens the event stream"); },
     async startTyping() { return undefined; },
     async send(input) {
       sent.push(input.text);

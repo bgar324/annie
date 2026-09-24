@@ -12,7 +12,7 @@ The transport is one Sendblue Free Sandbox line. That plan sets the operating en
 
 - The line number is assigned by Sendblue and shared, so `SENDBLUE_FROM_NUMBER` identifies the line, not an owned phone number. Inbound matching therefore requires the exact sender as well as the exact line.
 - Only a contact verified in Sendblue can exchange messages with the line, and that contact must open the conversation by texting the line before the assistant can send to it. Setup is verified-contact first, inbound-first.
-- The sandbox delivers nothing to this service. There is no webhook endpoint, no signature to verify, and no messaging callback to register with the provider. Every inbound message is discovered by the list sweep.
+- Sendblue delivers receive webhooks for the verified shared-line account. A live callback proved delivery on 2026-09-24. The callback is an authenticated wake hint, never a source of message content. The paged list sweep remains authoritative.
 - Sendblue returns no transcription for inbound audio, so voice notes cannot become user input.
 - One reply is one send call. Sendblue caps message content at 18,996 characters, and the agent's final answer is bounded to the same 18,996 characters, so the send path always accepts it.
 
@@ -23,7 +23,8 @@ One process owns one long-lived `better-sqlite3` connection and these components
 ```mermaid
 flowchart LR
   S[Sendblue list sweep] --> R[Sendblue receiver]
-  X[Sendblue event stream] -. wake .-> R
+  X[Sendblue webhook] -. durable wake hint .-> R
+  C[External wake broker] -. scheduled wake .-> R
   B[Daily brief scheduler] --> D
   R --> D[(SQLite)]
   D --> W[Durable worker]
@@ -38,7 +39,7 @@ flowchart LR
   H[Fastify boundary] --> D
 ```
 
-The public Fastify instance serves only `/health`, the signed connection routes, the OAuth callbacks, and the Notion client metadata document. No provider posts to this service, so the public HTTP surface is not part of message transport.
+The public Fastify instance serves `/health`, `/webhooks/sendblue`, `/internal/wake`, signed connection routes, OAuth callbacks, and the Notion client metadata document. The Sendblue endpoint checks the per-webhook secret and exact sender and line fields. The scheduled endpoint uses a separate bearer secret. Both persist a wake obligation before acknowledging it.
 
 When enabled, the authoritative process adds a second Fastify instance bound only to container `127.0.0.1`. It reuses that process's database handle, connection store, signed-link service, and memory store. Railway publishes only the public listener; an authenticated SSH local forward is the sole browser path to account health, new Google connection, and revision-checked `MEMORY.md` editing. The tunnel starts no second assistant runtime.
 
@@ -48,21 +49,29 @@ Before SQLite opens, startup trims projected trace files down to a small emergen
 
 ## Inbound message flow
 
-Ingress is a poll loop, not a callback. `SendblueReceiver` owns it:
+Ingress is a paged sweep driven by durable wake hints, not by callback payloads. `SendblueReceiver` owns it:
 
 1. Read the durable single-row ingress cursor.
 2. List inbound messages with `updated_at_gte` set to the cursor, minus a 60-second overlap once the cursor has completed one sweep, ordered by `updatedAt` ascending, 100 per page.
 3. Page through the reported total, rejecting a response whose pagination or ordering contradicts the request.
 4. Ingest each message, then advance the cursor to the highest observed `updatedAt` for the page.
-5. Sleep 5 seconds, or resume immediately when the event stream signals activity.
+5. Resolve hints against committed delivery rows. Retry bounded message-list visibility delays, then wait without provider traffic when no hints remain.
 
 Ingesting one message inserts the delivery, inbound message, initial trace events, and durable job in one SQLite transaction. Provider message IDs are unique, so the overlap window re-observes messages already stored and resolves them to the existing delivery instead of creating another inbound message, job, or agent run.
 
 A message is accepted only when its line number and recipient number both equal the configured Sendblue line, its sender number and contact number both equal `USER_PHONE_NUMBER`, it is inbound, it is a one-to-one `message` with no group ID, its service is `iMessage`, and its status is `RECEIVED`. Every other message is recorded as rejected with a reason and never gets an inbound row, a job, or a tool call.
 
-The event stream is a latency optimization only. A `message.received` event wakes the sweep early; it never carries message content into the database. When the stream is unavailable, the receiver reconnects with bounded backoff and the 5-second sweep continues to deliver every message.
+Migration 11 adds `sendblue_wake_hints`. Startup and authenticated scheduled wakes request a recovery sweep. Receive webhooks record a bounded provider-message hint, not message text. A request counter prevents an older sweep from clearing a newer hint. Successful sweeps preserve the existing cursor overlap and deduplication rules. There is no idle five-second poll or event stream. If a webhook is missed or its short visibility retries expire, the next recovery sweep can discover the message from the retained cursor, subject to Sendblue retention.
 
 Sendblue does not transcribe inbound audio. A media-only message therefore arrives with no text, is blocked without an agent run, and produces one `missing_text` failure notice. Safe message metadata records that media was present; attachment URLs are not retained.
+
+## Sleeping and scheduled wakes
+
+`WakeScheduler` publishes the earliest actionable queue, receiver, or deferred daily-brief deadline to the external broker. Receipt-blocked memory jobs do not cause repeated immediate wakes. Completed inbound finalization remains schedulable beyond the ordinary attempt cap. Local worker and daily scheduler loops remain active only while the process is running; they cannot wake a sleeping container.
+
+`deploy/wake-broker.mjs` runs as one SQLite-backed Cloudflare Durable Object. It stores only a wake deadline and retry metadata, not application state or provider credentials. It commits the deadline and alarm before acknowledging `/schedule`, retries failed Railway wakes, and preserves newer schedules received during an in-flight wake. Its hourly cron repairs alarms without contacting Railway. A six-hour UTC fallback supplies missed-message and scheduling recovery. Normal delivery and memory jobs drain while awake; delayed work is included in the published deadline.
+
+Railway Serverless must be enabled. A healthy idle receiver makes no outbound requests, allowing the platform to sleep after its network-idle window. This change does not promise a sub-dollar bill or a fixed cold-start latency. Google adapters import only their used API modules and the direct authentication library rather than loading every Google API, reducing startup memory without changing scopes or provider operations.
 
 ## Durable queue
 

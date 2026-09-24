@@ -5,7 +5,7 @@
 This service controls real Google Workspace, Notion, and iMessage accounts. Preserve these rules in every change:
 
 - Accept an inbound message only when it names the exact Sendblue line (`SENDBLUE_FROM_NUMBER`) and the exact trusted sender (`USER_PHONE_NUMBER`) on both of their reported fields.
-- Treat the paged inbound list sweep as the authoritative ingress path. The event stream is a latency hint only; never let a stream event become the source of a message.
+- Treat the paged inbound list sweep as the authoritative ingress path. Authenticated webhooks and scheduled calls are wake hints only; never ingest message content from their payloads. Commit the wake obligation before acknowledging it.
 - Commit the delivery row, inbound row, trace events, and job in one SQLite transaction, and advance the durable ingress cursor only from committed rows.
 - Keep every network call outside SQLite transactions.
 - Commit a trace attempt before each external request.
@@ -69,6 +69,8 @@ A job is at least once. A provider mutation is not. If the process may have issu
 Pin `sendblue@3.16.1` with `maxRetries: 0` and route every call through `SendblueGateway`. The gateway validates each response with an application Zod codec and normalizes failures into `MessagingProviderError` with kind `terminal`, `transient`, or `ambiguous`. A failed write is `ambiguous` unless the provider confirmed the failure.
 
 Inbound listing is filtered server-side to the trusted sender, the configured line, inbound direction, one-to-one iMessage, and `RECEIVED` status, and is ordered by `updatedAt` ascending. The receiver still re-checks every field locally before accepting. Sendblue does not transcribe inbound audio, so there is no voice path: a message without text reaches `missing_text` handling.
+
+Receive callbacks use `/webhooks/sendblue` and `sb-signing-secret`. Validate the trusted sender and configured line on both fields, direction, service, status, and group identity before accepting a keyed hint. An empty `group_id` is a one-to-one message. Stop provider polling while idle. Keep delayed-job and daily-brief wake deadlines registered with the external broker before relying on platform sleep.
 
 ### DeepSeek
 

@@ -1,4 +1,7 @@
-import { google } from "googleapis";
+import { calendar_v3 } from "googleapis/build/src/apis/calendar/v3.js";
+import { drive_v3 } from "googleapis/build/src/apis/drive/v3.js";
+import { people_v1 } from "googleapis/build/src/apis/people/v1.js";
+import { tasks_v1 } from "googleapis/build/src/apis/tasks/v1.js";
 import type { RuntimeConfig } from "../config.js";
 import type { RefreshCoordinator } from "../connections/refresh.js";
 import type { ConnectionId, TraceId } from "../core/ids.js";
@@ -124,10 +127,10 @@ export class GoogleApisWorkspaceClientProvider implements GoogleWorkspaceClientP
       ...(credential.tokenType === undefined ? {} : { token_type: credential.tokenType }),
       scope: credential.scopes.join(" "),
     });
-    const calendar = google.calendar({ version: "v3", auth: oauth });
-    const drive = google.drive({ version: "v3", auth: oauth });
-    const people = google.people({ version: "v1", auth: oauth });
-    const tasks = google.tasks({ version: "v1", auth: oauth });
+    const calendar = new calendar_v3.Calendar({ auth: oauth });
+    const drive = new drive_v3.Drive({ auth: oauth });
+    const people = new people_v1.People({ auth: oauth });
+    const tasks = new tasks_v1.Tasks({ auth: oauth });
 
     return {
       async listCalendars(input) {

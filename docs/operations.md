@@ -13,7 +13,7 @@ Prepare the Sendblue Free Sandbox before the first deploy:
 Then deploy:
 
 1. Create a Railway service from this repository. Railway detects and builds the root `Dockerfile`.
-2. In the service deployment settings, keep one replica. Set the health-check path to `/health` with a 30-second timeout. Use the `ON_FAILURE` restart policy with five retries. The image starts `node dist/main.js`.
+2. In the service deployment settings, keep one replica and enable Serverless. Set the health-check path to `/health` with a 30-second timeout. Use `ON_FAILURE` with five retries. Clear any temporary maintenance start command so the image starts `node dist/main.js`.
 3. Add a persistent volume mounted at `/app/data`.
 4. Do not set `RAILWAY_VOLUME_MOUNT_PATH`, `DATA_DIR`, or `RAILWAY_RUN_UID`. Railway provides the mount path. The image starts as root only to prepare the volume, then it drops to `node`.
 5. Assign a public HTTPS domain. Set `PUBLIC_BASE_URL` to its origin without a trailing path.
@@ -26,13 +26,16 @@ Then deploy:
     - `https://<domain>/oauth/notion/callback`
 11. To send the daily brief, set `DAILY_BRIEF_ENABLED=true`. The schedule is fixed at 08:00 America/Los_Angeles.
 12. Set `LOCAL_UI_ENABLED=true` and `LOCAL_UI_PORT=3001`. The listener binds container loopback and is not published by Railway.
-13. Deploy. Railway considers the service healthy only after `GET /health` returns HTTP 200.
+13. Deploy `deploy/wake-broker.mjs` with `pnpm dlx wrangler deploy -c deploy/wrangler.jsonc`. Keep Workers on the Free plan. Confirm `APP_WAKE_URL` names this service's HTTPS `/internal/wake` endpoint.
+14. Generate separate random secrets of at least 32 characters. Set `SENDBLUE_WEBHOOK_SECRET` in Railway. Set `WAKE_SECRET` in Railway and with `pnpm dlx wrangler secret put WAKE_SECRET -c deploy/wrangler.jsonc`. Set `WAKE_BROKER_URL` in Railway to the full broker URL ending in `/schedule`.
+15. Deploy Annie. Confirm that `/health` returns HTTP 200 and the broker's authenticated `/health` reports an armed future alarm.
+16. Append a Sendblue `receive` webhook for `https://<domain>/webhooks/sendblue`. Give it `SENDBLUE_WEBHOOK_SECRET` as its per-webhook secret and scope `sendblue_numbers` to the exact configured line. Preserve unrelated webhook subscriptions.
 
-The HTTP process serves health checks and browser OAuth flows. Messaging needs no public URL, webhook route, external cron, or inbound network path. The receiver polls Sendblue, and the daily brief scheduler writes future work to the same durable queue.
+Webhooks only request a durable list sweep. An accepted callback does not itself create an inbound message or run a tool. The separate wake broker starts the sleeping service for daily briefs, delayed work, and six-hour recovery. Do not replace it with a frequent health-check ping: responses keep Railway awake.
 
 Startup does not contact Sendblue, Google Workspace, Notion, or DeepSeek. An unhealthy provider connection cannot prevent the process from becoming ready. Startup validates configuration, migrates SQLite, repairs interrupted memory and write state, projects pending traces, and applies trace retention. The scheduler can insert the next daily brief job without contacting a provider.
 
-The process handles `SIGTERM` by failing health checks, closing the HTTP listener, and stopping the receiver, the scheduler, and the worker after in-flight work returns. It then projects remaining trace events and closes SQLite.
+The process handles `SIGTERM` by failing health checks, closing listeners, and stopping the receiver, schedulers, and worker after in-flight work returns. The wake scheduler makes a final bounded publication attempt before SQLite closes. Pending provider writes retain their existing ambiguity semantics.
 
 Before deploying a change to write policy, let current inbound work and prepared or attempting provider/message writes settle. Do not replay blocked requests or ambiguous writes during the cutover. Verify the deployed commit and `/health` after startup without issuing test provider mutations.
 
@@ -94,13 +97,13 @@ The Free Sandbox constrains day-to-day operation:
 
 - The line is shared and assigned by Sendblue, and it exchanges messages only with contacts verified in Sendblue. A message from any other number is rejected at ingress.
 - The verified contact must open the conversation. If the assistant has never received a message from `USER_PHONE_NUMBER`, treat a send failure as expected until the user texts the line.
-- Inbound latency is bounded by the 5-second sweep. The event stream shortens it when connected but is never required; a stream outage degrades latency, not delivery.
+- Normal ingress starts from an authenticated receive webhook. There is no five-second fallback poll or event stream. A missed webhook can wait until the next recovery wake, normally within the six-hour UTC recovery schedule, plus platform or provider delay.
 - Sendblue does not transcribe audio. A voice note or media-only message answers with one `missing_text` failure notice instead of an agent run.
 - Sendblue rate limits and HTTP 429 responses surface as transient sweep failures. The receiver honors `Retry-After`, so a throttled sweep retries instead of skipping messages.
 
 ## Monitor ingress
 
-The receiver writes its own traces. `sendblue_poll` events cover `receiver_started`, `page_attempted`, `page_completed`, and `sweep_failed`; `sendblue_stream` events cover stream connection and failure. A poll trace rotates every 15 minutes or 1,800 events, so a healthy service produces a steady series of short terminal poll traces.
+`sendblue_poll` traces cover `sweep_started`, `page_attempted`, `page_completed`, `hints_resolved`, `hint_abandoned`, `sweep_completed`, and `sweep_failed`. Traces close after each sweep. `wake` traces record a scheduling attempt before the broker request, followed by `published` or `publish_failed`. The application never logs webhook bodies or authentication secrets.
 
 Repeated `sweep_failed` events with no `page_completed` mean ingress is stopped: no message can reach the queue until it recovers. A terminal sweep failure stops the background actors and the process exits non-zero so Railway restarts it.
 
@@ -144,12 +147,14 @@ Rotate one provider credential at a time. Keep the service at one replica throug
 
 ### Sendblue API key pair
 
-`SENDBLUE_API_KEY_ID` and `SENDBLUE_API_SECRET_KEY` authenticate every list, stream, send, and status call. Rotate them together:
+`SENDBLUE_API_KEY_ID` and `SENDBLUE_API_SECRET_KEY` authenticate every list, send, and status call. Rotate them together:
 
 1. Create the replacement key pair in Sendblue.
 2. Replace both variables in Railway and redeploy.
 3. Text the line from `USER_PHONE_NUMBER` and confirm the trace shows a completed sweep and an `egress delivered` reply.
 4. Revoke the previous key pair.
+
+Rotate `SENDBLUE_WEBHOOK_SECRET` together with the exact receive subscription. Rotate `WAKE_SECRET` on both Railway and the broker. Do not replace all Sendblue subscriptions to change one callback.
 
 A rotation restart is safe. The ingress cursor is durable, and the sweep after restart re-reads a 60-second overlap window, so messages that arrived during the redeploy are still ingested exactly once.
 
