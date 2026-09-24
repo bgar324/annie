@@ -12,7 +12,7 @@ const forecastSchema = z.object({ properties: z.object({ periods: z.array(z.obje
   shortForecast: z.string(),
 })).max(32) }) });
 
-export type DailyWeather = { location: "West Covina" } & (
+export type DailyWeather = { location: "Westwood, Los Angeles" } & (
   | { timeZone: "America/Los_Angeles"; periods: z.infer<typeof forecastSchema>["properties"]["periods"] }
   | { error: "weather_unavailable" }
 );
@@ -40,12 +40,12 @@ export async function fetchDailyWeather(input: {
   try {
     const point = z.object({ properties: z.object({
       forecast: z.string().regex(/^https:\/\/api\.weather\.gov\/gridpoints\/[A-Z]{3}\/\d+,\d+\/forecast$/u),
-    }) }).parse(await get("https://api.weather.gov/points/34.0686,-117.939"));
+    }) }).parse(await get("https://api.weather.gov/points/34.0689,-118.4452"));
     const forecast = forecastSchema.parse(await get(`${point.properties.forecast}?units=us`));
-    return { location: "West Covina", timeZone: "America/Los_Angeles", periods: forecast.properties.periods };
+    return { location: "Westwood, Los Angeles", timeZone: "America/Los_Angeles", periods: forecast.properties.periods };
   } catch (error) {
     input.signal.throwIfAborted();
     input.traces.append({ traceId: input.traceId, component: "daily_weather", event: "forecast", outcome: "unavailable", data: { error: error instanceof Error ? error.name : "UnknownError" } });
-    return { location: "West Covina", error: "weather_unavailable" };
+    return { location: "Westwood, Los Angeles", error: "weather_unavailable" };
   }
 }
