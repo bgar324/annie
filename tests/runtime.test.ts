@@ -1322,6 +1322,51 @@ describe("production runtime", () => {
     });
   });
 
+  it.each([true, false])("reads inbound UCLA weather without an account when availability is %s", async (available) => {
+    const model = new FakeModel();
+    model.responses.push(
+      toolCallResponse("weather", { id: "weather_call", name: "weather.get", argumentsJson: "{}" }),
+      finalModelResponse("weather_reply", available ? "UCLA: sunny, 78°F." : "The UCLA forecast is unavailable."),
+    );
+    const periods = [{
+      startTime: "2026-09-29T06:00:00-07:00",
+      endTime: "2026-09-29T18:00:00-07:00",
+      isDaytime: true,
+      temperature: 78,
+      temperatureUnit: "F",
+      shortForecast: "Sunny",
+    }];
+    const urls: string[] = [];
+    const gateway = new FakeGateway();
+    const item = await newRuntime(model, gateway, {
+      weatherFetch: async (input) => {
+        const url = new Request(input).url;
+        urls.push(url);
+        if (!available) return new Response("", { status: 503 });
+        return Response.json(url.includes("/points/")
+          ? { properties: { forecast: "https://api.weather.gov/gridpoints/LOX/148,47/forecast" } }
+          : { properties: { periods } });
+      },
+    });
+    gateway.inbox.push(inboundMessage("msg_weather", { text: "What's the weather at UCLA?" }));
+    await sweep(item);
+    await drainJobs(item.runtime);
+
+    expect(urls).toEqual(available
+      ? ["https://api.weather.gov/points/34.0689,-118.4452", "https://api.weather.gov/gridpoints/LOX/148,47/forecast?units=us"]
+      : ["https://api.weather.gov/points/34.0689,-118.4452"]);
+    const result = model.requests[1]?.messages.find(
+      (message) => message.role === "tool" && message.toolCallId === "weather_call",
+    );
+    expect(JSON.parse(result?.content ?? "null")).toEqual(available
+      ? { location: "Westwood, Los Angeles", timeZone: "America/Los_Angeles", periods }
+      : { location: "Westwood, Los Angeles", error: "weather_unavailable" });
+    expect(egressState(item.runtime)).toBe("delivered");
+    expect(item.runtime.database.db.prepare<[], { purpose: string }>(
+      "SELECT purpose FROM egress_messages",
+    ).get()).toEqual({ purpose: "reply" });
+  });
+
   it.each([true, false])("keeps daily source coverage and delivery when weather availability is %s", async (weatherAvailable) => {
     const model = new FakeModel();
     model.responses.push(

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { RegisteredTool } from "../agent/tools.js";
 import type { TraceId } from "../core/ids.js";
 import { createTracedProviderFetch, type ProviderFetch } from "../providers/fetch.js";
 import type { TraceStore } from "../tracing/store.js";
@@ -17,7 +18,7 @@ export type DailyWeather = { location: "Westwood, Los Angeles" } & (
   | { error: "weather_unavailable" }
 );
 
-/** Forecast context for the daily brief, not a model tool. */
+/** Shared forecast reader for scheduled briefs and the inbound weather tool. */
 export async function fetchDailyWeather(input: {
   traceId: TraceId;
   traces: TraceStore;
@@ -48,4 +49,31 @@ export async function fetchDailyWeather(input: {
     input.traces.append({ traceId: input.traceId, component: "daily_weather", event: "forecast", outcome: "unavailable", data: { error: error instanceof Error ? error.name : "UnknownError" } });
     return { location: "Westwood, Los Angeles", error: "weather_unavailable" };
   }
+}
+
+export function weatherTool(input: {
+  traces: TraceStore;
+  fetchImpl?: ProviderFetch;
+}): RegisteredTool {
+  return {
+    definition: {
+      name: "weather.get",
+      description:
+        "Get a fresh National Weather Service forecast for UCLA in Westwood, Los Angeles, with Fahrenheit temperatures, conditions, and forecast period times. Use for weather questions or weather in an on-demand daily brief. No connected account is needed. This tool only covers UCLA/Westwood, not West Covina or other locations. Report weather_unavailable honestly; never invent a forecast.",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
+        additionalProperties: false,
+      },
+    },
+    operationClass: "read",
+    batchMode: "parallel_read",
+    execute: async (_arguments, context) => fetchDailyWeather({
+      traceId: context.traceId,
+      traces: input.traces,
+      signal: context.signal ?? AbortSignal.timeout(5_000),
+      ...(input.fetchImpl === undefined ? {} : { fetchImpl: input.fetchImpl }),
+    }),
+  };
 }

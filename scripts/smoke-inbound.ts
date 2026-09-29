@@ -150,6 +150,19 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
   const overrides = {
     messageGateway: gateway, notionClients: notion.clients, logger: false as const,
     gmailClients: google.gmailClients, googleWorkspaceClients: google.googleWorkspaceClients,
+    weatherFetch: async (input: string | URL | Request) => {
+      const url = new Request(input).url;
+      assert(["https://api.weather.gov/points/34.0689,-118.4452", "https://api.weather.gov/gridpoints/LOX/148,47/forecast?units=us"].includes(url));
+      if (smokeCase.weatherAvailable === false) return new Response("", { status: 503 });
+      if (url.includes("/points/")) {
+        return Response.json({ properties: { forecast: "https://api.weather.gov/gridpoints/LOX/148,47/forecast" } });
+      }
+      const date = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Los_Angeles" }).format(new Date());
+      return Response.json({ properties: { periods: [
+        { startTime: `${date}T06:00:00-07:00`, endTime: `${date}T18:00:00-07:00`, isDaytime: true, temperature: 78, temperatureUnit: "F", shortForecast: "Sunny" },
+        { startTime: `${date}T18:00:00-07:00`, endTime: `${date}T23:59:59-07:00`, isDaytime: false, temperature: 61, temperatureUnit: "F", shortForecast: "Clear" },
+      ] } });
+    },
   };
   let runtime = await createRuntime(config, overrides);
   const result: CaseResult = {

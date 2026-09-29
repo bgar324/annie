@@ -10,7 +10,7 @@ import { archivePage } from "./synthetic.js";
 
 export type Category =
   | "notion_write" | "notion_read" | "google_read" | "follow_up" | "conversation"
-  | "decline" | "connect" | "burst";
+  | "decline" | "connect" | "burst" | "weather";
 
 export interface Observation {
   texts: readonly string[];
@@ -33,6 +33,7 @@ export interface SmokeCase {
   exchange?: SeededExchange;
   notion?: NotionOptions;
   google?: GoogleOptions;
+  weatherAvailable?: boolean;
   /** Expected egress purpose of the last turn; a failure notice is a pass only when declared. */
   purpose?: "reply" | "failure" | "recovery";
   restart?: boolean;
@@ -102,6 +103,27 @@ function checkedOff(o: Observation, from: string, to: string): void {
 }
 
 export const cases: readonly SmokeCase[] = [
+  {
+    name: "ucla_weather", category: "weather",
+    texts: ["What's today's forecast at UCLA? Give me the high and low in Fahrenheit."],
+    expect(o) {
+      noProviderWrite(o); answeredInText(o);
+      assert(toolNames(o).includes("weather.get"), "Fetch the forecast rather than answering from memory");
+      assert.match(lastReply(o), /78/u);
+      assert.match(lastReply(o), /61/u);
+      assert.doesNotMatch(lastReply(o), /west covina/iu);
+    },
+  },
+  {
+    name: "weather_unavailable", category: "weather",
+    texts: ["What's the weather at UCLA today?"],
+    weatherAvailable: false,
+    expect(o) {
+      noProviderWrite(o); answeredInText(o);
+      assert(toolNames(o).includes("weather.get"), "Attempt a fresh forecast");
+      assert.doesNotMatch(lastReply(o), /\d+\s*°/u, "Do not invent temperatures after a failed forecast");
+    },
+  },
   // ---- Notion writes -----------------------------------------------------------------
   {
     name: "relative_date_checkbox", category: "notion_write",

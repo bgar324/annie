@@ -32,6 +32,7 @@ import { SendblueReceiver } from "./messages/receiver.js";
 import { registerSendblueWebhook } from "./messages/webhook.js";
 import { WakeScheduler } from "./messages/wake-scheduler.js";
 import { InboundTurnService } from "./messages/turn.js";
+import { weatherTool } from "./messages/weather.js";
 import {
   MessagingProviderError,
   type MessageGateway,
@@ -188,7 +189,14 @@ export async function createRuntime(
     const providerTools = [...gmail.tools(), ...workspace.tools(), ...notion.tools()];
     const tools = new ToolRegistry(providerTools);
     assertProductionTools(tools);
-    const agentTools = new ToolRegistry([...providerTools, ...connectionTools(connections)]);
+    const agentTools = new ToolRegistry([
+      ...providerTools,
+      ...connectionTools(connections),
+      weatherTool({
+        traces,
+        ...(overrides.weatherFetch === undefined ? {} : { fetchImpl: overrides.weatherFetch }),
+      }),
+    ]);
     assertAgentTools(agentTools, tools);
     const model = overrides.model ?? new DeepSeekChatModel({ config, traces });
     const agentLimits = {
@@ -528,6 +536,7 @@ function assertAgentTools(agentTools: ToolRegistry, providerTools: ToolRegistry)
     ...providerTools.definitions().map((tool) => tool.name),
     "connections.list",
     "connections.connect",
+    "weather.get",
   ];
   const actual = agentTools.definitions().map((tool) => tool.name);
   if (actual.length !== expected.length || actual.some((name, index) => name !== expected[index])) {
