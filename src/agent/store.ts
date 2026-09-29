@@ -606,7 +606,6 @@ export class AgentLimitError extends Error {
   readonly code:
     | "model_request_limit"
     | "tool_call_limit"
-    | "tool_response_limit"
     | "tool_not_allowed"
     | "write_limit"
     | "round_limit"

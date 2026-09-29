@@ -1340,12 +1340,12 @@ describe("durable bounded agent loop", () => {
     ).toBe(true);
   });
 
-  it("executes none of five tool calls returned in one model response", async () => {
+  it.each([7, 9])("bounds a batch of %i reads by the total call budget", async (count) => {
     const harness = agentHarness();
     const { inboundId, traceId } = insertInbound(
       harness.database,
       harness.traces,
-      "Too many calls",
+      "Read seven items",
     );
     let executions = 0;
     const registry = new ToolRegistry([
@@ -1357,18 +1357,26 @@ describe("durable bounded agent loop", () => {
         },
       },
     ]);
-    const calls = Array.from({ length: 5 }, (_, index) => ({
+    const calls = Array.from({ length: count }, (_, index) => ({
       id: `call_${index}`,
       name: "test.echo",
       argumentsJson: `{\"value\":\"${index}\"}`,
     }));
     const model = scriptedModel([
       {
-        id: "too_many_calls",
+        id: "seven_reads",
         content: "",
-        providerState: "Try five calls",
+        providerState: "Read seven items",
         toolCalls: calls,
         finishReason: "tool_calls",
+        usage: emptyUsage,
+      },
+      {
+        id: "seven_reads_reply",
+        content: "All seven items were read.",
+        providerState: null,
+        toolCalls: [],
+        finishReason: "stop",
         usage: emptyUsage,
       },
     ]);
@@ -1378,13 +1386,21 @@ describe("durable bounded agent loop", () => {
       harness.writes,
       model,
       registry,
-    ).execute({ source: { kind: "inbound", inboundId }, traceId, initialMessages: [{ role: "user", content: "Too many calls" }], });
+    ).execute({ source: { kind: "inbound", inboundId }, traceId, initialMessages: [{ role: "user", content: "Read seven items" }], });
 
-    expect(result).toMatchObject({
-      outcome: "bounded",
-      run: { phase: "blocked", failureCode: "tool_response_limit", toolCalls: 0 },
-    });
-    expect(executions).toBe(0);
+    if (count <= 8) {
+      expect(result).toMatchObject({
+        outcome: "completed",
+        response: "All seven items were read.",
+        run: { toolCalls: count },
+      });
+    } else {
+      expect(result).toMatchObject({
+        outcome: "bounded",
+        run: { failureCode: "tool_call_limit", toolCalls: 8 },
+      });
+    }
+    expect(executions).toBe(Math.min(count, 8));
   });
 
   it("loads bounded delivered history from the same chat", () => {

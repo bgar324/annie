@@ -989,7 +989,7 @@ describe("production runtime", () => {
     expect(JSON.parse(accepted?.content ?? "null")).not.toHaveProperty("hidden");
   });
 
-  it("answers a multi-write response with a rule instead of failing the turn", async () => {
+  it("rejects all five writes in one response without failing the turn", async () => {
     // Production: "mark off gym, room, pull day, transcripts" came back as four
     // notion.update_page calls in one response and the whole turn became a failure notice.
     const patch = (index: number) => ({
@@ -1003,14 +1003,14 @@ describe("production runtime", () => {
     const model = new FakeModel();
     model.responses.push(
       toolCallResponse("batch_fetch", { id: "call_batch_fetch", name: "notion.fetch", argumentsJson: JSON.stringify({ workspace: "Work", id: "page_1" }) }),
-      { ...toolCallResponse("batch_writes", patch(1)), toolCalls: [patch(1), patch(2), patch(3), patch(4)] },
+      { ...toolCallResponse("batch_writes", patch(1)), toolCalls: [patch(1), patch(2), patch(3), patch(4), patch(5)] },
       finalModelResponse("batch_reply", "one at a time it is — which first?"),
     );
-    const notionClients = new FakeNotionClients(true, "# Tasks\n- [ ] Task 1\n- [ ] Task 2\n- [ ] Task 3\n- [ ] Task 4\n");
+    const notionClients = new FakeNotionClients(true, "# Tasks\n- [ ] Task 1\n- [ ] Task 2\n- [ ] Task 3\n- [ ] Task 4\n- [ ] Task 5\n");
     const gateway = new FakeGateway();
     const item = await newRuntime(model, gateway, { notionClients });
     connectNotion(item);
-    gateway.inbox.push(inboundMessage("msg_batch", { text: "mark off tasks 1 through 4" }));
+    gateway.inbox.push(inboundMessage("msg_batch", { text: "mark off tasks 1 through 5" }));
 
     await sweep(item);
     await drainJobs(item.runtime);
@@ -1023,7 +1023,7 @@ describe("production runtime", () => {
     const answers = model.requests[2]?.messages
       .filter((message) => message.role === "tool" && message.toolCallId.startsWith("call_batch_") && message.toolCallId !== "call_batch_fetch")
       .map((message) => JSON.parse(message.content) as { error: { code: string } });
-    expect(answers?.map((answer) => answer.error.code)).toEqual(["write_batch", "write_batch", "write_batch", "write_batch"]);
+    expect(answers?.map((answer) => answer.error.code)).toEqual(["write_batch", "write_batch", "write_batch", "write_batch", "write_batch"]);
     expect(item.runtime.database.db.prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM write_intents WHERE kind = 'notion_update_page'").get()?.count).toBe(0);
   });
 

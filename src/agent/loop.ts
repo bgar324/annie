@@ -14,7 +14,6 @@ import {
 import { ToolRegistry, ToolRegistryError, type ToolOperationClass } from "./tools.js";
 import type { WriteStore } from "../writes/store.js";
 
-const maximumToolCallsPerResponse = 4;
 type ToolCallGuard = (
   call: ModelToolCall,
   operationClass: ToolOperationClass,
@@ -175,12 +174,6 @@ export class AgentLoop {
           throw error;
         }
         this.#runs.appendAssistant(run.id, response);
-        if (response.toolCalls.length > maximumToolCallsPerResponse) {
-          throw new AgentLimitError(
-            "tool_response_limit",
-            "The model returned too many tool calls in one response",
-          );
-        }
         if (response.toolCalls.length > 0 && finalRound) {
           throw new AgentLimitError("round_limit", "The tool round limit was reached");
         }

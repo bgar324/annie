@@ -112,14 +112,16 @@ Each run has a durable transcript and enforces these bounds:
 - 90-second timeout for one DeepSeek response, still bounded by the whole-run deadline;
 - twelve tool rounds, then one round offered no tools so the turn ends in a reply;
 - sixteen tool calls total;
-- four tool calls in one model response, of which at most one may be a write;
+- at most one provider write in one model response; read batches share the total call budget rather than a separate response cap;
 - no count on provider mutations per inbound request; no provider mutations in daily briefs;
 - eight exponentially backed-off transport attempts for one model request, still bounded by the whole-run deadline;
 - 18,996 characters for the final iMessage response, matching the Sendblue content cap.
 
 Internal tool names use dots. The OpenAI-compatible adapter alone converts dots to underscores on the wire and maps returned calls back to the internal names. It stores each assistant wire message as opaque provider state and replays it unchanged so provider reasoning signatures survive tool rounds; core code never interprets that state.
 
-Only the six provider reads explicitly registered as `parallel_read` execute concurrently, up to the four-call response limit. Unmarked reads, both connection-control tools, and writes remain serial by default. Parallel results are persisted back to the transcript in model call order, and individual failures remain isolated.
+Only the six provider reads explicitly registered as `parallel_read` execute concurrently, bounded by the remaining total call budget. The prompt recommends four reads per response, but exceeding that guidance does not abort the turn. Unmarked reads, both connection-control tools, and writes remain serial by default. Parallel results are persisted back to the transcript in model call order, and individual failures remain isolated.
+
+The September 29 daily brief, trace `tr_0d1fdf49833a45efb9cc4840380268fe`, fetched weather successfully but stopped before executing any of the model's seven tool calls. The former four-call response cap raised `tool_response_limit` and sent a generic failure notice. Removing that separate cap lets larger read batches proceed while preserving the total call budget, deadline, allowlist, per-call guards, and rejection of multi-write batches. The failed brief was not replayed.
 
 The production model is `deepseek-v4-flash` through DeepSeek's OpenAI-compatible chat-completions endpoint with high reasoning effort. Each assistant wire message is replayed unchanged so DeepSeek `reasoning_content` survives tool rounds. Direct deployed-model checks found that disabling thinking reduced latency but missed an explicit future-brief preference during memory maintenance, so high reasoning remains the correctness-preserving default. One DeepSeek response may use up to 90 seconds, still bounded by the 120-second whole-run deadline; a single round on a 14k-token transcript has been observed at 50 seconds, so the round budget and the deadline bound each other.
 
