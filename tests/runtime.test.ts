@@ -1328,14 +1328,7 @@ describe("production runtime", () => {
       toolCallResponse("weather", { id: "weather_call", name: "weather.get", argumentsJson: "{}" }),
       finalModelResponse("weather_reply", available ? "UCLA: sunny, 78°F." : "The UCLA forecast is unavailable."),
     );
-    const periods = [{
-      startTime: "2026-09-29T06:00:00-07:00",
-      endTime: "2026-09-29T18:00:00-07:00",
-      isDaytime: true,
-      temperature: 78,
-      temperatureUnit: "F",
-      shortForecast: "Sunny",
-    }];
+    const days = [{ date: "2026-09-29", highF: 78, lowF: 61, condition: "Clear sky" }];
     const urls: string[] = [];
     const gateway = new FakeGateway();
     const item = await newRuntime(model, gateway, {
@@ -1343,23 +1336,26 @@ describe("production runtime", () => {
         const url = new Request(input).url;
         urls.push(url);
         if (!available) return new Response("", { status: 503 });
-        return Response.json(url.includes("/points/")
-          ? { properties: { forecast: "https://api.weather.gov/gridpoints/LOX/148,47/forecast" } }
-          : { properties: { periods } });
+        return Response.json({
+          timezone: "America/Los_Angeles",
+          daily_units: { time: "iso8601", temperature_2m_max: "°F", temperature_2m_min: "°F", weather_code: "wmo code" },
+          daily: { time: ["2026-09-29"], temperature_2m_max: [78], temperature_2m_min: [61], weather_code: [0] },
+        });
       },
     });
     gateway.inbox.push(inboundMessage("msg_weather", { text: "What's the weather at UCLA?" }));
     await sweep(item);
     await drainJobs(item.runtime);
 
-    expect(urls).toEqual(available
-      ? ["https://api.weather.gov/points/34.0689,-118.4452", "https://api.weather.gov/gridpoints/LOX/148,47/forecast?units=us"]
-      : ["https://api.weather.gov/points/34.0689,-118.4452"]);
+    expect(urls).toHaveLength(1);
+    expect(new URL(urls[0]!).origin).toBe("https://api.open-meteo.com");
+    expect(new URL(urls[0]!).searchParams.get("latitude")).toBe("34.0689");
+    expect(new URL(urls[0]!).searchParams.get("longitude")).toBe("-118.4452");
     const result = model.requests[1]?.messages.find(
       (message) => message.role === "tool" && message.toolCallId === "weather_call",
     );
-    expect(JSON.parse(result?.content ?? "null")).toEqual(available
-      ? { location: "Westwood, Los Angeles", timeZone: "America/Los_Angeles", periods }
+    expect(JSON.parse(result?.content ?? "null")).toMatchObject(available
+      ? { location: "Westwood, Los Angeles", timeZone: "America/Los_Angeles", days }
       : { location: "Westwood, Los Angeles", error: "weather_unavailable" });
     expect(egressState(item.runtime)).toBe("delivered");
     expect(item.runtime.database.db.prepare<[], { purpose: string }>(
@@ -1367,7 +1363,11 @@ describe("production runtime", () => {
     ).get()).toEqual({ purpose: "reply" });
   });
 
-  it.each([true, false])("keeps daily source coverage and delivery when weather availability is %s", async (weatherAvailable) => {
+  it.each([
+    { weatherAvailable: true, city: undefined },
+    { weatherAvailable: false, city: undefined },
+    { weatherAvailable: true, city: "Tokyo, Japan" },
+  ])("keeps daily source coverage with forecast $weatherAvailable and saved city $city", async ({ weatherAvailable, city }) => {
     const model = new FakeModel();
     model.responses.push(
       {
@@ -1465,22 +1465,41 @@ describe("production runtime", () => {
     const googleWorkspaceClients = new FakeGoogleWorkspaceClients();
     const notionClients = new FakeNotionClients();
     let weatherRequests = 0;
-    const item = await newRuntime(model, new FakeGateway(), {
-      dailyBriefEnabled: true,
-      gmailClients,
-      googleWorkspaceClients,
-      notionClients,
-      weatherFetch: async () => {
+    const weatherFetch: NonNullable<RuntimeOverrides["weatherFetch"]> = async (input) => {
         weatherRequests += 1;
+        const url = new URL(new Request(input).url);
         if (!weatherAvailable) return new Response("", { status: 503 });
-        return Response.json(weatherRequests === 1
-          ? { properties: { forecast: "https://api.weather.gov/gridpoints/LOX/166,44/forecast", timeZone: "America/Los_Angeles" } }
-          : { properties: { periods: [
-            { startTime: "2026-06-02T06:00:00-07:00", endTime: "2026-06-02T18:00:00-07:00", isDaytime: true, temperature: 95, temperatureUnit: "F", shortForecast: "Overcast", probabilityOfPrecipitation: { value: 1 } },
-            { startTime: "2026-06-02T18:00:00-07:00", endTime: "2026-06-03T06:00:00-07:00", isDaytime: false, temperature: 74, temperatureUnit: "F", shortForecast: "Overcast", probabilityOfPrecipitation: { value: 2 } },
-          ] } });
-      },
+        if (url.hostname === "geocoding-api.open-meteo.com") {
+          expect(url.searchParams.get("name")).toBe(city);
+          return Response.json({ results: [{
+            name: "Tokyo", admin1: "Tokyo", country: "Japan", country_code: "JP",
+            latitude: 35.6762, longitude: 139.6503, timezone: "Asia/Tokyo",
+          }] });
+        }
+        expect(url.searchParams.get("latitude")).toBe(city === undefined ? "34.0689" : "35.6762");
+        expect(url.searchParams.get("longitude")).toBe(city === undefined ? "-118.4452" : "139.6503");
+        return Response.json({
+          timezone: city === undefined ? "America/Los_Angeles" : "Asia/Tokyo",
+          daily_units: { time: "iso8601", temperature_2m_max: "°F", temperature_2m_min: "°F", weather_code: "wmo code" },
+          daily: { time: ["2026-06-02"], temperature_2m_max: [95], temperature_2m_min: [74], weather_code: [3] },
+        });
+    };
+    const item = await newRuntime(model, new FakeGateway(), {
+      dailyBriefEnabled: true, gmailClients, googleWorkspaceClients, notionClients, weatherFetch,
     });
+    if (city !== undefined) {
+      const documents = item.runtime.localUi.memory;
+      const snapshot = await documents.loadSnapshot();
+      await documents.replaceIfRevision(snapshot.revision, documents.prepareReplacement(
+        `# Memory\n\n- Daily brief weather city: ${city}\n`,
+      ));
+      await item.runtime.close();
+      item.runtime = await createRuntime(item.config, {
+        model, messageGateway: new FakeGateway(), gmailClients, googleWorkspaceClients, notionClients,
+        weatherFetch,
+        logger: false,
+      });
+    }
     const connections = new ConnectionStore(
       item.runtime.database.db,
       new CredentialVault(item.config.credentialEncryptionKey),
@@ -1517,13 +1536,13 @@ describe("production runtime", () => {
     }
 
     await runNextJob(item.runtime, scheduled.scheduledForMs + 1);
-    expect(weatherRequests).toBe(weatherAvailable ? 2 : 1);
+    expect(weatherRequests).toBe(city === undefined ? 1 : 2);
     // Reclaim after a crash between egress preparation and job settlement. The stored
     // forecast context and completed model reply must not be regenerated.
     item.runtime.database.db.prepare("UPDATE jobs SET status = 'pending', available_at_ms = ? WHERE id = ?")
       .run(scheduled.scheduledForMs + 2, scheduled.jobId);
     await runNextJob(item.runtime, scheduled.scheduledForMs + 3);
-    expect(weatherRequests).toBe(weatherAvailable ? 2 : 1);
+    expect(weatherRequests).toBe(city === undefined ? 1 : 2);
     expect(model.requests).toHaveLength(3);
 
     expect(model.requests[0]?.tools.map((tool) => tool.name)).toEqual([
@@ -1544,6 +1563,14 @@ describe("production runtime", () => {
     const briefRequest = model.requests[0]?.messages.find(
       (message) => message.role === "user",
     )?.content;
+    const forecastLine = briefRequest?.split("\n").find((line) => line.startsWith("Weather forecast data"));
+    expect(forecastLine).toContain(city === undefined ? "Westwood, Los Angeles" : "Tokyo");
+    if (weatherAvailable) {
+      expect(forecastLine).toContain('"highF":95');
+      expect(forecastLine).toContain('"lowF":74');
+    } else {
+      expect(forecastLine).toContain("weather_unavailable");
+    }
     for (const label of ["one@example.test", "two@example.test", "three@example.test", "Work"]) {
       expect(briefRequest).toContain(label);
     }

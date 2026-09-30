@@ -128,7 +128,7 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
     CREDENTIAL_ENCRYPTION_KEY: randomBytes(32).toString("base64"),
     DAILY_BRIEF_ENABLED: "false", ...deepseek,
   });
-  writeFileSync(config.memoryPath, "# Memory\n\n- My todo list is Daily tasks in Personal.\n- Use UTC for dates.\n");
+  writeFileSync(config.memoryPath, `# Memory\n\n- My todo list is Daily tasks in Personal.\n- Use UTC for dates.\n${smokeCase.memory ?? ""}`);
   const notion = syntheticNotion(smokeCase.notion);
   const google = syntheticGoogle(smokeCase.google);
   const inbox: InboundMessage[] = [];
@@ -151,17 +151,30 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
     messageGateway: gateway, notionClients: notion.clients, logger: false as const,
     gmailClients: google.gmailClients, googleWorkspaceClients: google.googleWorkspaceClients,
     weatherFetch: async (input: string | URL | Request) => {
-      const url = new Request(input).url;
-      assert(["https://api.weather.gov/points/34.0689,-118.4452", "https://api.weather.gov/gridpoints/LOX/148,47/forecast?units=us"].includes(url));
+      const url = new URL(new Request(input).url);
+      assert(["api.open-meteo.com", "geocoding-api.open-meteo.com"].includes(url.hostname));
       if (smokeCase.weatherAvailable === false) return new Response("", { status: 503 });
-      if (url.includes("/points/")) {
-        return Response.json({ properties: { forecast: "https://api.weather.gov/gridpoints/LOX/148,47/forecast" } });
+      if (url.hostname === "geocoding-api.open-meteo.com") {
+        const city = url.searchParams.get("name")?.split(",")[0]?.trim().toLowerCase();
+        const locations = [
+          { name: "Tokyo", admin1: "Tokyo", country: "Japan", latitude: 35.6895, longitude: 139.69171 },
+          { name: "West Covina", admin1: "California", country: "United States", latitude: 34.06862, longitude: -117.93895 },
+        ];
+        return Response.json({ results: locations.filter((location) => location.name.toLowerCase() === city) });
       }
-      const date = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Los_Angeles" }).format(new Date());
-      return Response.json({ properties: { periods: [
-        { startTime: `${date}T06:00:00-07:00`, endTime: `${date}T18:00:00-07:00`, isDaytime: true, temperature: 78, temperatureUnit: "F", shortForecast: "Sunny" },
-        { startTime: `${date}T18:00:00-07:00`, endTime: `${date}T23:59:59-07:00`, isDaytime: false, temperature: 61, temperatureUnit: "F", shortForecast: "Clear" },
-      ] } });
+      const longitude = Number(url.searchParams.get("longitude"));
+      const tokyo = longitude === 139.69171;
+      const covina = longitude === -117.93895;
+      const timezone = tokyo ? "Asia/Tokyo" : "America/Los_Angeles";
+      const date = new Intl.DateTimeFormat("en-CA", { timeZone: timezone }).format(new Date());
+      return Response.json({
+        timezone,
+        daily_units: { time: "iso8601", temperature_2m_max: "°F", temperature_2m_min: "°F", weather_code: "wmo code" },
+        daily: {
+          time: [date], temperature_2m_max: [tokyo ? 86 : covina ? 91 : 78],
+          temperature_2m_min: [tokyo ? 70 : covina ? 66 : 61], weather_code: [0],
+        },
+      });
     },
   };
   let runtime = await createRuntime(config, overrides);

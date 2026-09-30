@@ -3,6 +3,8 @@
 // text must earn and the observable outcome; wording is asserted only where a plausible
 // regression would change it.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { readDailyBriefWeatherCity } from "../../src/memory/weather.js";
 import type { RuntimeConfig } from "../../src/config.js";
 import type { AssistantRuntime } from "../../src/runtime.js";
 import type { GoogleOptions, GoogleWorld, NotionOptions, NotionWorld, SeededExchange } from "./synthetic.js";
@@ -34,6 +36,7 @@ export interface SmokeCase {
   notion?: NotionOptions;
   google?: GoogleOptions;
   weatherAvailable?: boolean;
+  memory?: string;
   /** Expected egress purpose of the last turn; a failure notice is a pass only when declared. */
   purpose?: "reply" | "failure" | "recovery";
   restart?: boolean;
@@ -105,7 +108,7 @@ function checkedOff(o: Observation, from: string, to: string): void {
 export const cases: readonly SmokeCase[] = [
   {
     name: "ucla_weather", category: "weather",
-    texts: ["What's today's forecast at UCLA? Give me the high and low in Fahrenheit."],
+    texts: ["What's today's weather? Give me the high and low in Fahrenheit."],
     expect(o) {
       noProviderWrite(o); answeredInText(o);
       assert(toolNames(o).includes("weather.get"), "Fetch the forecast rather than answering from memory");
@@ -122,6 +125,67 @@ export const cases: readonly SmokeCase[] = [
       noProviderWrite(o); answeredInText(o);
       assert(toolNames(o).includes("weather.get"), "Attempt a fresh forecast");
       assert.doesNotMatch(lastReply(o), /\d+\s*°/u, "Do not invent temperatures after a failed forecast");
+    },
+  },
+  {
+    name: "weather_other_city", category: "weather",
+    texts: ["What's today's weather in Tokyo, Japan? Give me the Fahrenheit high and low, just for this question."],
+    memory: "- Daily brief weather city: West Covina, California\n",
+    expect(o) {
+      noProviderWrite(o); answeredInText(o);
+      assert(toolNames(o).includes("weather.get"));
+      assert.match(lastReply(o), /86/u);
+      assert.match(lastReply(o), /70/u);
+      assert.equal(readDailyBriefWeatherCity(readFileSync(o.config.memoryPath, "utf8")), "West Covina, California");
+    },
+  },
+  {
+    name: "weather_save_brief_city", category: "weather",
+    texts: ["From now on, use West Covina, California for the weather in my daily brief instead of Westwood."],
+    restart: true,
+    expect(o) {
+      noProviderWrite(o); answeredInText(o);
+      assert(toolNames(o).includes("weather.get"));
+      assert.match(readDailyBriefWeatherCity(readFileSync(o.config.memoryPath, "utf8")) ?? "", /^West Covina, California/iu);
+    },
+  },
+  {
+    name: "weather_reset_brief_city", category: "weather",
+    texts: ["Reset the weather location in my future daily briefs to the default Westwood near UCLA."],
+    memory: "- Daily brief weather city: Tokyo, Japan\n",
+    expect(o) {
+      noProviderWrite(o); answeredInText(o);
+      assert.equal(readDailyBriefWeatherCity(readFileSync(o.config.memoryPath, "utf8")), undefined);
+    },
+  },
+  {
+    name: "weather_contextual_preference", category: "weather",
+    texts: ["Use that city for the weather in my daily brief from now on."],
+    exchange: { question: "What's the forecast for Tokyo, Japan?", reply: "Tokyo, Japan: high 86°F, low 70°F.", ageMs: 120_000, state: "delivered" },
+    expect(o) {
+      noProviderWrite(o); answeredInText(o);
+      assert.match(readDailyBriefWeatherCity(readFileSync(o.config.memoryPath, "utf8")) ?? "", /^Tokyo(?:,|$)/iu);
+    },
+  },
+  {
+    name: "weather_default_preserves_preference", category: "weather",
+    texts: ["What's the weather today?"],
+    memory: "- Daily brief weather city: Tokyo, Japan\n",
+    expect(o) {
+      noProviderWrite(o); answeredInText(o);
+      assert(toolNames(o).includes("weather.get"));
+      assert.match(lastReply(o), /78/u);
+      assert.equal(readDailyBriefWeatherCity(readFileSync(o.config.memoryPath, "utf8")), "Tokyo, Japan");
+    },
+  },
+  {
+    name: "weather_unknown_city", category: "weather",
+    texts: ["Use NoSuchCity123 for weather in all future daily briefs."],
+    memory: "- Daily brief weather city: Tokyo, Japan\n",
+    expect(o) {
+      noProviderWrite(o); answeredInText(o);
+      assert(toolNames(o).includes("weather.get"));
+      assert.equal(readDailyBriefWeatherCity(readFileSync(o.config.memoryPath, "utf8")), "Tokyo, Japan");
     },
   },
   // ---- Notion writes -----------------------------------------------------------------

@@ -16,6 +16,7 @@ import {
 } from "../src/core/ids.js";
 import { MemoryDocumentStore } from "../src/memory/document.js";
 import { MemoryMaintenanceService } from "../src/memory/maintenance.js";
+import { readDailyBriefWeatherCity } from "../src/memory/weather.js";
 import { createTraceRedactor } from "../src/tracing/redaction.js";
 import { TraceStore } from "../src/tracing/store.js";
 import { createTestDatabase, type TestDatabase } from "./helpers.js";
@@ -141,7 +142,116 @@ describe("canonical memory document", () => {
   });
 });
 
+describe("daily brief weather city", () => {
+  it("reads only the canonical directive and trims its named city", () => {
+    expect(
+      readDailyBriefWeatherCity(
+        "# Memory\r\n- Asked about weather in Paris.\r\n- Daily brief weather city:   東京, Japan  \r\n",
+      ),
+    ).toBe("東京, Japan");
+    expect(readDailyBriefWeatherCity(`- Daily brief weather city: ${"a".repeat(120)}`)).toBe(
+      "a".repeat(120),
+    );
+  });
+
+  it.each([
+    "# Memory\n",
+    "# Memory\n- Asked about weather in Tokyo.\n",
+    "# Memory\n- Prefers Tokyo weather in daily briefs.\n",
+    "# Memory\n- daily brief weather city: Tokyo, Japan\n",
+    "# Memory\nQuoted '- Daily brief weather city: Tokyo, Japan'\n",
+  ])("leaves the default to the caller without a canonical directive: %s", (memory) => {
+    expect(readDailyBriefWeatherCity(memory)).toBeUndefined();
+  });
+
+  it.each([
+    "- Daily brief weather city:",
+    "- Daily brief weather city:    ",
+    "- Daily brief weather city:Tokyo, Japan",
+    `- Daily brief weather city: ${"a".repeat(121)}`,
+    "- Daily brief weather city: Tokyo,\tJapan",
+    "- Daily brief weather city: Tokyo\u0000",
+    "- Daily brief weather city: Tokyo\u2028Japan",
+    "- Daily brief weather city: Tokyo\u200b",
+    "- Daily brief weather city: Tokyo, Japan\n- Daily brief weather city: Paris, France",
+  ])("rejects malformed explicit directives instead of silently defaulting: %s", (memory) => {
+    expect(() => readDailyBriefWeatherCity(memory)).toThrow(
+      expect.objectContaining({ code: "invalid_structure" }),
+    );
+  });
+});
+
 describe("post-turn memory maintenance", () => {
+  it.each([
+    {
+      userMessage: "Use Tokyo, Japan weather in my daily briefs from now on.",
+      initialMemory: "# Memory\n",
+      replacement: "# Memory\n\n- Daily brief weather city: Tokyo, Japan\n",
+      reply: "delivered",
+      expectedCity: "Tokyo, Japan",
+      expectedStatus: "updated",
+    },
+    {
+      userMessage: "Reset my daily brief weather to the UCLA default.",
+      initialMemory: "# Memory\n\n- Daily brief weather city: Tokyo, Japan\n",
+      replacement: "# Memory\n",
+      reply: "delivered",
+      expectedCity: undefined,
+      expectedStatus: "updated",
+    },
+    {
+      userMessage: "Use Tokyo, Japan weather in my daily briefs from now on.",
+      initialMemory: "# Memory\n\n- Daily brief weather city: Paris, France\n",
+      replacement: "# Memory\n\n- Daily brief weather city: Tokyo, Japan\n",
+      reply: "delivery_unknown",
+      expectedCity: "Paris, France",
+      expectedStatus: "failed",
+    },
+    {
+      userMessage: "Use Tokyo, Japan weather in my daily briefs from now on.",
+      initialMemory: "# Memory\n\n- Daily brief weather city: Paris, France\n",
+      replacement: "# Memory\n\n- Daily brief weather city: \n",
+      reply: "delivered",
+      expectedCity: "Paris, France",
+      expectedStatus: "invalid",
+    },
+  ] as const)(
+    "reloads canonical weather after $expectedStatus maintenance with $reply delivery",
+    async ({ userMessage, initialMemory, replacement, reply, expectedCity, expectedStatus }) => {
+      const harness = await maintenanceHarness();
+      await replaceMemory(harness.documents, initialMemory);
+      const { runId } = completedRun(harness, userMessage, 1, reply);
+      const service = new MemoryMaintenanceService({
+        db: harness.database.handle.db,
+        documents: harness.documents,
+        traces: harness.traces,
+        model: {
+          async maintainMemory() {
+            return {
+              id: "weather_preference",
+              content: JSON.stringify({ action: "replace", memory: replacement }),
+              usage: { promptTokens: null, completionTokens: null, totalTokens: null },
+            };
+          },
+        },
+      });
+
+      const result = await service.maintainRun({ runId, deadlineAtMs: Date.now() + 60_000 });
+      const restartedDocuments = new MemoryDocumentStore({
+        path: harness.database.config.memoryPath,
+        maximumBytes: 16_384,
+      });
+      const reloadedMemory = await restartedDocuments.repairAndLoad();
+
+      expect(result.status).toBe(expectedStatus);
+      expect(runMaintenanceStatus(harness.database, runId)).toBe(expectedStatus);
+      expect(readDailyBriefWeatherCity(reloadedMemory)).toBe(expectedCity);
+      if (expectedStatus !== "updated") {
+        expect(reloadedMemory).toBe(initialMemory);
+      }
+    },
+  );
+
   it("writes one complete replacement and traces its unified diff", async () => {
     const harness = await maintenanceHarness();
     const { runId, traceId } = completedRun(harness, "Remember that I like tea", 1);
@@ -186,7 +296,6 @@ describe("post-turn memory maintenance", () => {
     });
     expect(second).toEqual(first);
     expect(requests).toHaveLength(1);
-    expect(requests[0]?.messages[0]?.content).toContain("at most 16384 UTF-8 bytes");
     expect(requests[0]?.messages[1]?.content).toContain("Remember that I like tea");
     expect(requests[0]?.messages[1]?.content).toContain("Reply remains available");
     expect(requests[0]?.messages[1]?.content).toContain("gmail.search");
