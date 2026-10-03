@@ -51,7 +51,7 @@ export type AssistantPromptAudience =
   | { kind: "inbound"; connections: readonly SafeConnectionView[] }
   | { kind: "daily_brief"; connections: readonly SafeConnectionView[] };
 
-export const assistantResponseFormatExample =
+const assistantResponseFormatExample =
   "📬 inbox:\n\n🚨 needs attention:\n• first item\n\n👀 worth a peek:\n• second item\n\nnothing else new today.";
 
 const responseFormatRules = [

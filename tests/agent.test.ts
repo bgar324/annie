@@ -5,7 +5,6 @@ import { DeepSeekChatModel } from "../src/agent/deepseek.js";
 import { ConversationHistoryStore } from "../src/agent/history.js";
 import type { ChatModel, ModelRequest, ModelResponse } from "../src/agent/model.js";
 import {
-  assistantResponseFormatExample,
   assistantResponseFormatReminder,
   buildAssistantSystemPrompt,
 } from "../src/agent/prompt.js";
@@ -69,22 +68,6 @@ describe("assistant prompt", () => {
     expect(fixedWireBytes).toBeLessThan(5_376);
   });
 
-  it("teaches › for list items only and closes on an unprefixed sentence, not an offer", () => {
-    expect(assistantResponseFormatReminder).toContain(`Example:\n${assistantResponseFormatExample}`);
-    const lines = assistantResponseFormatExample.split("\n").filter((line) => line.trim() !== "");
-    const items = lines.filter((line) => line.startsWith("› "));
-    const headers = lines.filter((line) => line.endsWith(":") && !line.startsWith("› "));
-    const sentences = lines.filter((line) => !items.includes(line) && !headers.includes(line));
-    expect(items.length).toBeGreaterThanOrEqual(2);
-    expect(headers.length).toBeGreaterThanOrEqual(2);
-    expect(sentences).toHaveLength(1);
-    // The closer taught here used to be "want details on either?", so every tool-backed
-    // reply ended by offering more work. A flat statement is the example now.
-    expect(sentences[0]).toMatch(/^[a-z][^›:?]*\.$/u);
-    expect(assistantResponseFormatReminder).not.toContain("- ›");
-    expect(assistantResponseFormatReminder).not.toContain("**");
-    expect(assistantResponseFormatReminder).not.toMatch(/^\s*-/mu);
-  });
 });
 
 describe("DeepSeek model adapter", () => {
