@@ -52,13 +52,13 @@ export type AssistantPromptAudience =
   | { kind: "daily_brief"; connections: readonly SafeConnectionView[] };
 
 export const assistantResponseFormatExample =
-  "📬 inbox:\n\n🚨 needs attention:\n› first item\n\n👀 worth a peek:\n› second item\n\nnothing else new today.";
+  "📬 inbox:\n\n🚨 needs attention:\n• first item\n\n👀 worth a peek:\n• second item\n\nnothing else new today.";
 
 const responseFormatRules = [
   "Never call a change done unless this run's write result says succeeded, or unchanged when it already matched. Prose is not evidence.",
   "Otherwise return plain text with no Markdown or Unicode U+002A.",
   "Tone: lowercase, dry, a little put-upon — you'd rather not have been asked, but you help fully. Never hostile. Confident and brief: say what happened once, in as few words as it takes. Never mention tools, turns, scopes, permissions, or access levels; say plainly what you can do or what you need. Never restate the request, your instructions, a stored preference, or why an item qualifies; never reassure.",
-  'After any tool result, including failure or no results, open with a relevant emoji: a header ending in ":" above a list, or leading the sentence of a short answer. Use "› " only for a genuine list of peer items such as tasks, events, or mail, one per line; an outcome, answer, explanation, caveat, or question is a plain sentence. Never start a line with Unicode U+002D.',
+  'After any tool result, including failure or no results, open with a relevant emoji: a header ending in ":" above a list, or leading the sentence of a short answer. Use "• " only for a genuine list of peer items such as tasks, events, or mail, one per line; an outcome, answer, explanation, caveat, or question is a plain sentence. Never start a line with Unicode U+002D.',
   `Example:\n${assistantResponseFormatExample}`,
   "Calendar reports start with 📅 and the requested period, for example 📅 today:.",
   "Unless asked, omit account traversal, empty accounts, and duplicates caused by shared calendars.",

@@ -81,19 +81,19 @@ function answeredInText(o: Observation): void {
   assert(!/couldn't complete|may have accepted/u.test(lastReply(o)), "The user must get an answer, not a failure notice");
 }
 
-// Reply shape on read probes: › marks exactly the listed items; outcomes, answers, and
+// Reply shape on read probes: • marks exactly the listed items; outcomes, answers, and
 // questions stay unprefixed lowercase prose; no Markdown. Checked only where wording
 // variance cannot mask a safety property.
 function replyShape(o: Observation, options: { items?: readonly string[]; outcomeIsProse?: boolean }): void {
   const lines = replyLines(o);
   assert(lines.every((lineText) => !/^\s*[-*]/u.test(lineText) && !lineText.includes("*")), "Markdown leaked into the reply");
-  assert(!lines.some((lineText) => /^› .*\?$/u.test(lineText)), "A question was bulleted with ›");
-  const items = lines.filter((lineText) => lineText.startsWith("› "))
+  assert(!lines.some((lineText) => /^• .*\?$/u.test(lineText)), "A question was bulleted");
+  const items = lines.filter((lineText) => lineText.startsWith("• "))
     .map((lineText) => lineText.slice(2).replace(/^\[[ x]\] /u, "").trim().toLowerCase());
-  if (options.items !== undefined) assert.deepEqual(items, options.items, "Exactly the listed items are › items");
-  if (options.outcomeIsProse === true) assert(!(lines[1] ?? "").startsWith("› "), "An outcome or answer is prose, not a › item");
+  if (options.items !== undefined) assert.deepEqual(items, options.items, "Exactly the listed items are bullets");
+  if (options.outcomeIsProse === true) assert(!(lines[1] ?? "").startsWith("• "), "An outcome or answer is prose, not a bullet item");
   const allowedCapitals = new Set([...o.notion.pages.values(), "Personal Notion Google Gmail Drive Alex Lee"].join(" ").match(/\b[A-Z][a-z]+/gu) ?? []);
-  for (const lineText of lines.filter((candidate) => !candidate.startsWith("› ") && !candidate.endsWith(":"))) {
+  for (const lineText of lines.filter((candidate) => !candidate.startsWith("• ") && !candidate.endsWith(":"))) {
     const word = /[A-Za-z][a-z']*/u.exec(lineText)?.[0];
     if (word !== undefined && /^[A-Z]/u.test(word)) assert(allowedCapitals.has(word), `Model prose is not lowercase: ${lineText}`);
   }

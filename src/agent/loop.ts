@@ -571,10 +571,10 @@ function pendingToolCalls(messages: readonly ModelMessage[]): readonly ModelTool
 }
 
 function normalizeFinalResponse(content: string, inbound: boolean): string {
-  const normalized = content.trim().replace(/^[\t ]*-[\t ]*›[ \t]*/gmu, "› ");
-  // In a reply, › enumerates peer items; a single › line is an outcome or answer and stays prose.
+  const normalized = content.trim().replace(/^[\t ]*-[\t ]*•[ \t]*/gmu, "• ");
+  // In a reply, • enumerates peer items; a single • line is an outcome or answer and stays prose.
   // A daily brief keeps its own section contract, so a one-item section is left alone.
-  return inbound && normalized.match(/^› /gmu)?.length === 1 ? normalized.replace(/^› /mu, "") : normalized;
+  return inbound && normalized.match(/^• /gmu)?.length === 1 ? normalized.replace(/^• /mu, "") : normalized;
 }
 
 function answeredToolCalls(messages: readonly ModelMessage[]): ReadonlySet<string> {

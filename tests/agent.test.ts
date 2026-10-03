@@ -901,7 +901,7 @@ describe("durable bounded agent loop", () => {
     expect(maximumActive).toBe(1);
   });
 
-  it("removes a redundant hyphen before final reply arrows", async () => {
+  it("removes a redundant hyphen before final reply bullets", async () => {
     const harness = agentHarness();
     const { inboundId, traceId } = insertInbound(
       harness.database,
@@ -911,7 +911,7 @@ describe("durable bounded agent loop", () => {
     const model = scriptedModel([
       {
         id: "response_final",
-        content: "📁 recent work:\n-\n› existing item\n- › first item\n  -  › second item",
+        content: "📁 recent work:\n-\n• existing item\n- • first item\n  -  • second item",
         providerState: null,
         toolCalls: [],
         finishReason: "stop",
@@ -919,7 +919,7 @@ describe("durable bounded agent loop", () => {
       },
     ]);
     const normalized =
-      "📁 recent work:\n-\n› existing item\n› first item\n› second item";
+      "📁 recent work:\n-\n• existing item\n• first item\n• second item";
     const loop = createAgentLoop(
       harness.runs,
       harness.writes,
@@ -940,13 +940,13 @@ describe("durable bounded agent loop", () => {
     expect(harness.runs.getRequired(result.run.id).finalResponse).toBe(normalized);
   });
 
-  it("turns a lone › outcome line into plain prose", async () => {
+  it("turns a lone bullet outcome line into plain prose", async () => {
     const harness = agentHarness();
     const { inboundId, traceId } = insertInbound(harness.database, harness.traces, "Mark it done");
     const model = scriptedModel([
       {
         id: "response_final",
-        content: "✅ daily tasks:\n- › already checked off, so nothing to change.\n\nwant today's copy ticked instead?",
+        content: "✅ daily tasks:\n- • already checked off, so nothing to change.\n\nwant today's copy ticked instead?",
         providerState: null,
         toolCalls: [],
         finishReason: "stop",

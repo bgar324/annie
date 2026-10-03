@@ -654,7 +654,7 @@ describe("production runtime", () => {
           properties: { Due: "2026-09-11" },
         }),
       }),
-      finalModelResponse("due_date_done", "📅 friday:\n› car wash is due sep 11."),
+      finalModelResponse("due_date_done", "📅 friday:\n• car wash is due sep 11."),
     );
     const notionClients = new FakeNotionClients(true, notionTaskPage);
     const gateway = new FakeGateway();
@@ -750,7 +750,7 @@ describe("production runtime", () => {
       }),
       finalModelResponse(
         "unchanged_reply",
-        "🧐 checked the page:\n› clean restroom was already checked off, so nothing changed.",
+        "🧐 checked the page:\n• clean restroom was already checked off, so nothing changed.",
       ),
     );
     const notionClients = new FakeNotionClients(true, notionTaskPage);
@@ -819,7 +819,7 @@ describe("production runtime", () => {
           updates: [{ oldText, newText }],
         }),
       }),
-      finalModelResponse("corrected_done", "✅ done:\n› car wash is checked off."),
+      finalModelResponse("corrected_done", "✅ done:\n• car wash is checked off."),
     );
     const notionClients = new FakeNotionClients(true, notionTaskPage);
     const gateway = new FakeGateway();
