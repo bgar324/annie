@@ -152,8 +152,18 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
     gmailClients: google.gmailClients, googleWorkspaceClients: google.googleWorkspaceClients,
     weatherFetch: async (input: string | URL | Request) => {
       const url = new URL(new Request(input).url);
-      assert(["api.open-meteo.com", "geocoding-api.open-meteo.com"].includes(url.hostname));
+      assert(["api.weather.gov", "api.open-meteo.com", "geocoding-api.open-meteo.com"].includes(url.hostname));
       if (smokeCase.weatherAvailable === false) return new Response("", { status: 503 });
+      if (url.hostname === "api.weather.gov") {
+        if (url.pathname.startsWith("/points/")) {
+          return Response.json({ properties: { forecast: "https://api.weather.gov/gridpoints/LOX/148,47/forecast" } });
+        }
+        const date = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Los_Angeles" }).format(new Date());
+        return Response.json({ properties: { periods: [
+          { startTime: `${date}T06:00:00-07:00`, endTime: `${date}T18:00:00-07:00`, isDaytime: true, temperature: 78, temperatureUnit: "F", shortForecast: "Sunny" },
+          { startTime: `${date}T18:00:00-07:00`, endTime: `${date}T23:59:59-07:00`, isDaytime: false, temperature: 61, temperatureUnit: "F", shortForecast: "Clear" },
+        ] } });
+      }
       if (url.hostname === "geocoding-api.open-meteo.com") {
         const city = url.searchParams.get("name")?.split(",")[0]?.trim().toLowerCase();
         const locations = [

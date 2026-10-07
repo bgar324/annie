@@ -50,8 +50,22 @@ const forecastSchema = z.object({
   }),
 });
 
+const nwsPointSchema = z.object({ properties: z.object({
+  forecast: z.string().regex(/^https:\/\/api\.weather\.gov\/gridpoints\/[A-Z]{3}\/\d+,\d+\/forecast$/u),
+}) });
+const nwsForecastSchema = z.object({ properties: z.object({
+  periods: z.array(z.object({
+    startTime: z.iso.datetime({ offset: true }),
+    endTime: z.iso.datetime({ offset: true }),
+    isDaytime: z.boolean(),
+    temperature: z.number(),
+    temperatureUnit: z.literal("F"),
+    shortForecast: z.string().trim().min(1).max(500),
+  })).min(1).max(32),
+}) });
+
 export type DailyWeather = { location: string } & (
-  | { timeZone: string; days: Array<{ date: string; highF: number; lowF: number; condition: string }> }
+  | { timeZone: string; days: Array<{ date: string; highF: number | null; lowF: number | null; condition: string }> }
   | { error: "weather_unavailable" | "location_not_found" }
   | { error: "location_ambiguous"; candidates: string[] }
 );
@@ -89,32 +103,47 @@ export async function fetchDailyWeather(input: {
     return body;
   };
   try {
-    let latitude = 34.0689;
-    let longitude = -118.4452;
-    if (!isCampus && city !== undefined) {
-      const searchUrl = new URL("https://geocoding-api.open-meteo.com/v1/search");
-      searchUrl.search = new URLSearchParams({ name: city, count: "10", language: "en", format: "json" }).toString();
-      const { results } = geocodingSchema.parse(await get(searchUrl));
-      if (results.length === 0) return { location, error: "location_not_found" };
-      // Send qualifiers unchanged to the provider. Prefer the requested city over prefix matches.
-      const exact = results.filter((result) => {
-        const name = result.name.toLocaleLowerCase("en");
-        return normalizedCity === name || normalizedCity?.startsWith(`${name},`) === true;
-      });
-      const candidates = [...new Map((exact.length > 0 ? exact : results).map((result) => [
-        `${result.latitude},${result.longitude}`, result,
-      ])).values()];
-      const label = (result: z.infer<typeof geocodingSchema>["results"][number]) =>
-        [...new Set([result.name, result.admin1, result.country].filter((part) => part !== undefined))].join(", ");
-      if (candidates.length > 1) {
-        return { location, error: "location_ambiguous", candidates: candidates.slice(0, 5).map(label) };
+    if (isCampus || city === undefined) {
+      const point = nwsPointSchema.parse(await get(new URL("https://api.weather.gov/points/34.0689,-118.4452")));
+      const forecast = nwsForecastSchema.parse(await get(new URL(`${point.properties.forecast}?units=us`)));
+      const timeZone = "America/Los_Angeles";
+      const localDate = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" });
+      const days = new Map<string, Extract<DailyWeather, { days: unknown }>["days"][number]>();
+      for (const period of forecast.properties.periods) {
+        const date = localDate.format(new Date(period.startTime));
+        const day = days.get(date) ?? { date, highF: null, lowF: null, condition: "" };
+        if (period.isDaytime) {
+          day.highF = period.temperature;
+          day.condition = period.shortForecast;
+        } else {
+          day.lowF = period.temperature;
+          if (day.highF === null) day.condition = period.shortForecast;
+        }
+        days.set(date, day);
       }
-      const candidate = candidates[0];
-      if (candidate === undefined) return { location, error: "location_not_found" };
-      latitude = candidate.latitude;
-      longitude = candidate.longitude;
-      location = label(candidate);
+      return { location, timeZone, days: [...days.values()] };
     }
+    const searchUrl = new URL("https://geocoding-api.open-meteo.com/v1/search");
+    searchUrl.search = new URLSearchParams({ name: city, count: "10", language: "en", format: "json" }).toString();
+    const { results } = geocodingSchema.parse(await get(searchUrl));
+    if (results.length === 0) return { location, error: "location_not_found" };
+    // Send qualifiers unchanged to the provider. Prefer the requested city over prefix matches.
+    const exact = results.filter((result) => {
+      const name = result.name.toLocaleLowerCase("en");
+      return normalizedCity === name || normalizedCity?.startsWith(`${name},`) === true;
+    });
+    const candidates = [...new Map((exact.length > 0 ? exact : results).map((result) => [
+      `${result.latitude},${result.longitude}`, result,
+    ])).values()];
+    const label = (result: z.infer<typeof geocodingSchema>["results"][number]) =>
+      [...new Set([result.name, result.admin1, result.country].filter((part) => part !== undefined))].join(", ");
+    if (candidates.length > 1) {
+      return { location, error: "location_ambiguous", candidates: candidates.slice(0, 5).map(label) };
+    }
+    const candidate = candidates[0];
+    if (candidate === undefined) return { location, error: "location_not_found" };
+    const { latitude, longitude } = candidate;
+    location = label(candidate);
     const forecastUrl = new URL("https://api.open-meteo.com/v1/forecast");
     forecastUrl.search = new URLSearchParams({
       latitude: String(latitude), longitude: String(longitude), timezone: "auto",
@@ -155,7 +184,7 @@ export function weatherTool(input: {
     definition: {
       name: "weather.get",
       description:
-        "Get a fresh seven-day Open-Meteo forecast for any city worldwide: Fahrenheit highs/lows, conditions, local dates and timezone. For an ordinary weather question without a named city or explicit location reference, omit city to use UCLA/Westwood, Los Angeles, even if memory names another daily-brief city. The saved daily-brief city applies to briefs only. Use qualifiers such as 'Tokyo, Japan' or 'West Covina, California'. No account needed. Ask for clarification on location_ambiguous or location_not_found; never substitute a different city or invent unavailable weather. For an explicit request to use a non-default city in future daily briefs, look it up first, then acknowledge the preference; canonical memory maintenance retains it. A one-off lookup never changes that preference. Resetting briefs to the default only removes the saved preference: no city lookup is needed. If fetching the default forecast, call with {} rather than geocoding a Westwood address. Attribute forecasts to Open-Meteo.",
+        "Get a fresh forecast for any city worldwide: Fahrenheit highs/lows, conditions, local dates and timezone. UCLA/Westwood uses the National Weather Service; other cities use Open-Meteo. A null high or low is unavailable for that partial day; never invent it. For an ordinary weather question without a named city or explicit location reference, omit city to use UCLA/Westwood, Los Angeles, even if memory names another daily-brief city. The saved daily-brief city applies to briefs only. Use qualifiers such as 'Tokyo, Japan' or 'West Covina, California'. No account needed. Ask for clarification on location_ambiguous or location_not_found; never substitute a different city or invent unavailable weather. For an explicit request to use a non-default city in future daily briefs, look it up first, then acknowledge the preference; canonical memory maintenance retains it. A one-off lookup never changes that preference. Resetting briefs to the default only removes the saved preference: no city lookup is needed. If fetching the default forecast, call with {} rather than geocoding a Westwood address. Attribute UCLA/Westwood forecasts to NWS and other forecasts to Open-Meteo.",
       parameters: {
         type: "object",
         properties: {

@@ -1328,7 +1328,10 @@ describe("production runtime", () => {
       toolCallResponse("weather", { id: "weather_call", name: "weather.get", argumentsJson: "{}" }),
       finalModelResponse("weather_reply", available ? "UCLA: sunny, 78°F." : "The UCLA forecast is unavailable."),
     );
-    const days = [{ date: "2026-09-29", highF: 78, lowF: 61, condition: "Clear sky" }];
+    const periods = [
+      { startTime: "2026-09-29T06:00:00-07:00", endTime: "2026-09-29T18:00:00-07:00", isDaytime: true, temperature: 78, temperatureUnit: "F", shortForecast: "Sunny" },
+      { startTime: "2026-09-29T18:00:00-07:00", endTime: "2026-09-30T06:00:00-07:00", isDaytime: false, temperature: 61, temperatureUnit: "F", shortForecast: "Clear" },
+    ];
     const urls: string[] = [];
     const gateway = new FakeGateway();
     const item = await newRuntime(model, gateway, {
@@ -1336,26 +1339,24 @@ describe("production runtime", () => {
         const url = new Request(input).url;
         urls.push(url);
         if (!available) return new Response("", { status: 503 });
-        return Response.json({
-          timezone: "America/Los_Angeles",
-          daily_units: { time: "iso8601", temperature_2m_max: "°F", temperature_2m_min: "°F", weather_code: "wmo code" },
-          daily: { time: ["2026-09-29"], temperature_2m_max: [78], temperature_2m_min: [61], weather_code: [0] },
-        });
+        if (new URL(url).pathname.startsWith("/points/")) {
+          return Response.json({ properties: { forecast: "https://api.weather.gov/gridpoints/LOX/148,47/forecast" } });
+        }
+        return Response.json({ properties: { periods } });
       },
     });
     gateway.inbox.push(inboundMessage("msg_weather", { text: "What's the weather at UCLA?" }));
     await sweep(item);
     await drainJobs(item.runtime);
 
-    expect(urls).toHaveLength(1);
-    expect(new URL(urls[0]!).origin).toBe("https://api.open-meteo.com");
-    expect(new URL(urls[0]!).searchParams.get("latitude")).toBe("34.0689");
-    expect(new URL(urls[0]!).searchParams.get("longitude")).toBe("-118.4452");
+    expect(urls).toEqual(available
+      ? ["https://api.weather.gov/points/34.0689,-118.4452", "https://api.weather.gov/gridpoints/LOX/148,47/forecast?units=us"]
+      : ["https://api.weather.gov/points/34.0689,-118.4452"]);
     const result = model.requests[1]?.messages.find(
       (message) => message.role === "tool" && message.toolCallId === "weather_call",
     );
     expect(JSON.parse(result?.content ?? "null")).toMatchObject(available
-      ? { location: "Westwood, Los Angeles", timeZone: "America/Los_Angeles", days }
+      ? { location: "Westwood, Los Angeles", timeZone: "America/Los_Angeles", days: [{ date: "2026-09-29", highF: 78, lowF: 61, condition: "Sunny" }] }
       : { location: "Westwood, Los Angeles", error: "weather_unavailable" });
     expect(egressState(item.runtime)).toBe("delivered");
     expect(item.runtime.database.db.prepare<[], { purpose: string }>(
@@ -1469,6 +1470,16 @@ describe("production runtime", () => {
         weatherRequests += 1;
         const url = new URL(new Request(input).url);
         if (!weatherAvailable) return new Response("", { status: 503 });
+        if (city === undefined) {
+          expect(url.hostname).toBe("api.weather.gov");
+          if (url.pathname.startsWith("/points/")) {
+            return Response.json({ properties: { forecast: "https://api.weather.gov/gridpoints/LOX/148,47/forecast" } });
+          }
+          return Response.json({ properties: { periods: [
+            { startTime: "2026-06-02T06:00:00-07:00", endTime: "2026-06-02T18:00:00-07:00", isDaytime: true, temperature: 95, temperatureUnit: "F", shortForecast: "Sunny" },
+            { startTime: "2026-06-02T18:00:00-07:00", endTime: "2026-06-03T06:00:00-07:00", isDaytime: false, temperature: 74, temperatureUnit: "F", shortForecast: "Clear" },
+          ] } });
+        }
         if (url.hostname === "geocoding-api.open-meteo.com") {
           expect(url.searchParams.get("name")).toBe(city);
           return Response.json({ results: [{
@@ -1476,10 +1487,10 @@ describe("production runtime", () => {
             latitude: 35.6762, longitude: 139.6503, timezone: "Asia/Tokyo",
           }] });
         }
-        expect(url.searchParams.get("latitude")).toBe(city === undefined ? "34.0689" : "35.6762");
-        expect(url.searchParams.get("longitude")).toBe(city === undefined ? "-118.4452" : "139.6503");
+        expect(url.searchParams.get("latitude")).toBe("35.6762");
+        expect(url.searchParams.get("longitude")).toBe("139.6503");
         return Response.json({
-          timezone: city === undefined ? "America/Los_Angeles" : "Asia/Tokyo",
+          timezone: "Asia/Tokyo",
           daily_units: { time: "iso8601", temperature_2m_max: "°F", temperature_2m_min: "°F", weather_code: "wmo code" },
           daily: { time: ["2026-06-02"], temperature_2m_max: [95], temperature_2m_min: [74], weather_code: [3] },
         });
@@ -1536,13 +1547,13 @@ describe("production runtime", () => {
     }
 
     await runNextJob(item.runtime, scheduled.scheduledForMs + 1);
-    expect(weatherRequests).toBe(city === undefined ? 1 : 2);
+    expect(weatherRequests).toBe(weatherAvailable ? 2 : 1);
     // Reclaim after a crash between egress preparation and job settlement. The stored
     // forecast context and completed model reply must not be regenerated.
     item.runtime.database.db.prepare("UPDATE jobs SET status = 'pending', available_at_ms = ? WHERE id = ?")
       .run(scheduled.scheduledForMs + 2, scheduled.jobId);
     await runNextJob(item.runtime, scheduled.scheduledForMs + 3);
-    expect(weatherRequests).toBe(city === undefined ? 1 : 2);
+    expect(weatherRequests).toBe(weatherAvailable ? 2 : 1);
     expect(model.requests).toHaveLength(3);
 
     expect(model.requests[0]?.tools.map((tool) => tool.name)).toEqual([

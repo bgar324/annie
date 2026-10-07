@@ -31,14 +31,19 @@ const readWeather = (fetchImpl: ProviderFetch, city?: string) => fetchDailyWeath
 });
 
 describe("global weather reader", () => {
-  it.each([undefined, "Westwood", "UCLA", "Westwood, Los Angeles"])("uses UCLA coordinates for %s", async (city) => {
+  it.each([undefined, "Westwood", "UCLA", "Westwood, Los Angeles"])("reads %s independently of Open-Meteo quotas", async (city) => {
+    const periods = [
+      { startTime: "2026-09-30T06:00:00-07:00", endTime: "2026-09-30T18:00:00-07:00", isDaytime: true, temperature: 82, temperatureUnit: "F", shortForecast: "Partly cloudy" },
+      { startTime: "2026-09-30T18:00:00-07:00", endTime: "2026-10-01T06:00:00-07:00", isDaytime: false, temperature: 61, temperatureUnit: "F", shortForecast: "Mostly clear" },
+    ];
     const result = await readWeather(async (input) => {
       const url = new URL(new Request(input).url);
-      expect(url.origin).toBe("https://api.open-meteo.com");
-      expect(url.searchParams.get("latitude")).toBe("34.0689");
-      expect(url.searchParams.get("longitude")).toBe("-118.4452");
-      expect(url.searchParams.get("temperature_unit")).toBe("fahrenheit");
-      return Response.json(forecast());
+      if (url.hostname !== "api.weather.gov") return Response.json({ error: true }, { status: 429 });
+      if (url.pathname === "/points/34.0689,-118.4452") {
+        return Response.json({ properties: { forecast: "https://api.weather.gov/gridpoints/LOX/148,47/forecast" } });
+      }
+      expect(url.href).toBe("https://api.weather.gov/gridpoints/LOX/148,47/forecast?units=us");
+      return Response.json({ properties: { periods } });
     }, city);
     expect(result).toEqual({
       location: "Westwood, Los Angeles", timeZone: "America/Los_Angeles",
@@ -93,13 +98,57 @@ describe("global weather reader", () => {
     if (problem === "invalid date") response.daily.time = ["2026-02-30"];
     if (problem === "invalid timezone") response.timezone = "Not/AZone";
     if (problem === "high below low") response.daily.temperature_2m_max = [20];
-    expect(await readWeather(async () => Response.json(response)))
-      .toEqual({ location: "Westwood, Los Angeles", error: "weather_unavailable" });
+    expect(await readWeather(async (input) => {
+      if (new URL(new Request(input).url).hostname === "geocoding-api.open-meteo.com") {
+        return Response.json({ results: [{ name: "Tokyo", country: "Japan", latitude: 35.6895, longitude: 139.69171 }] });
+      }
+      return Response.json(response);
+    }, "Tokyo"))
+      .toEqual({ location: "Tokyo, Japan", error: "weather_unavailable" });
   });
 
   it("reports provider failure without inventing a forecast", async () => {
     expect(await readWeather(async () => new Response("", { status: 503 })))
       .toEqual({ location: "Westwood, Los Angeles", error: "weather_unavailable" });
+  });
+
+  it.each(["http://api.weather.gov/gridpoints/LOX/148,47/forecast", "https://example.test/forecast"])("rejects an unsafe NWS forecast URL %s", async (forecast) => {
+    let calls = 0;
+    expect(await readWeather(async () => {
+      calls += 1;
+      return Response.json({ properties: { forecast } });
+    })).toEqual({ location: "Westwood, Los Angeles", error: "weather_unavailable" });
+    expect(calls).toBe(1);
+  });
+
+  it.each(["empty", "wrong units", "invalid timestamp"])("rejects %s NWS periods", async (problem) => {
+    const periods = problem === "empty" ? [] : [{
+      startTime: problem === "invalid timestamp" ? "yesterday" : "2026-09-30T18:00:00-07:00",
+      endTime: "2026-10-01T06:00:00-07:00", isDaytime: false, temperature: 61,
+      temperatureUnit: problem === "wrong units" ? "C" : "F", shortForecast: "Clear",
+    }];
+    expect(await readWeather(async (input) => {
+      if (new URL(new Request(input).url).pathname.startsWith("/points/")) {
+        return Response.json({ properties: { forecast: "https://api.weather.gov/gridpoints/LOX/148,47/forecast" } });
+      }
+      return Response.json({ properties: { periods } });
+    })).toEqual({ location: "Westwood, Los Angeles", error: "weather_unavailable" });
+  });
+
+  it("preserves a night-only forecast without inventing a daytime high", async () => {
+    const periods = [{
+      startTime: "2026-09-30T20:00:00-07:00", endTime: "2026-10-01T06:00:00-07:00",
+      isDaytime: false, temperature: 61, temperatureUnit: "F", shortForecast: "Clear",
+    }];
+    expect(await readWeather(async (input) => {
+      if (new URL(new Request(input).url).pathname.startsWith("/points/")) {
+        return Response.json({ properties: { forecast: "https://api.weather.gov/gridpoints/LOX/148,47/forecast" } });
+      }
+      return Response.json({ properties: { periods } });
+    })).toEqual({
+      location: "Westwood, Los Angeles", timeZone: "America/Los_Angeles",
+      days: [{ date: "2026-09-30", highF: null, lowF: 61, condition: "Clear" }],
+    });
   });
 
   it("propagates caller cancellation before requesting the resolved forecast", async () => {
