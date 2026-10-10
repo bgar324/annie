@@ -57,8 +57,9 @@ const modelCallSchema = z.object({
   messages: z.array(z.object({ role: z.string(), content: z.string().nullish() })).min(1),
   response_format: z.object({ type: z.string() }).optional(),
   tools: z.array(z.unknown()).optional(),
+  reasoning_effort: z.enum(["low", "medium", "high", "max"]),
 });
-type ModelCall = z.infer<typeof modelCallSchema> & { kind: "agent" | "memory"; durationMs: number };
+type ModelCall = z.infer<typeof modelCallSchema> & { kind: "agent" | "memory"; durationMs: number; requestBytes: number };
 let modelCalls: ModelCall[] = [];
 let blockedRequests = 0;
 globalThis.fetch = async (input, init) => {
@@ -67,15 +68,16 @@ globalThis.fetch = async (input, init) => {
     blockedRequests += 1;
     throw new Error("Smoke network boundary refused non-DeepSeek request");
   }
-  const parsed = input instanceof Request && input.method === "POST"
-    ? modelCallSchema.parse(JSON.parse(await input.clone().text()))
+  const requestBody = input instanceof Request && input.method === "POST"
+    ? await input.clone().text()
     : undefined;
+  const parsed = requestBody === undefined ? undefined : modelCallSchema.parse(JSON.parse(requestBody));
   const startedAt = Date.now();
   const response = await networkFetch(input, { ...init, redirect: "error" });
   const body = await response.text();
   if (parsed !== undefined) {
     const head = parsed.messages[0]?.content ?? "";
-    modelCalls.push({ ...parsed, kind: head.startsWith("Maintain the canonical") ? "memory" : "agent", durationMs: Date.now() - startedAt });
+    modelCalls.push({ ...parsed, kind: head.startsWith("Maintain the canonical") ? "memory" : "agent", durationMs: Date.now() - startedAt, requestBytes: Buffer.byteLength(requestBody ?? "") });
   }
   return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
 };
@@ -110,6 +112,9 @@ interface CaseResult {
   firstReplyMs: number;
   rounds: number;
   agentMs: number[];
+  agentRequestBytes: number[];
+  reasoningEfforts: string[];
+  memoryReasoningEfforts: string[];
   tools: string[];
   reply: string;
   error?: string;
@@ -190,7 +195,7 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
   let runtime = await createRuntime(config, overrides);
   const result: CaseResult = {
     name: smokeCase.name, category: smokeCase.category, iteration, passed: false, passThrough: false,
-    latencyMs: 0, firstReplyMs: 0, rounds: 0, agentMs: [], tools: [], reply: "",
+    latencyMs: 0, firstReplyMs: 0, rounds: 0, agentMs: [], agentRequestBytes: [], reasoningEfforts: [], memoryReasoningEfforts: [], tools: [], reply: "",
   };
   try {
     runtime.localUi.connections.saveAuthorization({
@@ -251,6 +256,9 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
     result.firstReplyMs = (sentAt[0] ?? startedAt) - startedAt;
     result.rounds = modelCalls.filter((call) => call.kind === "agent").length;
     result.agentMs = modelCalls.filter((call) => call.kind === "agent").map((call) => call.durationMs);
+    result.agentRequestBytes = modelCalls.filter((call) => call.kind === "agent").map((call) => call.requestBytes);
+    result.reasoningEfforts = modelCalls.filter((call) => call.kind === "agent").map((call) => call.reasoning_effort);
+    result.memoryReasoningEfforts = modelCalls.filter((call) => call.kind === "memory").map((call) => call.reasoning_effort);
     result.tools = observation.tools.map((tool) => `${tool.tool_name}:${tool.status}`);
     result.reply = smokeCase.name === "connect_google"
       ? (sent.at(-1) ?? "").replace(/https:\/\/\S+/gu, "[synthetic signed link]")

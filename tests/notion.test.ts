@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
+import { z } from "zod";
 import { AgentRunStore } from "../src/agent/store.js";
 import { ToolRegistry, type ToolExecutionContext } from "../src/agent/tools.js";
 import { loadRuntimeConfig } from "../src/config.js";
@@ -25,6 +26,7 @@ import {
   type NotionSession,
   type NotionToolDescriptor,
 } from "../src/notion/client.js";
+import type { TaskChange } from "../src/notion/tasks.js";
 import { NotionToolService } from "../src/notion/tools.js";
 import { CredentialVault } from "../src/security/vault.js";
 import { createTraceRedactor } from "../src/tracing/redaction.js";
@@ -331,7 +333,7 @@ describe("Notion writes", () => {
     expect(harness.runs.getToolRequired(context.toolExecutionId).status).toBe("succeeded");
   });
 
-  it("maps only the three supported update commands", async () => {
+  it("maps the three general update commands to their provider commands", async () => {
     const harness = notionHarness();
     addNotionConnection(harness, "workspace_update", "Writing");
     const calls: Array<{ name: string; argumentsValue: Record<string, unknown> }> = [];
@@ -777,6 +779,536 @@ describe("Notion writes", () => {
   });
 });
 
+describe("Notion task edits", () => {
+  it.each(["fetch", "search"])("uses a compact %s read as complete same-run proof without exposing the full source", async (readKind) => {
+    const harness = notionHarness();
+    const connection = addNotionConnection(harness, "workspace_compact", "Tasks");
+    const source = "# Tasks\nPrivate prose that must stay out of the task view.\n## Yesterday\n- [ ] Repeat\n## Today\n- [ ] Repeat\n";
+    const fixture = sessionFixture(async (name, argumentsValue) => {
+      if (name === "notion-search") {
+        return { structuredContent: { results: [{ id: "tasks", title: "Tasks", highlight: source }], truncated: false } };
+      }
+      if (name === "notion-fetch") {
+        return { structuredContent: { id: "tasks", text: source, truncated: false } };
+      }
+      expect(name).toBe("notion-update-page");
+      expect(writeStates(harness)).toEqual(["attempting"]);
+      const updates = providerTaskPatchSchema.parse(argumentsValue.content_updates);
+      expect(argumentsValue.command).toBe("update_content");
+      expect(updates[0].replace_all_matches).toBe(false);
+      expect(source.split(updates[0].old_str)).toHaveLength(2);
+      return { content: [{ type: "text", text: "accepted" }] };
+    });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const readArguments = readKind === "search"
+      ? { query: "Tasks", workspace: "Tasks", hydrate: 1, view: "tasks" }
+      : { id: "tasks", workspace: "Tasks", view: "tasks" };
+    const context = toolContext(harness, `notion.${readKind}`, "read", undefined, readArguments);
+    const result = readKind === "search"
+      ? await service.search({ query: "Tasks", workspace: "Tasks", pageSize: 5, hydrate: 1, view: "tasks" }, context)
+      : await service.fetch({ id: "tasks", workspace: "Tasks", view: "tasks" }, context);
+    harness.runs.finishTool(context.toolExecutionId, "succeeded", result);
+    const envelope = compactReadEnvelopeSchema.parse(result);
+    const page = readKind === "search"
+      ? compactSearchEnvelopeSchema.parse(result).result.pages[0]
+      : compactTaskPageSchema.parse(envelope.result);
+    assert(page !== undefined);
+    const section = page.sections.find((value) => value.path.at(-1) === "Today");
+    assert(section !== undefined);
+    const task = section.tasks[0];
+    assert(task !== undefined);
+    expect(JSON.stringify(envelope.result)).not.toContain("Private prose");
+    expect(JSON.stringify(envelope.result)).not.toContain(connection.id);
+    expect(JSON.stringify(envelope.result)).not.toContain(context.runId);
+    expect(task.ref).toMatch(/^t_[a-f0-9]{24,}$/u);
+    expect(section.ref).toMatch(/^s_[a-f0-9]{24,}$/u);
+    expect(result).toMatchObject(readKind === "search" ? { hidden: { pages: [{ text: source }] } } : { hidden: { page: { text: source } } });
+
+    const changed = await service.updatePage({
+      workspace: "Tasks", pageId: "tasks", command: "edit_tasks",
+      changes: [
+        { kind: "check", task: task.ref, checked: true },
+        { kind: "append", section: section.ref, text: "Repeat" },
+      ],
+    }, toolContext(harness, "notion.update_page", "write", context.runId));
+    expect(changed).toMatchObject({
+      outcome: "succeeded",
+      result: { pageId: "tasks", view: "tasks", ordering: "changed_sections" },
+      hidden: { page: { id: "tasks", text: source.replace("## Today\n- [ ] Repeat\n", "## Today\n- [x] Repeat\n- [ ] Repeat\n"), truncated: false } },
+    });
+    expect(writeStates(harness)).toEqual(["succeeded"]);
+    expect(fixture.call.mock.calls.filter(([name]) => name === "notion-update-page")).toHaveLength(1);
+  });
+
+  it.each([
+    { name: "notion.search", argumentsValue: { query: "tasks", view: "tasks", hydrate: 0 } },
+    { name: "notion.search", argumentsValue: { query: "tasks", view: "tasks" } },
+    { name: "notion.search", argumentsValue: { query: "tasks", hydrate: 1, match: "older" } },
+    { name: "notion.fetch", argumentsValue: { id: "tasks", view: "full", match: "older" } },
+    { name: "notion.fetch", argumentsValue: { id: "tasks", match: "older" } },
+    { name: "notion.fetch", argumentsValue: { id: "tasks", view: "tasks", match: "first\nsecond" } },
+    { name: "notion.fetch", argumentsValue: { id: "tasks", view: "tasks", match: "x".repeat(513) } },
+  ])("rejects invalid compact read options before calling the provider: $argumentsValue", async ({ name, argumentsValue }) => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_invalid_read", "Tasks");
+    const fixture = sessionFixture(async () => { throw new Error("invalid read dispatched"); });
+    const registry = new ToolRegistry(notionService(harness, fixedSessionProvider(fixture.session)).tools());
+    await expect(registry.execute({
+      name, argumentsJson: JSON.stringify(argumentsValue), context: toolContext(harness, name, "read"),
+    })).rejects.toMatchObject({ code: "invalid_arguments" });
+    expect(fixture.call).not.toHaveBeenCalled();
+    expect(writeStates(harness)).toEqual([]);
+  });
+
+  it.each([
+    { changes: [] },
+    { changes: Array.from({ length: 17 }, () => ({ kind: "append", section: "s_unknown", text: "Task" })) },
+    { changes: [{ kind: "append", section: "s_unknown", text: "line\nline" }] },
+    { changes: [{ kind: "append", section: "s_unknown", text: " ".repeat(2) }] },
+    { changes: [{ kind: "append", section: "s_unknown", text: "x".repeat(2_001) }] },
+    { changes: [{ kind: "append", section: "s_unknown", text: "Task", checked: true }] },
+    { changes: [{ kind: "check", task: "t_unknown", checked: "true" }] },
+    { changes: [{ kind: "check", task: "t_unknown", checked: true, text: "Task" }] },
+    { changes: [{ kind: "check", task: "t_unknown", checked: true }], newContent: "forbidden" },
+    { changes: [{ kind: "check", task: "t_unknown", checked: true }], updates: [{ oldText: "x", newText: "y" }] },
+    { changes: [{ kind: "check", task: "t_unknown", checked: true }], properties: { title: "forbidden" } },
+  ])("rejects malformed task commands before source lookup or intent: $changes", async (fields) => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_invalid_task", "Tasks");
+    const fixture = sessionFixture(async () => { throw new Error("invalid task command dispatched"); });
+    const registry = new ToolRegistry(notionService(harness, fixedSessionProvider(fixture.session)).tools());
+    await expect(registry.execute({
+      name: "notion.update_page",
+      argumentsJson: JSON.stringify({ workspace: "Tasks", pageId: "tasks", command: "edit_tasks", ...fields }),
+      context: toolContext(harness, "notion.update_page", "write"),
+    })).rejects.toMatchObject({ code: "invalid_arguments" });
+    expect(fixture.validate).not.toHaveBeenCalled();
+    expect(fixture.call).not.toHaveBeenCalled();
+    expect(writeStates(harness)).toEqual([]);
+  });
+
+  it.each([
+    { command: "update_properties", properties: { title: "Title" } },
+    { command: "replace_content", newContent: "Text" },
+    { command: "update_content", updates: [{ oldText: "old", newText: "new" }] },
+  ])("forbids task changes on the general $command command before intent", async (fields) => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_general_fields", "Tasks");
+    const fixture = sessionFixture(async () => { throw new Error("stray changes dispatched"); });
+    const registry = new ToolRegistry(notionService(harness, fixedSessionProvider(fixture.session)).tools());
+    await expect(registry.execute({
+      name: "notion.update_page",
+      argumentsJson: JSON.stringify({
+        workspace: "Tasks", pageId: "tasks", ...fields,
+        changes: [{ kind: "append", section: "s_unknown", text: "Task" }],
+      }),
+      context: toolContext(harness, "notion.update_page", "write"),
+    })).rejects.toMatchObject({ code: "invalid_arguments", message: expect.stringMatching(/changes/u) });
+    expect(fixture.call).not.toHaveBeenCalled();
+    expect(writeStates(harness)).toEqual([]);
+  });
+
+  it.each(["unknown", "wrong run", "wrong page", "wrong connection", "credential generation", "changed source"])("rejects %s refs before intent", async (scenario) => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_ref", "Tasks");
+    let source = "## Today\n- [ ] Original\n";
+    const fixture = sessionFixture(async (name, argumentsValue) => {
+      expect(name).toBe("notion-fetch");
+      return { structuredContent: { id: String(argumentsValue.id), text: source, truncated: false } };
+    });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const first = await compactFetch(harness, service, "tasks");
+    const task = first.page.sections.flatMap((section) => section.tasks)[0];
+    assert(task !== undefined);
+    let runId = first.context.runId;
+    let pageId = "tasks";
+    let workspace = "Tasks";
+    if (scenario === "wrong run") {
+      runId = (await compactFetch(harness, service, "tasks")).context.runId;
+    } else if (scenario === "wrong page") {
+      pageId = "other";
+      await compactFetch(harness, service, pageId, runId);
+    } else if (scenario === "wrong connection") {
+      addNotionConnection(harness, "workspace_ref_other", "Other");
+      workspace = "Other";
+      await compactFetch(harness, service, pageId, runId, workspace);
+    } else if (scenario === "credential generation") {
+      addNotionConnection(harness, "workspace_ref", "Tasks");
+      await compactFetch(harness, service, pageId, runId);
+    } else if (scenario === "changed source") {
+      source += "An unrelated new line changes the source hash.\n";
+      await compactFetch(harness, service, pageId, runId);
+    }
+    await expect(service.updatePage({
+      workspace, pageId, command: "edit_tasks",
+      changes: [{ kind: "check", task: scenario === "unknown" ? "t_unknown" : task.ref, checked: true }],
+    }, toolContext(harness, "notion.update_page", "write", runId))).rejects.toMatchObject({ code: "task_ref_invalid" });
+    expect(fixture.validate).not.toHaveBeenCalled();
+    expect(writeStates(harness)).toEqual([]);
+    expect(fixture.call.mock.calls.every(([name]) => name === "notion-fetch")).toBe(true);
+  });
+
+  it.each(["fetch", "search"])("blocks an older complete task proof after a newer incomplete compact %s", async (readKind) => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_truncated_task", "Tasks");
+    let truncated = false;
+    const fixture = sessionFixture(async (name) => name === "notion-search"
+      ? { structuredContent: { results: [{ id: "tasks" }], truncated: false } }
+      : { structuredContent: { id: "tasks", text: "## Today\n- [ ] Original\n", truncated } });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const first = await compactFetch(harness, service, "tasks");
+    const task = first.page.sections.flatMap((section) => section.tasks)[0];
+    assert(task !== undefined);
+    truncated = true;
+    const context = toolContext(harness, `notion.${readKind}`, "read", first.context.runId, { id: "tasks", view: "tasks" });
+    const result = readKind === "search"
+      ? await service.search({ query: "Tasks", workspace: "Tasks", pageSize: 5, hydrate: 1, view: "tasks" }, context)
+      : await service.fetch({ id: "tasks", workspace: "Tasks", view: "tasks" }, context);
+    harness.runs.finishTool(context.toolExecutionId, "succeeded", result);
+    const visible = compactReadEnvelopeSchema.parse(result).result;
+    expect(visible).toMatchObject(readKind === "search"
+      ? { pages: [{ view: "tasks", sourceComplete: false, available: false }] }
+      : { view: "tasks", sourceComplete: false, available: false });
+    expect(JSON.stringify(visible)).not.toContain(task.ref);
+    await expect(service.updatePage({
+      workspace: "Tasks", pageId: "tasks", command: "edit_tasks", changes: [{ kind: "check", task: task.ref, checked: true }],
+    }, toolContext(harness, "notion.update_page", "write", first.context.runId))).rejects.toMatchObject({ code: "write_target_unverified" });
+    expect(writeStates(harness)).toEqual([]);
+    expect(fixture.call.mock.calls.some(([name]) => name === "notion-update-page")).toBe(false);
+  });
+
+  it.each(["full", "tasks"].flatMap((view) => ["failed", "wrong identity", "page limit", "aggregate limit"].map((failure) => ({ view, failure }))))(
+    "blocks stale task refs after $failure hydration in $view mode without blocking other hydrated pages",
+    async ({ view, failure }) => {
+      const harness = notionHarness();
+      addNotionConnection(harness, "workspace_failed_hydration", "Tasks");
+      const source = "## Today\n- [ ] Original\n";
+      let newer = false;
+      const fixture = sessionFixture(async (name, argumentsValue) => {
+        if (name === "notion-search") {
+          const ids = failure === "aggregate limit" ? ["first", "second", "tasks"] : ["tasks"];
+          return { structuredContent: { results: ids.map((id) => ({ id })), truncated: false } };
+        }
+        if (name === "notion-fetch") {
+          if (newer && failure === "failed") return { isError: true, content: [{ type: "text", text: "unavailable" }] };
+          if (newer && failure === "wrong identity") return { structuredContent: { id: "other", text: source, truncated: false } };
+          const padding = !newer ? "" : "x".repeat(failure === "page limit" ? 26_000 : 18_000);
+          return { structuredContent: { id: String(argumentsValue.id), text: source + padding, truncated: false } };
+        }
+        return { content: [{ type: "text", text: "accepted" }] };
+      });
+      const service = notionService(harness, fixedSessionProvider(fixture.session));
+      const first = await compactFetch(harness, service, "tasks");
+      const task = first.page.sections.flatMap((section) => section.tasks)[0];
+      assert(task !== undefined);
+      newer = true;
+      const hydrate = failure === "aggregate limit" ? 3 : 1;
+      const argumentsValue = { query: "Tasks", workspace: "Tasks", pageSize: 5, hydrate, view: view as "full" | "tasks" };
+      const context = toolContext(harness, "notion.search", "read", first.context.runId, argumentsValue);
+      const result = await service.search(argumentsValue, context);
+      harness.runs.finishTool(context.toolExecutionId, "succeeded", result);
+      await expect(service.updatePage({
+        workspace: "Tasks", pageId: "tasks", command: "edit_tasks", changes: [{ kind: "check", task: task.ref, checked: true }],
+      }, toolContext(harness, "notion.update_page", "write", first.context.runId))).rejects.toMatchObject({ code: "write_target_unverified" });
+      expect(writeStates(harness)).toEqual([]);
+      expect(fixture.validate).not.toHaveBeenCalled();
+      expect(fixture.call.mock.calls.some(([name]) => name === "notion-update-page")).toBe(false);
+      if (failure === "aggregate limit") {
+        await expect(service.updatePage({
+          workspace: "Tasks", pageId: "first", command: "update_content",
+          updates: [{ oldText: "- [ ] Original", newText: "- [x] Original", replaceAllMatches: false }],
+        }, toolContext(harness, "notion.update_page", "write", first.context.runId))).resolves.toMatchObject({ outcome: "succeeded" });
+      }
+      newer = false;
+      const refreshed = await compactFetch(harness, service, "tasks", first.context.runId);
+      const currentTask = refreshed.page.sections.flatMap((section) => section.tasks)[0];
+      assert(currentTask !== undefined);
+      await expect(service.updatePage({
+        workspace: "Tasks", pageId: "tasks", command: "edit_tasks", changes: [{ kind: "check", task: currentTask.ref, checked: true }],
+      }, toolContext(harness, "notion.update_page", "write", first.context.runId))).resolves.toMatchObject({ outcome: "succeeded" });
+    },
+  );
+
+  it("returns authoritative refreshed task refs for a no-op without preparing or dispatching", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_task_noop", "Tasks");
+    const source = "## Today\n- [x] Already done\n";
+    const fixture = sessionFixture(async (name) => {
+      expect(name).toBe("notion-fetch");
+      return { structuredContent: { id: "tasks", text: source, truncated: false } };
+    });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const read = await compactFetch(harness, service, "tasks");
+    const task = read.page.sections.flatMap((section) => section.tasks)[0];
+    assert(task !== undefined);
+    const result = await service.updatePage({
+      workspace: "Tasks", pageId: "tasks", command: "edit_tasks", changes: [{ kind: "check", task: task.ref, checked: true }],
+    }, toolContext(harness, "notion.update_page", "write", read.context.runId));
+    expect(result).toMatchObject({
+      outcome: "unchanged",
+      result: { view: "tasks", sections: [{ tasks: [{ ref: task.ref, checked: true }] }] },
+      hidden: { page: { id: "tasks", text: source, truncated: false } },
+    });
+    expect(writeStates(harness)).toEqual([]);
+    expect(fixture.validate).not.toHaveBeenCalled();
+    expect(fixture.call).toHaveBeenCalledTimes(1);
+  });
+
+  it("validates the generated provider patch against the live schema before preparing intent", async () => {
+    const harness = notionHarness();
+    const connection = addNotionConnection(harness, "workspace_task_drift", "Tasks");
+    const fixture = sessionFixture(async () => ({ structuredContent: { id: "tasks", text: "## Today\n- [ ] Original\n", truncated: false } }));
+    const read = await compactFetch(harness, notionService(harness, fixedSessionProvider(fixture.session)), "tasks");
+    const section = read.page.sections[0];
+    assert(section !== undefined);
+    const context = toolContext(harness, "notion.update_page", "write", read.context.runId);
+    const client = new Client({ name: "fixture", version: "1.0.0" });
+    const call = vi.spyOn(client, "callTool").mockResolvedValue({ content: [{ type: "text", text: "must not return" }] });
+    const tools: Record<string, NotionToolDescriptor> = {
+      "notion-update-page": {
+        name: "notion-update-page",
+        inputSchema: {
+          type: "object",
+          properties: { page_id: { type: "string" }, command: { const: "update_content" }, content_updates: { type: "array" }, new_required_guard: { type: "string" } },
+          required: ["page_id", "command", "content_updates", "new_required_guard"],
+          additionalProperties: false,
+        },
+      },
+    };
+    const session = new NotionMcpSession({
+      client,
+      tools: new Map(Object.entries(tools)),
+      traceId: context.traceId, connectionId: connection.id, traces: harness.traces,
+    });
+    await expect(notionService(harness, fixedSessionProvider(session)).updatePage({
+      workspace: "Tasks", pageId: "tasks", command: "edit_tasks", changes: [{ kind: "append", section: section.ref, text: "New task" }],
+    }, context)).rejects.toMatchObject({ code: "schema_drift" });
+    expect(call).not.toHaveBeenCalled();
+    expect(writeStates(harness)).toEqual([]);
+  });
+
+  it("keeps an ambiguous task write free of applied source and refreshed mutation handles", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_task_ambiguous", "Tasks");
+    const fixture = sessionFixture(async (name) => {
+      if (name === "notion-fetch") return { structuredContent: { id: "tasks", text: "## Today\n- [ ] Original\n", truncated: false } };
+      throw new McpError(ErrorCode.RequestTimeout, "response lost");
+    });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const read = await compactFetch(harness, service, "tasks");
+    const section = read.page.sections[0];
+    assert(section !== undefined);
+    const context = toolContext(harness, "notion.update_page", "write", read.context.runId);
+    await expect(service.updatePage({
+      workspace: "Tasks", pageId: "tasks", command: "edit_tasks", changes: [{ kind: "append", section: section.ref, text: "Maybe added" }],
+    }, context)).rejects.toMatchObject({ code: ErrorCode.RequestTimeout });
+    const persisted = harness.runs.getToolRequired(context.toolExecutionId).result;
+    expect(persisted).toEqual({ ok: false, error: { code: "acceptance_unknown", message: "Notion may have accepted the write; it was not repeated" } });
+    expect(writeStates(harness)).toEqual(["ambiguous"]);
+    expect(fixture.call.mock.calls.filter(([name]) => name === "notion-update-page")).toHaveLength(1);
+  });
+
+  it("persists refreshed refs and literal applied source before returning, then reuses them after resuming", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_task_resume", "Tasks");
+    const source = "## Today\n- [ ] Original\n";
+    const text = "Keep $& $' $` literal";
+    const fixture = sessionFixture(async (name) => name === "notion-fetch"
+      ? { structuredContent: { id: "tasks", text: source, truncated: false } }
+      : { content: [{ type: "text", text: "accepted" }] });
+    const provider = fixedSessionProvider(fixture.session);
+    const service = notionService(harness, provider);
+    const read = await compactFetch(harness, service, "tasks");
+    const section = read.page.sections[0];
+    assert(section !== undefined);
+    const firstContext = toolContext(harness, "notion.update_page", "write", read.context.runId);
+    const result = await service.updatePage({
+      workspace: "Tasks", pageId: "tasks", command: "edit_tasks", changes: [{ kind: "append", section: section.ref, text }],
+    }, firstContext);
+    const persisted = harness.runs.getToolRequired(firstContext.toolExecutionId);
+    expect(persisted.status).toBe("succeeded");
+    expect(persisted.result).toEqual(result);
+    expect(result).toMatchObject({ hidden: { page: { id: "tasks", text: `${source}- [ ] ${text}\n`, truncated: false } } });
+    const refreshed = compactWriteEnvelopeSchema.parse(persisted.result).result;
+    const added = refreshed.sections.flatMap((value) => value.tasks).find((task) => task.text === text);
+    assert(added !== undefined);
+    expect(refreshed.sections[0]?.ref).not.toBe(section.ref);
+    const resumed = notionService(harness, provider);
+    await expect(resumed.updatePage({
+      workspace: "Tasks", pageId: "tasks", command: "edit_tasks", changes: [{ kind: "append", section: section.ref, text: "Stale" }],
+    }, toolContext(harness, "notion.update_page", "write", read.context.runId))).rejects.toMatchObject({ code: "task_ref_invalid" });
+    await expect(resumed.updatePage({
+      workspace: "Tasks", pageId: "tasks", command: "edit_tasks", changes: [{ kind: "check", task: added.ref, checked: true }],
+    }, toolContext(harness, "notion.update_page", "write", read.context.runId))).resolves.toMatchObject({
+      result: { view: "tasks", sections: [{ tasks: [{ text: "Original", checked: false }, { text, checked: true }] }] },
+      hidden: { page: { text: `${source}- [x] ${text}\n` } },
+    });
+    expect(writeStates(harness)).toEqual(["succeeded", "succeeded"]);
+    expect(fixture.call.mock.calls.filter(([name]) => name === "notion-fetch")).toHaveLength(1);
+  });
+
+  it("can edit literal dollar-token text introduced by an earlier patch in the same run", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_literal_patch", "Tasks");
+    const fixture = sessionFixture(async () => ({ content: [{ type: "text", text: "accepted" }] }));
+    const source = "before\nold\nafter\n";
+    const replacement = "$& $' $` $$";
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const first = fetchedUpdateContext(harness, "tasks", source);
+    await service.updatePage({
+      pageId: "tasks", command: "update_content", updates: [{ oldText: "old", newText: replacement, replaceAllMatches: false }],
+    }, first);
+    await expect(service.updatePage({
+      pageId: "tasks", command: "update_content", updates: [{ oldText: replacement, newText: "done", replaceAllMatches: false }],
+    }, toolContext(harness, "notion.update_page", "write", first.runId))).resolves.toMatchObject({ outcome: "succeeded" });
+    expect(writeStates(harness)).toEqual(["succeeded", "succeeded"]);
+  });
+
+  it("rejects duplicate changes to one task without preparing intent", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_task_duplicate", "Tasks");
+    const fixture = sessionFixture(async () => ({ structuredContent: { id: "tasks", text: "## Today\n- [ ] Original\n", truncated: false } }));
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const read = await compactFetch(harness, service, "tasks");
+    const task = read.page.sections.flatMap((section) => section.tasks)[0];
+    assert(task !== undefined);
+    await expect(service.updatePage({
+      pageId: "tasks", command: "edit_tasks",
+      changes: [{ kind: "check", task: task.ref, checked: true }, { kind: "check", task: task.ref, checked: false }],
+    }, toolContext(harness, "notion.update_page", "write", read.context.runId))).rejects.toMatchObject({ code: "task_change_invalid" });
+    expect(writeStates(harness)).toEqual([]);
+    expect(fixture.call).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses a literal older-section match and keeps the entire visible page within its byte limit", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_task_bounds", "Tasks");
+    const pageId = "p".repeat(1_500);
+    const source = Array.from({ length: 5 }, (_, section) =>
+      `## Day ${section}\n${Array.from({ length: 15 }, (_, task) => `- [ ] Task ${section}.${task} ${"x".repeat(160)}\n`).join("")}`).join("");
+    const fixture = sessionFixture(async () => ({ structuredContent: { id: pageId, text: source, truncated: false } }));
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const result = await service.fetch({ id: pageId, workspace: "Tasks", view: "tasks", match: "DAY 0" }, toolContext(harness, "notion.fetch", "read", undefined, { id: pageId }));
+    const page = compactTaskPageSchema.parse(compactReadEnvelopeSchema.parse(result).result);
+    expect(page.id).toBe(pageId);
+    expect(page.sections.map((section) => section.path.at(-1))).toEqual(["Day 0"]);
+    expect(page.sections[0]?.tasks.length).toBeLessThanOrEqual(12);
+    expect(page.sections[0]?.omittedTasks).toBeGreaterThanOrEqual(3);
+    expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(6_144);
+    expect(result).toMatchObject({ hidden: { page: { text: source } } });
+  });
+
+  it("rejects compact identity metadata that cannot fit without clipping the page id", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_task_identity", "Tasks");
+    // UTF-16 length remains within the ordinary id bound; UTF-8 metadata exceeds 6KiB.
+    const oversizedPageId = "界".repeat(2_048);
+    const oversizedFixture = sessionFixture(async () => ({ structuredContent: { id: oversizedPageId, text: "## Today\n- [ ] Task\n", truncated: false } }));
+    await expect(notionService(harness, fixedSessionProvider(oversizedFixture.session)).fetch({
+      id: oversizedPageId, view: "tasks",
+    }, toolContext(harness, "notion.fetch", "read", undefined, { id: oversizedPageId }))).rejects.toMatchObject({ code: "task_view_too_large" });
+    expect(writeStates(harness)).toEqual([]);
+  });
+
+  it("does not bypass complete-source hydration limits just because the visible task view is small", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_task_hydrate_bound", "Tasks");
+    const fixture = sessionFixture(async (name) => name === "notion-search"
+      ? { structuredContent: { results: [{ id: "tasks" }], truncated: false } }
+      : { structuredContent: { id: "tasks", text: `${"private prose ".repeat(2_000)}\n## Today\n- [ ] Task\n`, truncated: false } });
+    const result = await notionService(harness, fixedSessionProvider(fixture.session)).search({
+      query: "Tasks", workspace: "Tasks", pageSize: 5, hydrate: 1, view: "tasks",
+    }, toolContext(harness, "notion.search", "read"));
+    expect(result).toMatchObject({ result: { results: [{ id: "tasks" }], pages: [] } });
+    expect(writeStates(harness)).toEqual([]);
+  });
+
+  it("keeps malformed complete syntax unavailable without issuing task handles or blocking full reads", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_task_unsupported", "Tasks");
+    const source = "## Today\n- [ ] Real task\n```md\n- [ ] Unclosed code\n";
+    const fixture = sessionFixture(async (name) => {
+      expect(name).toBe("notion-fetch");
+      return { structuredContent: { id: "tasks", text: source, truncated: false } };
+    });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const context = toolContext(harness, "notion.fetch", "read", undefined, { id: "tasks", view: "tasks" });
+    const result = await service.fetch({ id: "tasks", view: "tasks" }, context);
+    harness.runs.finishTool(context.toolExecutionId, "succeeded", result);
+    expect(result).toMatchObject({ result: { view: "tasks", sourceComplete: true, available: false, sections: [], reason: expect.any(String) }, hidden: { page: { text: source } } });
+    await expect(service.updatePage({
+      pageId: "tasks", command: "edit_tasks", changes: [{ kind: "append", section: "s_unknown", text: "New task" }],
+    }, toolContext(harness, "notion.update_page", "write", context.runId))).rejects.toMatchObject({ code: "task_view_unavailable" });
+    await expect(service.fetch({ id: "tasks" }, toolContext(harness, "notion.fetch", "read", context.runId, { id: "tasks" }))).resolves.toEqual({
+      workspace: { label: "Tasks" }, result: { id: "tasks", text: source, truncated: false },
+    });
+    expect(writeStates(harness)).toEqual([]);
+  });
+
+  it("preserves CRLF, tabs, trailing spaces, fences, and content wrappers around a task edit", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_task_bytes", "Tasks");
+    const source = '<page>\r\n<content>\r\n# Tasks\r\n## Today\r\n\t- [ ] Existing  \r\n```md\r\n- [ ] Code is not a task\r\n```\r\n\r\n---\r\n\r\n</content>\r\n</page>';
+    const fixture = sessionFixture(async (name) => name === "notion-fetch"
+      ? { structuredContent: { id: "tasks", text: source, truncated: false } }
+      : { content: [{ type: "text", text: "accepted" }] });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const read = await compactFetch(harness, service, "tasks");
+    const section = read.page.sections.find((value) => value.path.at(-1) === "Today");
+    assert(section !== undefined);
+    expect(section.tasks).toHaveLength(1);
+    const task = section.tasks[0];
+    assert(task !== undefined);
+    const text = "Keep $& and $' literal";
+    const result = await service.updatePage({
+      pageId: "tasks", command: "edit_tasks",
+      changes: [{ kind: "check", task: task.ref, checked: true }, { kind: "append", section: section.ref, text }],
+    }, toolContext(harness, "notion.update_page", "write", read.context.runId));
+    expect(result).toMatchObject({ hidden: { page: {
+      text: source.replace("\t- [ ] Existing  ", "\t- [x] Existing  ").replace("\r\n\r\n---", () => `\r\n\t- [ ] ${text}\r\n\r\n---`),
+      truncated: false,
+    } } });
+    expect(writeStates(harness)).toEqual(["succeeded"]);
+  });
+
+  it("accepts sixteen appends in caller order, including identical existing task text", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_task_batch", "Tasks");
+    const source = "## Today\n- [ ] Task 0\n";
+    const fixture = sessionFixture(async (name) => name === "notion-fetch"
+      ? { structuredContent: { id: "tasks", text: source, truncated: false } }
+      : { content: [{ type: "text", text: "accepted" }] });
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const read = await compactFetch(harness, service, "tasks");
+    const section = read.page.sections[0];
+    assert(section !== undefined);
+    const texts = Array.from({ length: 16 }, (_, index) => `Task ${index}`);
+    const changes: TaskChange[] = texts.map((text) => ({ kind: "append", section: section.ref, text }));
+    await expect(service.updatePage({ pageId: "tasks", command: "edit_tasks", changes },
+      toolContext(harness, "notion.update_page", "write", read.context.runId))).resolves.toMatchObject({
+      hidden: { page: { text: source + texts.map((text) => `- [ ] ${text}\n`).join("") } },
+    });
+    expect(fixture.call.mock.calls.filter(([name]) => name === "notion-update-page")).toHaveLength(1);
+    expect(writeStates(harness)).toEqual(["succeeded"]);
+  });
+
+  it("rejects a generated task patch beyond the existing single-patch bound before intent", async () => {
+    const harness = notionHarness();
+    addNotionConnection(harness, "workspace_task_patch_bound", "Tasks");
+    const fixture = sessionFixture(async () => ({ structuredContent: { id: "tasks", text: "## Today\n- [ ] Original\n", truncated: false } }));
+    const service = notionService(harness, fixedSessionProvider(fixture.session));
+    const read = await compactFetch(harness, service, "tasks");
+    const section = read.page.sections[0];
+    assert(section !== undefined);
+    const changes: TaskChange[] = Array.from({ length: 5 }, () => ({ kind: "append", section: section.ref, text: "x".repeat(2_000) }));
+    await expect(service.updatePage({ pageId: "tasks", command: "edit_tasks", changes },
+      toolContext(harness, "notion.update_page", "write", read.context.runId))).rejects.toMatchObject({ code: "task_patch_too_large" });
+    expect(fixture.call).toHaveBeenCalledTimes(1);
+    expect(fixture.validate).not.toHaveBeenCalled();
+    expect(writeStates(harness)).toEqual([]);
+  });
+});
+
 describe("Notion MCP boundary", () => {
   it("accepts an additive optional read field and keeps the connection healthy", async () => {
     const harness = notionHarness();
@@ -983,6 +1515,44 @@ describe("Notion MCP boundary", () => {
     }
   });
 });
+
+const compactTaskPageSchema = z.object({
+  id: z.string().optional(),
+  pageId: z.string().optional(),
+  view: z.literal("tasks"),
+  sourceComplete: z.literal(true),
+  available: z.literal(true),
+  sections: z.array(z.object({
+    ref: z.string(),
+    path: z.array(z.string()),
+    tasks: z.array(z.object({ ref: z.string(), text: z.string(), checked: z.boolean() })),
+    omittedTasks: z.number(),
+  })),
+  omittedSections: z.number(),
+  totalSections: z.number(),
+  ordering: z.enum(["document_tail", "matched_document_tail", "changed_sections"]),
+}).loose();
+const compactReadEnvelopeSchema = z.object({ result: z.unknown() });
+const compactSearchEnvelopeSchema = z.object({ result: z.object({ pages: z.array(compactTaskPageSchema) }) });
+const compactWriteEnvelopeSchema = z.object({ result: compactTaskPageSchema });
+const providerTaskPatchSchema = z.tuple([z.object({
+  old_str: z.string().min(1).max(8_000),
+  new_str: z.string().max(8_000),
+  replace_all_matches: z.literal(false),
+})]);
+
+async function compactFetch(
+  harness: NotionHarness,
+  service: NotionToolService,
+  pageId: string,
+  runId?: RunId,
+  workspace = "Tasks",
+): Promise<{ context: ToolExecutionContext; page: z.infer<typeof compactTaskPageSchema> }> {
+  const context = toolContext(harness, "notion.fetch", "read", runId, { id: pageId, workspace, view: "tasks" });
+  const result = await service.fetch({ id: pageId, workspace, view: "tasks" }, context);
+  harness.runs.finishTool(context.toolExecutionId, "succeeded", result);
+  return { context, page: compactTaskPageSchema.parse(compactReadEnvelopeSchema.parse(result).result) };
+}
 
 interface NotionHarness {
   database: TestDatabase;

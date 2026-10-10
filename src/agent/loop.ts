@@ -165,6 +165,7 @@ export class AgentLoop {
             runId: run.id,
             messages: requestMessages,
             tools: finalRound ? [] : toolDefinitions,
+            ...(run.source.kind === "inbound" ? { reasoningEffort: "low" as const } : {}),
             signal: runSignal,
           });
         } catch (error) {

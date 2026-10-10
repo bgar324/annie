@@ -10,16 +10,24 @@ import type { TraceId } from "../core/ids.js";
 import { canonicalJson } from "../core/json.js";
 import type { WriteStore } from "../writes/store.js";
 import { NotionMcpError, type NotionClientProvider, type NotionUpstreamTool } from "./client.js";
+import { planTaskEdit, projectTasks, type TaskPlan, type TaskProjection } from "./tasks.js";
 
 const accountSchema = z.string().trim().min(1).max(160).optional();
+const viewSchema = z.enum(["full", "tasks"]).optional();
+const matchSchema = z.string().min(1).max(512)
+  .refine((value) => value.trim().length > 0 && !/[\r\n\u2028\u2029]/u.test(value), "Use a nonempty single-line match");
 const searchArgumentsSchema = z
   .object({
     query: z.string().trim().min(1).max(512),
     workspace: accountSchema,
     pageSize: z.number().int().min(1).max(10).default(10),
     hydrate: z.number().int().min(0).max(3).default(0),
+    view: viewSchema,
+    match: matchSchema.optional(),
   })
-  .strict();
+  .strict()
+  .refine((input) => input.view === "tasks" || input.match === undefined, "match requires view:tasks")
+  .refine((input) => input.view !== "tasks" || input.hydrate > 0, "view:tasks requires hydrate:1 or higher");
 const upstreamSearchArgumentsSchema = z
   .object({ page_size: z.number().int().min(1).max(50) })
   .loose();
@@ -27,8 +35,11 @@ const fetchArgumentsSchema = z
   .object({
     id: z.string().trim().min(1).max(2_048),
     workspace: accountSchema,
+    view: viewSchema,
+    match: matchSchema.optional(),
   })
-  .strict();
+  .strict()
+  .refine((input) => input.view === "tasks" || input.match === undefined, "match requires view:tasks");
 const propertyValueSchema = z.union([
   z.string().max(4_000),
   z.number().finite(),
@@ -87,10 +98,30 @@ const updateContentSchema = z
     updates: z.tuple([contentUpdateSchema]),
   })
   .strict();
+const taskChangeSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("append"),
+    section: z.string().min(1).max(160),
+    text: z.string().min(1).max(2_000)
+      .refine((value) => value.trim().length > 0 && !/[\r\n\u2028\u2029]/u.test(value), "Use nonempty single-line task text"),
+  }).strict(),
+  z.object({
+    kind: z.literal("check"),
+    task: z.string().min(1).max(160),
+    checked: z.boolean(),
+  }).strict(),
+]);
+const editTasksSchema = z.object({
+  workspace: accountSchema,
+  pageId: z.string().min(1).max(2_048),
+  command: z.literal("edit_tasks"),
+  changes: z.array(taskChangeSchema).min(1).max(16),
+}).strict();
 const updatePageArgumentsSchema = z.discriminatedUnion("command", [
   updatePropertiesSchema,
   replaceContentSchema,
   updateContentSchema,
+  editTasksSchema,
 ]);
 const toolResultSchema = z
   .object({
@@ -139,7 +170,7 @@ interface NormalizedNotionTextResult {
   readonly truncated: boolean;
 }
 
-/** A fetched page as the model and the write guard see it; hydration returns the same shape. */
+/** Full normalized source, used by ordinary reads and private compact-read provenance. */
 interface NormalizedNotionPage {
   readonly id?: string;
   readonly title?: string;
@@ -175,7 +206,8 @@ type NotionWriteResult =
       ok: true;
       outcome: "unchanged";
       workspace: { label: string };
-      result: { pageId: string };
+      result: { pageId: string } | ({ pageId: string } & TaskProjection);
+      hidden?: { page: { id: string; text: string; truncated: false } };
     };
 
 const notionSearchResultSchema = z
@@ -232,7 +264,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.search",
-          description: "Search internal content in one connected Notion workspace. For unscoped reads, call each healthy capable account with its exact safe label. To find and edit one task page, use a short title query and hydrate:1; increase hydration only if several candidates need reading. Complete result.pages already count as this run's fetch: use the selected page's id, text, and returned workspace directly, without fetching it again. Use hydrate:0 for broad discovery.",
+          description: "Search one Notion workspace using its exact safe label. For task actions use a short title query, hydrate:1, view:tasks; reuse the selected page's id and refs without refetching. A known personal task page needs no owner clarification. Only when sections name different people, select the requested owner or user's name in memory; no matching owner means ask once and write nothing. Never infer ownership from Annie or account details. An undated new task goes in the target's last matching section. Compact pages retain complete source privately. Use hydrate:0 for broad discovery, or default view:full for general text. match is a single-line literal filter for older heading paths/task text and requires view:tasks.",
           parameters: {
             type: "object",
             properties: {
@@ -240,8 +272,14 @@ export class NotionToolService {
               workspace: { type: "string", minLength: 1, maxLength: 160 },
               pageSize: { type: "integer", minimum: 1, maximum: 10, default: 10 },
               hydrate: { type: "integer", minimum: 0, maximum: 3, default: 0 },
+              view: { enum: ["full", "tasks"], default: "full" },
+              match: { type: "string", minLength: 1, maxLength: 512, pattern: "^[^\\r\\n\\u2028\\u2029]+$" },
             },
             required: ["query"],
+            allOf: [
+              { if: { properties: { match: {} }, required: ["match"] }, then: { properties: { view: { const: "tasks" } }, required: ["view"] } },
+              { if: { properties: { view: { const: "tasks" } }, required: ["view"] }, then: { properties: { hydrate: { type: "integer", minimum: 1 } }, required: ["hydrate"] } },
+            ],
             additionalProperties: false,
           },
         },
@@ -253,14 +291,19 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.fetch",
-          description: "Read a Notion page, database, data source, view, or block by its returned id and safe workspace label. Use this when search did not hydrate the selected page or its text is incomplete. Do not refetch a complete hydrated page just to edit it.",
+          description: "Read a Notion item by its returned id and safe workspace label. view:tasks returns bounded section/task refs for semantic edits; match selects older heading paths/task text by case-insensitive literal substring. Default view:full reads general text. Fetch only when search did not hydrate the selected page or its source is incomplete.",
           parameters: {
             type: "object",
             properties: {
               id: { type: "string", minLength: 1, maxLength: 2_048 },
               workspace: { type: "string", minLength: 1, maxLength: 160 },
+              view: { enum: ["full", "tasks"], default: "full" },
+              match: { type: "string", minLength: 1, maxLength: 512, pattern: "^[^\\r\\n\\u2028\\u2029]+$" },
             },
             required: ["id"],
+            allOf: [
+              { if: { properties: { match: {} }, required: ["match"] }, then: { properties: { view: { const: "tasks" } }, required: ["view"] } },
+            ],
             additionalProperties: false,
           },
         },
@@ -325,14 +368,14 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.update_page",
-          description: "Edit one complete page read this run, using its id as pageId and the same workspace. For checkboxes/additions use command:update_content and one updates item. Copy oldText VERBATIM from result.text, including straight/curly quotes, spaces, tabs, and newlines; never retype or normalize it. It must occur exactly once. To check a task, keep its text and change only [ ] to [x] in newText. To add one, copy a unique heading/neighboring line as oldText, keep that anchor unchanged in newText, and insert '\\n- [ ] New task' in the intended section. Include copied surrounding context if the task repeats. Do not rewrite the page or its history to add a task. write_target_not_found and write_target_ambiguous mean no provider write was sent: correct the copied span using their feedback. Never replay an ambiguous provider write. For a property change use command:update_properties with one property. Use replace_content only for an explicitly requested full rewrite. outcome:unchanged means already matched. Moving, deleting, and archiving are unavailable.",
+          description: "Edit a complete page read this run using its pageId and same workspace. For tasks use command:edit_tasks with changes:[{kind:'append',section:<section ref>,text:'New task'}] or [{kind:'check',task:<task ref>,checked:true}]; combine up to16 changes in user order. Use current refs, never reconstruct them. Append adds a checkbox even if its text already exists. outcome:unchanged means already matched. For general edits use update_content with one unique oldText copied VERBATIM from full result.text and literal newText. Local target/ref errors sent no write. Never replay an ambiguous provider write. update_properties changes one property; replace_content is only for an explicitly requested full rewrite. Moving, deleting, archiving are unavailable.",
           parameters: {
             type: "object",
             properties: {
               workspace: { type: "string", minLength: 1, maxLength: 160 },
               pageId: { type: "string", minLength: 1, maxLength: 2_048 },
               command: {
-                enum: ["update_properties", "replace_content", "update_content"],
+                enum: ["update_properties", "replace_content", "update_content", "edit_tasks"],
               },
               properties: {
                 type: "object",
@@ -363,6 +406,35 @@ export class NotionToolService {
                   additionalProperties: false,
                 },
               },
+              changes: {
+                type: "array",
+                minItems: 1,
+                maxItems: 16,
+                items: {
+                  oneOf: [
+                    {
+                      type: "object",
+                      properties: {
+                        kind: { const: "append" },
+                        section: { type: "string", minLength: 1, maxLength: 160 },
+                        text: { type: "string", minLength: 1, maxLength: 2_000, pattern: "^[^\\r\\n\\u2028\\u2029]+$" },
+                      },
+                      required: ["kind", "section", "text"],
+                      additionalProperties: false,
+                    },
+                    {
+                      type: "object",
+                      properties: {
+                        kind: { const: "check" },
+                        task: { type: "string", minLength: 1, maxLength: 160 },
+                        checked: { type: "boolean" },
+                      },
+                      required: ["kind", "task", "checked"],
+                      additionalProperties: false,
+                    },
+                  ],
+                },
+              },
             },
             required: ["workspace", "pageId", "command"],
             // Each command owns exactly its fields; the others are forbidden, not ignored, so
@@ -372,22 +444,29 @@ export class NotionToolService {
               {
                 if: { properties: { command: { const: "update_properties" } } },
                 then: {
-                  properties: { properties: { type: "object" }, newContent: false, updates: false },
+                  properties: { properties: { type: "object" }, newContent: false, updates: false, changes: false },
                   required: ["properties"],
                 },
               },
               {
                 if: { properties: { command: { const: "replace_content" } } },
                 then: {
-                  properties: { newContent: { type: "string" }, properties: false, updates: false },
+                  properties: { newContent: { type: "string" }, properties: false, updates: false, changes: false },
                   required: ["newContent"],
                 },
               },
               {
                 if: { properties: { command: { const: "update_content" } } },
                 then: {
-                  properties: { updates: { type: "array" }, newContent: false, properties: false },
+                  properties: { updates: { type: "array" }, newContent: false, properties: false, changes: false },
                   required: ["updates"],
+                },
+              },
+              {
+                if: { properties: { command: { const: "edit_tasks" } } },
+                then: {
+                  properties: { changes: { type: "array" }, properties: false, newContent: false, updates: false },
+                  required: ["changes"],
                 },
               },
             ],
@@ -405,8 +484,11 @@ export class NotionToolService {
     input: z.infer<typeof searchArgumentsSchema>,
     context: ToolExecutionContext,
   ): Promise<unknown> {
+    if ((input.match !== undefined && input.view !== "tasks") || (input.view === "tasks" && input.hydrate === 0)) {
+      parseToolArguments(searchArgumentsSchema, input);
+    }
     const connection = this.#select("notion.search", input.workspace, context);
-    const result = await this.#clients.withSession(
+    const hydrated = await this.#clients.withSession(
       connection.id,
       context.traceId,
       async (session) => {
@@ -421,16 +503,18 @@ export class NotionToolService {
           request,
         );
         if (input.hydrate === 0 || !("results" in search)) {
-          return search;
+          return { result: search };
         }
         // Hydration: the top results' full text in the same tool round, so the usual
         // search-then-fetch pair costs one model round instead of two. Each page is the
         // exact notion.fetch shape, bounded per page and in total; a page that fails or
         // overflows is simply absent, and the search result itself is never lost.
         const pages: NormalizedNotionPage[] = [];
+        const sources = new Map<string, NormalizedNotionPage>();
         let bytes = 0;
         for (const reference of search.results.slice(0, input.hydrate)) {
           if (reference.id === undefined) continue;
+          sources.set(reference.id, { id: reference.id, truncated: true });
           let page: NormalizedNotionPage;
           try {
             page = normalizeNotionResult("notion-fetch", await session.call("notion-fetch", { id: reference.id }));
@@ -438,23 +522,49 @@ export class NotionToolService {
             if (error instanceof NotionMcpError || error instanceof NotionToolResultError) continue;
             throw error;
           }
+          if (page.id !== undefined && page.id !== reference.id) continue;
           const size = Buffer.byteLength(canonicalJson(page));
           if (size > maximumHydratedPageBytes || bytes + size > maximumHydrationBytes) break;
           bytes += size;
-          pages.push({ ...page, id: reference.id });
+          const completePage = { ...page, id: reference.id };
+          pages.push(completePage);
+          sources.set(reference.id, completePage);
         }
-        return { ...search, pages };
+        return { result: { ...search, pages }, sources: [...sources.values()] };
       },
       context.signal,
     );
+    const result = hydrated.result;
+    const sources = "sources" in hydrated ? hydrated.sources : undefined;
     this.#markHealthy(connection, context.traceId);
-    return { workspace: { label: connection.safeLabel }, result };
+    if (input.view === "tasks") {
+      const pages = "pages" in result ? result.pages : [];
+      return {
+        workspace: { label: connection.safeLabel },
+        result: {
+          ...("results" in result
+            ? { results: result.results.map(({ highlight: _highlight, ...reference }) => reference) }
+            : { results: [], available: false, reason: "Search did not return page references; fetch a known page id for its task view." }),
+          truncated: result.truncated,
+          pages: pages.map((page) => this.#taskPage(page, page.id ?? "", connection, context, input.match)),
+        },
+        hidden: { pages: sources ?? pages },
+      };
+    }
+    const incompletePages = sources?.filter((page) => page.truncated).map(({ id }) => ({ id, truncated: true }));
+    return {
+      workspace: { label: connection.safeLabel }, result,
+      ...(incompletePages?.length ? { hidden: { pages: incompletePages } } : {}),
+    };
   }
 
   async fetch(
     input: z.infer<typeof fetchArgumentsSchema>,
     context: ToolExecutionContext,
   ): Promise<unknown> {
+    if (input.match !== undefined && input.view !== "tasks") {
+      parseToolArguments(fetchArgumentsSchema, input);
+    }
     const connection = this.#select("notion.fetch", input.workspace, context);
     const result = await this.#clients.withSession(connection.id, context.traceId, async (session) =>
       normalizeNotionResult(
@@ -464,6 +574,13 @@ export class NotionToolService {
       context.signal,
     );
     this.#markHealthy(connection, context.traceId);
+    if (input.view === "tasks") {
+      return {
+        workspace: { label: connection.safeLabel },
+        result: this.#taskPage(result, result.id ?? input.id, connection, context, input.match),
+        hidden: { page: result },
+      };
+    }
     return { workspace: { label: connection.safeLabel }, result };
   }
 
@@ -507,9 +624,37 @@ export class NotionToolService {
   ): Promise<NotionWriteResult> {
     const connection = this.#select("notion.update_page", input.workspace, context);
     const page = this.#fetchedPage(input.pageId, connection, context);
+    let edit: Exclude<z.infer<typeof updatePageArgumentsSchema>, { command: "edit_tasks" }>;
+    let plannedTaskEdit: Extract<TaskPlan, { outcome: "changed" }> | undefined;
+    if (input.command === "edit_tasks") {
+      if (page.text === undefined) {
+        throw new ModelSafeError("NotionWriteTargetError", "write_target_unverified", "Read the complete page text in this request before editing tasks.");
+      }
+      const plan = planTaskEdit(page.text, this.#taskBinding(input.pageId, connection, context), input.changes, {
+        maxViewBytes: taskViewBytes({ pageId: input.pageId }),
+      });
+      if (plan.outcome === "unchanged") {
+        return {
+          ok: true,
+          outcome: "unchanged",
+          workspace: { label: connection.safeLabel },
+          result: { pageId: input.pageId, ...plan.view },
+          hidden: { page: { id: input.pageId, text: page.text, truncated: false } },
+        };
+      }
+      plannedTaskEdit = plan;
+      edit = parseToolArguments(updateContentSchema, {
+        workspace: input.workspace,
+        pageId: input.pageId,
+        command: "update_content",
+        updates: [{ oldText: plan.oldText, newText: plan.newText, replaceAllMatches: false }],
+      });
+    } else {
+      edit = input;
+    }
     let unchanged = false;
-    if (input.command === "update_content") {
-      const [update] = input.updates;
+    if (edit.command === "update_content") {
+      const [update] = edit.updates;
       const offset = page.text?.indexOf(update.oldText) ?? -1;
       if (offset < 0) {
         throw new ModelSafeError(
@@ -526,7 +671,7 @@ export class NotionToolService {
         );
       }
       unchanged = update.oldText === update.newText;
-    } else if (input.command === "replace_content") {
+    } else if (edit.command === "replace_content") {
       if (page.text === undefined) {
         throw new ModelSafeError(
           "NotionWriteTargetError",
@@ -534,7 +679,7 @@ export class NotionToolService {
           "Fetch the complete page text before replacing its content.",
         );
       }
-      unchanged = input.newContent === page.text;
+      unchanged = edit.newContent === page.text;
     }
     if (unchanged) {
       return {
@@ -549,30 +694,72 @@ export class NotionToolService {
     // becomes the latest same-run read, so a following patch is proven against the page
     // as it truly is: a span the first patch consumed is rejected as absent, and one it
     // introduced is available. A property update leaves the text untouched.
-    const applied =
-      page.text === undefined ? undefined
-      : input.command === "update_content" ? page.text.replace(input.updates[0].oldText, input.updates[0].newText)
-      : input.command === "replace_content" ? input.newContent
-      : page.text;
+    let applied = plannedTaskEdit?.appliedText ?? page.text;
+    if (plannedTaskEdit === undefined && edit.command === "update_content" && page.text !== undefined) {
+      const [update] = edit.updates;
+      applied = page.text.replace(update.oldText, () => update.newText);
+    } else if (edit.command === "replace_content") {
+      applied = edit.newContent;
+    }
     return this.#write({
       connection,
       context,
       upstreamName: "notion-update-page",
       writeKind: "notion_update_page",
-      argumentsValue: toUpdateArguments(input),
+      argumentsValue: toUpdateArguments(edit),
       safeSummary: {
         command: input.command,
         pageId: input.pageId,
       },
       ...(applied === undefined ? {} : { appliedPage: { id: input.pageId, text: applied, truncated: false as const } }),
+      ...(plannedTaskEdit === undefined ? {} : { taskView: plannedTaskEdit.view }),
     });
   }
 
+  #taskBinding(pageId: string, connection: ConnectionRecord, context: ToolExecutionContext): string {
+    return canonicalJson({
+      runId: context.runId,
+      connectionId: connection.id,
+      credentialGeneration: connection.credentialGeneration,
+      pageId,
+    });
+  }
+
+  #taskPage(
+    page: NormalizedNotionPage,
+    pageId: string,
+    connection: ConnectionRecord,
+    context: ToolExecutionContext,
+    match: string | undefined,
+  ): unknown {
+    const metadata = { id: pageId };
+    const maxBytes = taskViewBytes(metadata);
+    if (page.truncated || page.text === undefined) {
+      const result = {
+        ...metadata,
+        view: "tasks",
+        sourceComplete: false,
+        available: false,
+        reason: "Complete source text is unavailable; fetch this page completely before editing tasks.",
+      };
+      if (Buffer.byteLength(canonicalJson(result)) > maximumCompactPageBytes) {
+        throw new ModelSafeError("NotionTaskViewError", "task_view_too_large", "This page id leaves no room for a compact task view.");
+      }
+      return result;
+    }
+    return {
+      ...metadata,
+      ...projectTasks(page.text, this.#taskBinding(pageId, connection, context), {
+        ...(match === undefined ? {} : { match }),
+        maxBytes,
+      }),
+    };
+  }
+
   /**
-   * The page the model may edit: the latest complete same-run, same-connection read of
-   * it, whether from notion.fetch or hydrated into a notion.search result. Both are the
-   * same normalized shape recorded on a succeeded tool execution, so a hydrated page is
-   * exactly as much proof as a fetched one.
+   * Select the latest same-run, same-connection source before checking completeness.
+   * Full fetches, hydrated pages, private compact-read source, and succeeded applied
+   * content all count. A newer incomplete source must block an older complete one.
    */
   #fetchedPage(
     pageId: string,
@@ -585,30 +772,35 @@ export class NotionToolService {
         { page_json: string }
       >(`
         SELECT page_json FROM (
-          SELECT rowid, json_object('workspace', json_extract(result_json, '$.workspace'),
-                                    'result', json_extract(result_json, '$.result')) AS page_json
+          SELECT rowid, 0 AS source_order, json_object('workspace', json_extract(result_json, '$.workspace'),
+                                    'result', COALESCE(json_extract(result_json, '$.hidden.page'),
+                                                       json_extract(result_json, '$.result'))) AS page_json
           FROM tool_executions
           WHERE run_id = @run_id AND connection_id = @connection_id
             AND tool_name = 'notion.fetch' AND status = 'succeeded'
             AND json_extract(arguments_json, '$.id') = @page_id
             AND result_json IS NOT NULL
           UNION ALL
-          SELECT executions.rowid, json_object('workspace', json_extract(executions.result_json, '$.workspace'),
+          SELECT executions.rowid, pages.key AS source_order, json_object('workspace', json_extract(executions.result_json, '$.workspace'),
                                                'result', pages.value) AS page_json
           FROM tool_executions AS executions,
-               json_each(executions.result_json, '$.result.pages') AS pages
+               json_each(CASE WHEN EXISTS (
+                 SELECT 1 FROM json_each(json_extract(executions.result_json, '$.hidden.pages')) AS private_pages
+                 WHERE json_extract(private_pages.value, '$.id') = @page_id
+               ) THEN json_extract(executions.result_json, '$.hidden.pages')
+                 ELSE json_extract(executions.result_json, '$.result.pages') END) AS pages
           WHERE executions.run_id = @run_id AND executions.connection_id = @connection_id
             AND executions.tool_name = 'notion.search' AND executions.status = 'succeeded'
             AND json_extract(pages.value, '$.id') = @page_id
           UNION ALL
-          SELECT rowid, json_object('workspace', json_extract(result_json, '$.workspace'),
+          SELECT rowid, 0 AS source_order, json_object('workspace', json_extract(result_json, '$.workspace'),
                                     'result', json_extract(result_json, '$.hidden.page')) AS page_json
           FROM tool_executions
           WHERE run_id = @run_id AND connection_id = @connection_id
             AND tool_name = 'notion.update_page' AND status = 'succeeded'
             AND json_extract(result_json, '$.hidden.page.id') = @page_id
         )
-        ORDER BY rowid DESC
+        ORDER BY rowid DESC, source_order DESC
         LIMIT 1
       `)
       .get({
@@ -641,6 +833,7 @@ export class NotionToolService {
     argumentsValue: Record<string, unknown>;
     safeSummary: unknown;
     appliedPage?: { id: string; text: string; truncated: false };
+    taskView?: TaskProjection;
   }): Promise<NotionWriteResult> {
     return this.#clients.withSession(
       input.connection.id,
@@ -674,7 +867,9 @@ export class NotionToolService {
             ok: true,
             outcome: "succeeded",
             workspace: { label: input.connection.safeLabel },
-            result,
+            result: input.taskView === undefined
+              ? result
+              : { pageId: String(input.argumentsValue.page_id), ...input.taskView },
             ...(input.appliedPage === undefined ? {} : { hidden: { page: input.appliedPage } }),
           };
           this.#writes.complete({
@@ -741,7 +936,7 @@ export class NotionToolResultError extends ModelSafeError<"provider_rejected"> {
 }
 
 function toUpdateArguments(
-  input: z.infer<typeof updatePageArgumentsSchema>,
+  input: Exclude<z.infer<typeof updatePageArgumentsSchema>, { command: "edit_tasks" }>,
 ): Record<string, unknown> {
   if (input.command === "update_properties") {
     return {
@@ -766,6 +961,16 @@ function toUpdateArguments(
       replace_all_matches: update.replaceAllMatches,
     })),
   };
+}
+
+const maximumCompactPageBytes = 6_144;
+
+function taskViewBytes(metadata: { id: string } | { pageId: string }): number {
+  const maximumBytes = maximumCompactPageBytes - Buffer.byteLength(canonicalJson(metadata)) + 1;
+  if (maximumBytes <= 0) {
+    throw new ModelSafeError("NotionTaskViewError", "task_view_too_large", "This page id leaves no room for a compact task view.");
+  }
+  return maximumBytes;
 }
 
 function normalizeNotionResult(

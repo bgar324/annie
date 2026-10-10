@@ -265,7 +265,7 @@ describe("queue wake deadlines", () => {
 describe("wake scheduler", () => {
   it("publishes the earliest deadline once and stays quiet until it moves", async () => {
     const harness = createSchedulerHarness();
-    const now = Date.now();
+    const now = Date.UTC(2026, 8, 23, 14, 0);
     const signal = new AbortController().signal;
     harness.queueDeadline.value = now + 10 * minuteMs;
 
@@ -333,7 +333,8 @@ describe("wake scheduler", () => {
 
   it("records the attempt before the request and only trusts an acknowledged schedule", async () => {
     const harness = createSchedulerHarness();
-    const now = Date.now();
+    // Keep the six-hour fallback later than the queued deadline.
+    const now = Date.UTC(2026, 8, 23, 14, 0);
     const signal = new AbortController().signal;
     harness.queueDeadline.value = now + 30 * minuteMs;
     harness.respondWith(502);
@@ -366,7 +367,7 @@ describe("wake scheduler", () => {
 
   it("retries a broker that cannot be reached at all", async () => {
     const harness = createSchedulerHarness();
-    const now = Date.now();
+    const now = Date.UTC(2026, 8, 23, 14, 0);
     const signal = new AbortController().signal;
     harness.queueDeadline.value = now + 30 * minuteMs;
     harness.failWith(new TypeError("fetch failed"));
