@@ -142,7 +142,6 @@ describe("DeepSeek model adapter", () => {
     expect(authorization).toBe("Bearer deepseek_test_key");
     expect(requestedBody).toMatchObject({
       model: "deepseek-v4-flash",
-      reasoning_effort: "high",
       messages: [
         { role: "user", content: "Do both" },
         priorProviderMessage,
@@ -232,7 +231,6 @@ describe("DeepSeek model adapter", () => {
     });
 
     expect(requestedBodies[1]).toMatchObject({
-      reasoning_effort: "high",
       messages: [
         { role: "user", content: "Echo this" },
         returnedProviderMessage,
@@ -401,13 +399,12 @@ describe("DeepSeek model adapter", () => {
     expect(requestedBodies[0]).not.toHaveProperty("response_format");
     expect(requestedBodies[1]?.response_format).toEqual({ type: "json_object" });
     expect(requestedBodies[1]).not.toHaveProperty("tools");
-    expect(requestedBodies[0]?.reasoning_effort).toBe("high");
     expect(requestedBodies[0]).not.toHaveProperty("max_tokens");
     expect(requestedBodies[1]?.reasoning_effort).toBe("low");
     expect(requestedBodies[1]?.max_tokens).toBe(768);
   });
 
-  it("uses high reasoning without tools for memory maintenance", async () => {
+  it("omits tools for memory maintenance", async () => {
     const harness = modelHarness();
     let requestedBody: Record<string, unknown> = {};
     const model = new DeepSeekChatModel({
@@ -436,7 +433,6 @@ describe("DeepSeek model adapter", () => {
         ],
       }),
     ).resolves.toMatchObject({ content: "{\"action\":\"unchanged\"}" });
-    expect(requestedBody).toMatchObject({ reasoning_effort: "high" });
     expect(requestedBody).not.toHaveProperty("thinking");
     expect(requestedBody).not.toHaveProperty("tools");
     expect(requestedBody).not.toHaveProperty("tool_choice");

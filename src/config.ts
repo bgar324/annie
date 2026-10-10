@@ -52,7 +52,7 @@ const runtimeEnvSchema = storageEnvSchema.extend({
   DEEPSEEK_API_KEY: nonEmpty,
   DEEPSEEK_MODEL: nonEmpty.default("deepseek-v4-flash"),
   DEEPSEEK_BASE_URL: z.url().default("https://api.deepseek.com"),
-  DEEPSEEK_REASONING_EFFORT: z.enum(["low", "medium", "high"]).default("high"),
+  DEEPSEEK_REASONING_EFFORT: z.enum(["low", "medium", "high", "max"]).default("max"),
   DEEPSEEK_REQUEST_TIMEOUT_MS: positiveInteger(90_000, 120_000),
 
   GOOGLE_CLIENT_ID: nonEmpty,
@@ -117,7 +117,7 @@ export interface RuntimeConfig extends StorageConfig {
     apiKey: string;
     model: string;
     baseUrl: string;
-    reasoningEffort: "low" | "medium" | "high";
+    reasoningEffort: "low" | "medium" | "high" | "max";
     requestTimeoutMs: number;
   };
   google: {

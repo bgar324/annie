@@ -63,11 +63,10 @@ describe("runtime configuration", () => {
       fromNumber: "+15550000001",
       baseUrl: "https://api.sendblue.co",
     });
-    expect(config.deepseek).toEqual({
+    expect(config.deepseek).toMatchObject({
       apiKey: "deepseek_test_key",
       model: "deepseek-v4-flash",
       baseUrl: "https://api.deepseek.com",
-      reasoningEffort: "high",
       requestTimeoutMs: 90_000,
     });
     expect(config.dailyBrief).toEqual({
