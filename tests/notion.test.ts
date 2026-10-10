@@ -627,9 +627,9 @@ describe("Notion writes", () => {
   });
 
   it.each([
-    { label: "absent source", text: "- [ ] Different task" },
-    { label: "repeated source", text: "- [ ] Task\n- [ ] Task" },
-  ])("rejects $label without dispatching a patch", async ({ text }) => {
+    { label: "absent source", text: "- [ ] Different task", code: "write_target_not_found" },
+    { label: "repeated source", text: "- [ ] Task\n- [ ] Task", code: "write_target_ambiguous" },
+  ])("rejects $label without dispatching a patch", async ({ text, code }) => {
     const harness = notionHarness();
     addNotionConnection(harness, "workspace_source", "Work");
     const fixture = sessionFixture(async () => {
@@ -642,7 +642,7 @@ describe("Notion writes", () => {
       command: "update_content",
       updates: [{ oldText: "- [ ] Task", newText: "- [x] Task", replaceAllMatches: false }],
     }, fetchedUpdateContext(harness, "tasks", text))).rejects.toMatchObject({
-      code: "write_target_ambiguous",
+      code,
     });
     expect(fixture.call).not.toHaveBeenCalled();
     expect(writeStates(harness)).toEqual([]);

@@ -20,7 +20,7 @@ export function connectionTools(connections: ConnectionStore): readonly Register
       definition: {
         name: "connections.list",
         description:
-          "List the accounts connected to Annie right now, including each safe label, provider, live health status, and capabilities. Use this authoritative live result for connection-status questions or when a provider tool reports that the prompt snapshot is stale; ordinary reads already receive a safe account snapshot.",
+          "Read current connection metadata: safe labels, health status, and granted capabilities. Use for account-status questions or a stale account snapshot; ordinary reads already receive a snapshot. This does not call or test provider operations. Healthy means the connection is recorded as usable, and a capability means supported, not that create/update or any particular request succeeded. Do not describe all operations as working from this result.",
         parameters: {
           type: "object",
           properties: {},

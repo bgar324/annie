@@ -979,7 +979,7 @@ describe("production runtime", () => {
     expect(notionClients.writes).toHaveLength(2);
     expect(notionClients.pageText).toBe("# Tasks\n- [x] Task 1\n- [ ] Task 1b\n- [ ] Task 2\n");
     const refused = model.requests[3]?.messages.find((message) => message.role === "tool" && message.toolCallId === "call_write_2");
-    expect(JSON.parse(refused?.content ?? "null")).toMatchObject({ ok: false, error: { code: "write_target_ambiguous" } });
+    expect(JSON.parse(refused?.content ?? "null")).toMatchObject({ ok: false, error: { code: "write_target_not_found" } });
     // The applied page proves the next patch from the persisted row; echoing it back to
     // the model grew a production transcript past 38k tokens, so the transcript copy of a
     // write result carries no page text.

@@ -232,7 +232,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.search",
-          description: "Search internal content in one connected Notion workspace. For automatic multi-account reads, call once per exact safe label in connected account status. Set hydrate to 1-3 to also return the full text of the top results as pages, which counts as fetching them: use it when you expect to read or edit the page you find, so search and fetch take one round. Use 0 for a broad lookup.",
+          description: "Search internal content in one connected Notion workspace. For unscoped reads, call each healthy capable account with its exact safe label. To find and edit one task page, use a short title query and hydrate:1; increase hydration only if several candidates need reading. Complete result.pages already count as this run's fetch: use the selected page's id, text, and returned workspace directly, without fetching it again. Use hydrate:0 for broad discovery.",
           parameters: {
             type: "object",
             properties: {
@@ -253,7 +253,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.fetch",
-          description: "Fetch a Notion page, database, data source, view, or block from the source workspace returned by notion.search.",
+          description: "Read a Notion page, database, data source, view, or block by its returned id and safe workspace label. Use this when search did not hydrate the selected page or its text is incomplete. Do not refetch a complete hydrated page just to edit it.",
           parameters: {
             type: "object",
             properties: {
@@ -272,7 +272,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.create_page",
-          description: "Create one Notion page with narrow properties and optional text. Text alone does not create it.",
+          description: "Create one new Notion page, not a task on an existing page. Supply properties such as {\"title\":\"Project notes\"} and optional content; use a parent returned from that workspace when the user names a destination. To add a checkbox to an existing task page, use notion.update_page instead. A written reply alone creates nothing.",
           parameters: {
             type: "object",
             properties: {
@@ -325,7 +325,7 @@ export class NotionToolService {
       {
         definition: {
           name: "notion.update_page",
-          description: "Update one page fetched in this run using the same workspace. Use one unique exact-text patch for task changes or additions, one property for a property change, or replace_content only when the user requests a full rewrite. Include unchanged headings/context to distinguish repeated text. An unchanged patch returns outcome:unchanged without a provider write. Moving, deleting, and archiving are unavailable.",
+          description: "Edit one complete page read this run, using its id as pageId and the same workspace. For checkboxes/additions use command:update_content and one updates item. Copy oldText VERBATIM from result.text, including straight/curly quotes, spaces, tabs, and newlines; never retype or normalize it. It must occur exactly once. To check a task, keep its text and change only [ ] to [x] in newText. To add one, copy a unique heading/neighboring line as oldText, keep that anchor unchanged in newText, and insert '\\n- [ ] New task' in the intended section. Include copied surrounding context if the task repeats. Do not rewrite the page or its history to add a task. write_target_not_found and write_target_ambiguous mean no provider write was sent: correct the copied span using their feedback. Never replay an ambiguous provider write. For a property change use command:update_properties with one property. Use replace_content only for an explicitly requested full rewrite. outcome:unchanged means already matched. Moving, deleting, and archiving are unavailable.",
           parameters: {
             type: "object",
             properties: {
@@ -511,14 +511,18 @@ export class NotionToolService {
     if (input.command === "update_content") {
       const [update] = input.updates;
       const offset = page.text?.indexOf(update.oldText) ?? -1;
-      if (
-        offset < 0 ||
-        page.text?.indexOf(update.oldText, offset + 1) !== -1
-      ) {
+      if (offset < 0) {
+        throw new ModelSafeError(
+          "NotionWriteTargetError",
+          "write_target_not_found",
+          "No provider write was sent: oldText does not occur in the fetched text. Copy it verbatim from the current result, preserving punctuation, whitespace, and newlines; do not reconstruct it. Refetch only if the source is incomplete or stale.",
+        );
+      }
+      if (page.text?.indexOf(update.oldText, offset + 1) !== -1) {
         throw new ModelSafeError(
           "NotionWriteTargetError",
           "write_target_ambiguous",
-          "The old text must occur exactly once in the fetched page. Fetch again and include enough unchanged context to identify one location.",
+          "No provider write was sent: oldText occurs more than once. Extend the exact copied span with its section heading or neighboring lines until it identifies one location.",
         );
       }
       unchanged = update.oldText === update.newText;

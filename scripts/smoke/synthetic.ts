@@ -23,6 +23,7 @@ export interface NotionOptions {
   fetchFails?: boolean;
   writeLoses?: boolean;
   truncatedFetch?: boolean;
+  taskPage?: { title: string; text: string };
 }
 
 export interface NotionWorld {
@@ -59,7 +60,7 @@ export const archivePage = "# Task archive\n- [ ] Clean restroom\n- [ ] Clean an
 export function syntheticNotion(options: NotionOptions = {}): NotionWorld {
   const yesterday = `## ${isoDate(-1)}\n- [${options.yesterdayChecked === true ? "x" : " "}] Clean and organize room\n- [x] Wash car`;
   const today = `## ${isoDate(0)}\n- [ ] Clean restroom\n- [ ] Water plants\n- [ ] Clean and organize room`;
-  const original = `# Daily tasks\n\n## ${isoDate(-2)}\n- [ ] Clean and organize room\n\n${yesterday}\n\n${today}\n`;
+  const original = options.taskPage?.text ?? `# Daily tasks\n\n## ${isoDate(-2)}\n- [ ] Clean and organize room\n\n${yesterday}\n\n${today}\n`;
   const pages = new Map([["daily", original], ["archive", archivePage]]);
   const createdTitles: string[] = [];
   let mutations = 0;
@@ -72,7 +73,7 @@ export function syntheticNotion(options: NotionOptions = {}): NotionWorld {
         async call(tool, argumentsValue) {
           if (tool === "notion-search") {
             return { structuredContent: { truncated: false, results: [
-              { id: "daily", title: "Daily tasks" }, { id: "archive", title: "Task archive" },
+              { id: "daily", title: options.taskPage?.title ?? "Daily tasks" }, { id: "archive", title: "Task archive" },
             ] } };
           }
           if (tool === "notion-fetch") {

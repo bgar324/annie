@@ -49,6 +49,10 @@ const requests = {
   mark_restroom: "Can you mark clean restroom done on today's list?",
 };
 
+const sharedTodoText = "# Daily tasks\n<content>\n" + Array.from({ length: 80 }, (_, index) =>
+  `## Day ${index + 1}\n### Sam's To-do's:\n- [x] Buy groceries \n### Ben's To-do's:\n- [x] Clean up Google storage and iCloud storage\n---\n`,
+).join("") + "<empty-block/>\n</content>\n";
+
 // The production incident: earlier accepted requests that never produced a reply, then a
 // bare greeting. Those requests are closed history and lend the next turn no permission.
 const priorFailures: readonly string[] = [
@@ -220,6 +224,28 @@ export const cases: readonly SmokeCase[] = [
       assert(added.length >= 1 && added.length <= 2 && added.every((item) => /^- \[ \] /u.test(item)));
       assert(/google storage/iu.test(added.join(" ")) && /icloud storage/iu.test(added.join(" ")));
       assert(changed.startsWith(o.notion.original.slice(0, o.notion.original.indexOf(o.notion.today))), "Earlier days must be unchanged");
+    },
+  },
+  {
+    name: "shared_todo_retry", category: "notion_write",
+    texts: ["Try again"],
+    exchange: {
+      question: "Put that in my todo: make daily bruin decision by October 19",
+      reply: "The edit to the shared page didn't go through, so it isn't on the list yet.",
+      ageMs: 120_000, state: "delivered", failedScope: "notion_write",
+    },
+    notion: { taskPage: { title: "Daily tasks", text: sharedTodoText } },
+    expect(o) {
+      answeredInText(o);
+      assert.equal(o.notion.mutations(), 1, "The retry adds the task exactly once");
+      assert.deepEqual(o.writes, [{ state: "succeeded" }]);
+      const changed = o.notion.pages.get("daily") ?? "";
+      const task = /^- \[ \] make daily bruin decision by october 19\n/gimu;
+      assert.equal([...changed.matchAll(task)].length, 1, "The requested checkbox and deadline must be present once");
+      assert.equal(changed.replace(task, ""), sharedTodoText, "Adding a task must preserve the existing page byte-for-byte");
+      assert(changed.indexOf("Daily Bruin") > changed.lastIndexOf("### Ben's To-do's:") ||
+        changed.indexOf("daily bruin") > changed.lastIndexOf("### Ben's To-do's:"), "The task belongs in Ben's section");
+      assert.equal(o.notion.pages.get("archive"), archivePage);
     },
   },
   {
