@@ -7,13 +7,13 @@ import { suppressRecoveryNotifications } from "../connections/refresh.js";
 import type { ConnectionStore } from "../connections/store.js";
 import { toSafeConnectionView } from "../connections/types.js";
 import { canonicalJson } from "../core/json.js";
-import { newTraceId, type RunId, type TraceId } from "../core/ids.js";
+import { newTraceId, type ConnectionId, type RunId, type TraceId } from "../core/ids.js";
 import { dailyBriefSources, dailyBriefWindow, searchCoverage, type DailyBriefWindow } from "../messages/daily-brief-context.js";
 import type { CredentialVault } from "../security/vault.js";
 import type { TraceStore } from "../tracing/store.js";
 import { briefSchema, codexAuthSchema, outputSchema, webBriefToolNames, type CodexAuth, type Edition, type toolSchema, type attemptSchema, type completionSchema } from "./schema.js";
 import { digest, WebBriefError, WebBriefStore, type WebRunRow } from "./store.js";
-import { previewDraftSchema, previewOutputSchema, previewWeatherSchema, projectPreviewCalendar, type PreviewArtifact } from "./preview.js";
+import { previewDraftSchema, previewOutputSchema, previewWeatherSchema, projectPreviewCalendar, projectPreviewTodos, type PreviewArtifact } from "./preview.js";
 
 export interface WebBriefServiceInput {
   db: Database.Database;
@@ -30,6 +30,7 @@ const contextSchema = z.object({
   window: z.object({ calendarStart: z.string(), calendarEnd: z.string(), modifiedAfter: z.string() }),
   weather: z.object({ keyVersion: z.number(), nonce: z.string(), ciphertext: z.string(), authTag: z.string() }).optional(),
 });
+const googleLinkMetadata = z.object({ email: z.string().email().max(320), emailVerified: z.literal(true) });
 const pacific = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23" });
 const leaseMs = 10 * 60_000;
 const budgetMs = 15 * 60_000;
@@ -348,12 +349,31 @@ export class WebBriefService {
     }));
     if (!weather.success) return { kind: "invalid", code: "invalid_preview_weather" };
     const projection = projectPreviewCalendar({ date: row.local_date, results: evidence.calendarResults });
+    const connections = new Map(this.input.connections.list().map((connection) => [connection.id, connection]));
+    const linkSources = this.input.db.prepare<{ id: string; run: string }, {
+      id: string; tool_name: string; value_json: string; connection_id: ConnectionId | null;
+    }>(`SELECT source.id,execution.tool_name,source.value_json,execution.connection_id
+      FROM web_brief_sources source JOIN tool_executions execution ON execution.id=source.tool_execution_id
+      WHERE source.web_brief_id=@id AND execution.run_id=@run AND execution.status='succeeded'`)
+      .all({ id: row.id, run: this.#store.agentId(row.id) });
+    const todos = projectPreviewTodos({
+      todos: parsed.data.todos,
+      sources: linkSources.map((source) => {
+        const connection = source.connection_id === null ? undefined : connections.get(source.connection_id);
+        const metadata = googleLinkMetadata.safeParse(connection?.safeMetadata);
+        return {
+          id: source.id, toolName: source.tool_name, value: JSON.parse(source.value_json) as unknown,
+          verifiedEmail: connection?.provider === "google" && metadata.success ? metadata.data.email : null,
+        };
+      }),
+    });
+    if (todos.kind === "invalid") return todos;
     const coverage = evidence.coverage.map((entry) => entry.product === "calendar" && entry.status === "complete" && projection.truncatedAccounts.has(entry.account)
       ? { ...entry, status: "truncated" as const } : entry);
     const preview: PreviewArtifact = {
       version: 1, date: row.local_date, generatedAt: new Date().toISOString(), timeZone: "America/Los_Angeles",
       weather: weather.data, calendar: projection.calendar,
-      todos: parsed.data.todos.map((todo, index) => ({ id: `todo_${digest(canonicalJson({ index, ...todo }))}`, ...todo })),
+      todos: todos.todos,
       coverage,
     };
     if (preview.calendar.length > 200 || coverage.length > 256 || Buffer.byteLength(canonicalJson(preview)) > 262_144) {
@@ -457,5 +477,6 @@ function previewInstructions(window: DailyBriefWindow): string {
     "Check ALL listed Gmail accounts and ALL Notion workspaces independently, even when Notion is empty. Use exact safe labels. Read recent important/unread mail and recorded Notion tasks/deadlines. Preserve missing, unavailable and truncated coverage honestly. Combine items only when source evidence proves they are the same underlying task, never by title alone.",
     `For each listed Google product use google.search maxResults 20: Calendar timeMin ${window.calendarStart}, timeMax ${window.calendarEnd}, no query; Drive modifiedAfter ${window.modifiedAfter}, no text or modifiedBefore; Tasks dueBefore ${window.calendarEnd}, includeCompleted false, no query.`,
     "Cite only sourceId values returned in this run for each explicit action. No Contacts, writes, sends, reminders, reconnect actions, invented deadlines or invented current weather. Account/source labels are private provenance, not part of todo wording.",
+    "Every todo must include references, an array of {sourceId,itemId} chosen from its cited same-run normalized results. For Gmail search use the exact messages[].id or threadId, or hydration.threads[].thread.id. For Notion search use the exact result.results[].id or result.pages[].id. Never guess an identity or URL. A gmail.read_thread or notion.fetch citation already identifies one target and may use references:[]; a search batch alone never identifies which item should open. Code adds source links and strips references from the artifact.",
   ].join("\n");
 }

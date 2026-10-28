@@ -13,7 +13,7 @@ import { createTraceRedactor } from "../src/tracing/redaction.js";
 import { TraceStore } from "../src/tracing/store.js";
 import { loadWebBriefConfig } from "../src/web-brief/config.js";
 import { registerWebBriefRoutes } from "../src/web-brief/routes.js";
-import { projectPreviewCalendar } from "../src/web-brief/preview.js";
+import { projectPreviewCalendar, projectPreviewTodos, previewDraftSchema } from "../src/web-brief/preview.js";
 import { codexAuthSchema, webBriefToolNames } from "../src/web-brief/schema.js";
 import { WebBriefService } from "../src/web-brief/service.js";
 import { WebBriefStore } from "../src/web-brief/store.js";
@@ -41,7 +41,7 @@ interface WebBriefHarness {
   store: WebBriefStore;
 }
 
-function harness(products: "gmail" | "all" = "gmail", result: unknown = { messages: [], truncated: false }): WebBriefHarness {
+function harness(products: "gmail" | "all" = "gmail", result: unknown = { messages: [], truncated: false }, metadata: Record<string, unknown> = { secretMetadata: "never-model" }): WebBriefHarness {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date("2026-10-28T14:00:00Z"));
   const database = createTestDatabase();
@@ -52,7 +52,7 @@ function harness(products: "gmail" | "all" = "gmail", result: unknown = { messag
   const runs = new AgentRunStore(db, traces);
   const connections = new ConnectionStore(db, vault, traces);
   connections.saveAuthorization({ traceId: newTraceId(), provider: "google", providerAccountId: "private-id-never-model",
-    safeLabel: "Work", safeMetadata: { secretMetadata: "never-model" }, providerState: {},
+    safeLabel: "Work", safeMetadata: metadata, providerState: {},
     capabilities: products === "all" ? ["gmail.read", "calendar.read", "drive.read", "tasks.read", "contacts.read"] : ["gmail.read"], credentials: { refreshToken: "provider-token-never-model" },
   });
   const calls: string[] = [];
@@ -326,11 +326,11 @@ describe("non-publishing fixed real-data preview", () => {
     const h = harness();
     const claim = await previewClaimed(h);
     const source = await mail(h, claim.leaseToken);
-    const completion = { ...claim, auth, brief: { todos: [{ title: "Review the requested draft", detail: null, due: null, sourceIds: [source.sourceId ?? "foreign"] }] }, errorCode: null };
+    const completion = { ...claim, auth, brief: { todos: [{ title: "Review the requested draft", detail: null, due: null, sourceIds: [source.sourceId ?? "foreign"], references: [] }] }, errorCode: null };
     const response = await h.service.completePreview(completion);
     expect(response).toMatchObject({ kind: "previewed", errorCode: null, preview: {
       version: 1, date: "2026-10-28", timeZone: "America/Los_Angeles", weather: previewWeather, calendar: [],
-      todos: [{ title: "Review the requested draft", detail: null, due: null, sourceIds: [source.sourceId] }],
+      todos: [{ title: "Review the requested draft", detail: null, due: null, sourceIds: [source.sourceId], links: [] }],
       coverage: [{ account: "Work", product: "gmail", status: "complete" }],
     } });
     expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(262_144);
@@ -361,8 +361,8 @@ describe("non-publishing fixed real-data preview", () => {
 
   it.each([
     { brief: { todos: [], weather: { highF: 99 } }, code: "invalid_preview" },
-    { brief: { todos: [{ title: "Unproven", detail: null, due: null, sourceIds: ["foreign"] }] }, code: "invalid_citation" },
-    { brief: { todos: [{ title: "Bad date", detail: null, due: "2026-02-30", sourceIds: ["foreign"] }] }, code: "invalid_preview" },
+    { brief: { todos: [{ title: "Unproven", detail: null, due: null, sourceIds: ["foreign"], references: [] }] }, code: "invalid_citation" },
+    { brief: { todos: [{ title: "Bad date", detail: null, due: "2026-02-30", sourceIds: ["foreign"], references: [] }] }, code: "invalid_preview" },
     { brief: { todos: [] }, code: "source_coverage_missing" },
   ])("checkpoints valid rotated auth on invalid preview output ($code)", async ({ brief: draft, code }) => {
     const h = harness();
@@ -473,6 +473,62 @@ describe("non-publishing fixed real-data preview", () => {
     expect(await h.service.completePreview({ ...claim, auth, brief: { todos: [] }, errorCode: null })).toMatchObject({ kind: "failed", errorCode: "source_coverage_missing" });
     expect(h.store.auth()?.generation).toBe(2);
   });
+
+  it("routes exact selected mail identities through their actual bound account without exposing metadata to Codex", async () => {
+    const result = { messages: [{ id: "a10", threadId: "b10", subject: "Same title" }, { id: "a20", threadId: "b20", subject: "Same title" }] };
+    const h = harness("gmail", result, { email: "work+brief@example.test", emailVerified: true });
+    h.service.input.connections.saveAuthorization({ traceId: newTraceId(), provider: "google", providerAccountId: "personal-private",
+      safeLabel: "Personal", safeMetadata: { email: "personal@example.test", emailVerified: true }, providerState: {},
+      capabilities: ["gmail.read"], credentials: { refreshToken: "synthetic" } });
+    const claim = await previewClaimed(h);
+    const work = await mail(h, claim.leaseToken);
+    const personal = await h.service.tool({ leaseToken: claim.leaseToken, callId: "personal-mail", name: "gmail.search",
+      arguments: { account: "Personal", query: "newer_than:1d is:unread" } });
+    const sourceId = work.sourceId ?? "missing";
+    const personalId = personal.sourceId ?? "missing";
+    expect(JSON.stringify(claim)).not.toContain("work+brief@example.test");
+    expect(await h.service.completePreview({ ...claim, auth, errorCode: null, brief: { todos: [
+      { title: "Same title", detail: null, due: null, sourceIds: [sourceId, personalId], references: [{ sourceId, itemId: "a20" }, { sourceId: personalId, itemId: "a10" }] },
+      { title: "No exact selection", detail: null, due: null, sourceIds: [sourceId], references: [] },
+    ] } })).toMatchObject({ kind: "previewed", preview: { todos: [
+      { links: [{ url: "https://mail.google.com/mail/u/?authuser=work%2Bbrief%40example.test#all/b20", label: "Open email" },
+        { url: "https://mail.google.com/mail/u/?authuser=personal%40example.test#all/b10", label: "Open email" }] },
+      { links: [] },
+    ] } });
+    expect(h.service.edition().edition).toBeNull();
+  });
+
+  it.each([
+    { metadata: { email: "work@example.test", emailVerified: false }, linked: false },
+    { metadata: { email: "work@example.test" }, linked: false },
+    { metadata: { email: "not an email", emailVerified: true }, linked: false },
+    { metadata: { email: "work@example.test", emailVerified: true }, linked: true },
+  ])("requires verified connection email metadata for single-thread account routing ($linked)", async ({ metadata, linked }) => {
+    const h = harness("gmail", { thread: { id: "abc123", messages: [] } }, metadata);
+    const claim = await previewClaimed(h);
+    await mail(h, claim.leaseToken);
+    const source = await h.service.tool({ leaseToken: claim.leaseToken, callId: "read-thread", name: "gmail.read_thread", arguments: { account: "Work", threadId: "abc123" } });
+    expect(await h.service.completePreview({ ...claim, auth, errorCode: null, brief: { todos: [
+      { title: "Recorded request", detail: null, due: null, sourceIds: [source.sourceId], references: [] },
+    ] } })).toMatchObject({ kind: "previewed", preview: { todos: [{ links: linked
+      ? [{ url: "https://mail.google.com/mail/u/?authuser=work%40example.test#all/abc123", label: "Open email" }] : [] }] } });
+  });
+
+  it("rejects a fabricated selected identity while checkpointing auth and publishing nothing", async () => {
+    const h = harness("gmail", { messages: [{ id: "abc", threadId: "def" }] }, { email: "work@example.test", emailVerified: true });
+    const claim = await previewClaimed(h);
+    const source = await mail(h, claim.leaseToken);
+    const sourceId = source.sourceId ?? "missing";
+    const renewed = { ...auth, tokens: { ...auth.tokens, refresh_token: "link-validation-rotated" } };
+    expect(await h.service.completePreview({ ...claim, auth: renewed, errorCode: null, brief: { todos: [
+      { title: "Recorded request", detail: null, due: null, sourceIds: [sourceId], references: [{ sourceId, itemId: "invented" }] },
+    ] } })).toMatchObject({ kind: "failed", errorCode: "invalid_reference" });
+    expect(h.store.auth()?.generation).toBe(2);
+    expect(h.store.auth()?.state).toBe("ready");
+    expect(h.service.edition().edition).toBeNull();
+    expect(h.db.prepare("SELECT * FROM write_intents").all()).toEqual([]);
+    expect(h.db.prepare("SELECT * FROM egress_messages").all()).toEqual([]);
+  });
 });
 
 describe("deterministic preview calendar projection", () => {
@@ -549,5 +605,87 @@ describe("preview migration and normalized calendar identity", () => {
     expect(result.events[0]).toMatchObject({ eventId: "google-resource", iCalUID: "shared-occurrence@example.test",
       calendar: { label: "Main", primary: true }, start: { kind: "date", value: "2026-10-28" } });
     expect(JSON.stringify(result)).not.toContain("private-calendar");
+  });
+});
+
+describe("deterministic preview source links", () => {
+  const todo = { title: "Recorded request", detail: null, due: null, sourceIds: ["mail"], references: [] };
+  const mailSource = { id: "mail", toolName: "gmail.search", verifiedEmail: "work@example.test",
+    value: { messages: [{ id: "a1", threadId: "b1" }, { id: "a2", threadId: "b2" }],
+      hydration: { threads: [{ threadId: "b1", thread: { id: "b1", messages: [{ id: "a3", threadId: "b1" }] } }] } } };
+  const pageId = "12345678-1234-1234-1234-123456789abc";
+  const notionSource = { id: "notes", toolName: "notion.search", verifiedEmail: null,
+    value: { result: { results: [{ title: "No identity" }, { id: pageId, url: "https://attacker.example/redirect" }], pages: [{ id: pageId }] } } };
+
+  it("resolves exact batch identities and hydrated messages, deduplicates targets, and strips model references", () => {
+    const result = projectPreviewTodos({ todos: [{ ...todo, references: [
+      { sourceId: "mail", itemId: "a1" }, { sourceId: "mail", itemId: "a3" }, { sourceId: "mail", itemId: "b2" },
+    ] }], sources: [mailSource] });
+    expect(result).toMatchObject({ kind: "valid", todos: [{ links: [
+      { url: "https://mail.google.com/mail/u/?authuser=work%40example.test#all/b1", label: "Open email" },
+      { url: "https://mail.google.com/mail/u/?authuser=work%40example.test#all/b2", label: "Open email" },
+    ] }] });
+    if (result.kind !== "valid") throw new Error("Expected verified projection");
+    expect(Object.keys(result.todos[0] ?? {}).sort()).toEqual(["detail", "due", "id", "links", "sourceIds", "title"]);
+    expect(projectPreviewTodos({ todos: [todo], sources: [mailSource] })).toMatchObject({ kind: "valid", todos: [{ links: [] }] });
+  });
+
+  it.each([
+    { sourceId: "mail", itemId: "invented" },
+    { sourceId: "foreign-run", itemId: "a1" },
+    { sourceId: "notes", itemId: pageId },
+    { sourceId: "mail", itemId: "https://mail.google.com/mail/u/0/#all/b1" },
+  ])("rejects nonexistent, foreign, uncited or URL-based references ($sourceId/$itemId)", (reference) => {
+    expect(projectPreviewTodos({ todos: [{ ...todo, references: [reference] }], sources: [mailSource, notionSource] }))
+      .toEqual({ kind: "invalid", code: "invalid_reference" });
+  });
+
+  it("opens Notion-only pages and orders mixed-source Gmail links first without copying provider URLs", () => {
+    expect(projectPreviewTodos({ todos: [
+      { ...todo, sourceIds: ["notes", "mail"], references: [{ sourceId: "notes", itemId: pageId }, { sourceId: "mail", itemId: "a1" }] },
+      { ...todo, sourceIds: ["notes"], references: [{ sourceId: "notes", itemId: pageId }] },
+      { ...todo, sourceIds: ["fetch"], references: [] },
+    ], sources: [mailSource, notionSource, {
+      id: "fetch", toolName: "notion.fetch", verifiedEmail: null, value: { result: { id: pageId } },
+    }] })).toMatchObject({ kind: "valid", todos: [
+      { links: [{ label: "Open email" }, { url: "https://www.notion.so/12345678123412341234123456789abc", label: "Open Notion page" }] },
+      { links: [{ url: "https://www.notion.so/12345678123412341234123456789abc", label: "Open Notion page" }] },
+      { links: [{ url: "https://www.notion.so/12345678123412341234123456789abc", label: "Open Notion page" }] },
+    ] });
+  });
+
+  it("omits unsafe, missing or unsupported targets instead of guessing", () => {
+    expect(projectPreviewTodos({ todos: [
+      { ...todo, references: [{ sourceId: "mail", itemId: "a1" }] },
+      { ...todo, sourceIds: ["unsafe"], references: [] },
+      { ...todo, sourceIds: ["unknown-page"], references: [] },
+      { ...todo, sourceIds: ["drive"], references: [] },
+    ], sources: [
+      { ...mailSource, verifiedEmail: null },
+      { id: "unsafe", toolName: "gmail.read_thread", verifiedEmail: "work@example.test", value: { thread: { id: "../mail" } } },
+      { id: "unknown-page", toolName: "notion.fetch", verifiedEmail: null, value: { result: { id: "not-a-page-id", url: "https://attacker.example/" } } },
+      { id: "drive", toolName: "google.read", verifiedEmail: "work@example.test", value: { id: "a1" } },
+    ] })).toMatchObject({ kind: "valid", todos: [{ links: [] }, { links: [] }, { links: [] }, { links: [] }] });
+  });
+
+  it("requires thread evidence before turning a selected Gmail message into a thread link", () => {
+    const selected = { ...todo, references: [{ sourceId: "mail", itemId: "a1" }] };
+    for (const message of [{ id: "a1" }, { id: "a1", threadId: null }]) {
+      const source = { ...mailSource, value: { messages: [message] } };
+      expect(projectPreviewTodos({ todos: [selected], sources: [source] }))
+        .toMatchObject({ kind: "valid", todos: [{ links: [] }] });
+      expect(projectPreviewTodos({ todos: [selected], sources: [{
+        ...source, value: { ...source.value, hydration: { threads: [{ thread: { id: "b1", messages: [message] } }] } },
+      }] })).toMatchObject({ kind: "valid", todos: [{
+        links: [{ url: "https://mail.google.com/mail/u/?authuser=work%40example.test#all/b1", label: "Open email" }],
+      }] });
+    }
+  });
+
+  it("requires explicit reference arrays and forbids model-authored target URLs", () => {
+    const { references: _references, ...withoutReferences } = todo;
+    expect(previewDraftSchema.safeParse({ todos: [withoutReferences] }).success).toBe(false);
+    expect(previewDraftSchema.safeParse({ todos: [{ ...todo, links: [{ url: "https://mail.google.com/", label: "Open email" }] }] }).success).toBe(false);
+    expect(previewDraftSchema.safeParse({ todos: [{ ...todo, references: Array.from({ length: 33 }, () => ({ sourceId: "mail", itemId: "a1" })) }] }).success).toBe(false);
   });
 });
