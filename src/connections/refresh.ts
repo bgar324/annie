@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { z } from "zod";
@@ -12,6 +13,13 @@ import type { TraceStore } from "../tracing/store.js";
 import type { ConnectionRecoveryService } from "./recovery.js";
 import { ConnectionStore } from "./store.js";
 import { StaleCredentialGenerationError, type ConnectionRecord } from "./types.js";
+
+const recoveryNotifications = new AsyncLocalStorage<"suppress">();
+
+/** Suppress only this execution's reconnect notices, including after a shared refresh. */
+export function suppressRecoveryNotifications<T>(operation: () => Promise<T>): Promise<T> {
+  return recoveryNotifications.run("suppress", operation);
+}
 
 const refreshAttemptCount = 3;
 const refreshRetryBackoffMs = [250, 500] as const;
@@ -106,6 +114,9 @@ export class RefreshCoordinator {
   ): Promise<T> {
     const connection = this.#connections.getRequired(connectionId);
     if (connection.status === "reconnect_required" || connection.status === "disconnected") {
+      if (connection.status === "reconnect_required" && recoveryNotifications.getStore() !== "suppress") {
+        this.#recovery?.planReconnect(connectionId, traceId);
+      }
       throw new RefreshRequiredError(connectionId, `${connection.safeLabel} requires reconnection`);
     }
     const expiresAt = connection.expiresAtMs;
@@ -121,17 +132,20 @@ export class RefreshCoordinator {
     signal?.throwIfAborted();
 
     const existing = this.#inflight.get(connectionId);
-    if (existing !== undefined) {
-      const credentials = await existing;
+    const pending = existing ?? this.#refreshCredentials(connection, traceId, nowMs, signal);
+    if (existing === undefined) this.#inflight.set(connectionId, pending);
+    try {
+      const credentials = await pending;
       signal?.throwIfAborted();
       return credentials as T;
-    }
-    const pending = this.#refreshCredentials(connection, traceId, nowMs, signal);
-    this.#inflight.set(connectionId, pending);
-    try {
-      return (await pending) as T;
+    } catch (error) {
+      // The shared refresh owns health and credentials; each caller owns its notices.
+      if (error instanceof RefreshRequiredError && recoveryNotifications.getStore() !== "suppress") {
+        this.#recovery?.planReconnect(connectionId, traceId);
+      }
+      throw error;
     } finally {
-      if (this.#inflight.get(connectionId) === pending) {
+      if (existing === undefined && this.#inflight.get(connectionId) === pending) {
         this.#inflight.delete(connectionId);
       }
     }
@@ -155,7 +169,6 @@ export class RefreshCoordinator {
         errorCode: "refresh_acceptance_unknown",
         errorSummary: "A prior token refresh may have rotated credentials before its response was saved",
       });
-      this.#recovery?.planReconnect(connection.id, traceId);
       throw new RefreshRequiredError(connection.id, `${connection.safeLabel} requires reconnection`);
     }
 
@@ -205,7 +218,6 @@ export class RefreshCoordinator {
             errorCode: error.code,
             errorSummary: error.message,
           });
-          this.#recovery?.planReconnect(connection.id, traceId);
           throw new RefreshRequiredError(
             connection.id,
             `${connection.safeLabel} requires reconnection`,

@@ -110,6 +110,33 @@ describe("Gmail read tools", () => {
     expect(harness.runs.getToolRequired(context.toolExecutionId).connectionId).toBe(personal.id);
   });
 
+  it("marks a paged search incomplete without exposing the provider cursor", async () => {
+    const harness = gmailHarness();
+    addGoogleConnection(harness, "sub_paged", "Work", "work@example.test");
+    const service = gmailService(harness, {
+      async forConnection() {
+        return stubGmailApi({
+          async listMessages() {
+            return response({
+              messages: [{ id: "message_first", threadId: "thread_first" }],
+              resultSizeEstimate: 1,
+              nextPageToken: "opaque-provider-cursor",
+            });
+          },
+          async getMessage() {
+            return response({ id: "message_first", threadId: "thread_first", snippet: "First page" });
+          },
+        });
+      },
+    });
+    const result = await service.search(
+      { query: "newer_than:1d", account: "Work", maxResults: 1 },
+      toolContext(harness, "gmail.search"),
+    );
+    expect(result).toMatchObject({ messagesTruncated: true, messages: [{ id: "message_first" }] });
+    expect(JSON.stringify(result)).not.toContain("opaque-provider-cursor");
+  });
+
   it("fetches message metadata in bounded concurrent waves and preserves list order", async () => {
     const harness = gmailHarness();
     const connection = addGoogleConnection(

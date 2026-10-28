@@ -22,6 +22,7 @@ import { GoogleApisWorkspaceClientProvider } from "./google/client.js";
 import { GoogleWorkspaceToolService } from "./google/tools.js";
 import { MemoryDocumentStore } from "./memory/document.js";
 import { MemoryMaintenanceService } from "./memory/maintenance.js";
+import { readDailyBriefWeatherCity } from "./memory/weather.js";
 import { SendblueGateway } from "./messages/client.js";
 import { DailyBriefService } from "./messages/daily-brief.js";
 import { MessageEgressService, type EgressSendPolicy } from "./messages/egress.js";
@@ -32,7 +33,7 @@ import { SendblueReceiver } from "./messages/receiver.js";
 import { registerSendblueWebhook } from "./messages/webhook.js";
 import { WakeScheduler } from "./messages/wake-scheduler.js";
 import { InboundTurnService } from "./messages/turn.js";
-import { weatherTool } from "./messages/weather.js";
+import { fetchDailyWeather, weatherTool } from "./messages/weather.js";
 import {
   MessagingProviderError,
   type MessageGateway,
@@ -58,6 +59,9 @@ import { createTraceRedactor } from "./tracing/redaction.js";
 import { TraceStore } from "./tracing/store.js";
 import { TraceRetentionService, emergencyTrimTraceFiles } from "./tracing/retention.js";
 import { WriteStore } from "./writes/store.js";
+import { loadWebBriefConfig } from "./web-brief/config.js";
+import { registerWebBriefRoutes } from "./web-brief/routes.js";
+import { WebBriefService } from "./web-brief/service.js";
 
 const memoryMaintenanceBudgetMs = 45_000;
 const memoryMaintenanceLeaseMarginMs = 5_000;
@@ -105,6 +109,7 @@ export async function createRuntime(
   config: RuntimeConfig,
   overrides: RuntimeOverrides = {},
 ): Promise<AssistantRuntime> {
+  const webBriefConfig = loadWebBriefConfig();
   // A previously filled volume makes the SQLite write probe fail before any
   // cleanup could run, so free derived trace files first. The spool remains
   // the source of truth and re-projects deleted files on demand.
@@ -114,7 +119,12 @@ export async function createRuntime(
   });
   const database = openDatabase(config);
   try {
-    const traces = new TraceStore(database.db, createTraceRedactor(config.secretValues));
+    const traces = new TraceStore(database.db, createTraceRedactor([
+      ...config.secretValues,
+      ...(webBriefConfig === null ? [] : [
+        webBriefConfig.runnerToken, webBriefConfig.readerToken, webBriefConfig.adminToken,
+      ]),
+    ]));
     const projector = new TraceProjector(database.db, traces, config.traceDir);
     const eviction = new TraceEvictionService({ db: database.db, traceDir: config.traceDir });
     const queue = new QueueStore({
@@ -399,6 +409,25 @@ export async function createRuntime(
     });
     registerGoogleOAuth({ app, config, links, attempts, connections, traces });
     registerNotionOAuth({ app, config, links, attempts, connections, traces });
+    if (webBriefConfig !== null) {
+      const webBrief = new WebBriefService({
+        db: database.db, vault, traces, runs, tools, connections,
+        async loadContext({ traceId, signal }) {
+          const document = await memory.load();
+          const city = readDailyBriefWeatherCity(document);
+          const weather = await fetchDailyWeather({
+            traceId, traces, signal,
+            ...(city === undefined ? {} : { city }),
+            ...(overrides.weatherFetch === undefined ? {} : { fetchImpl: overrides.weatherFetch }),
+          });
+          return { memory: document, weather };
+        },
+        async releaseRun(runId) {
+          await notionClients.release?.(runs.getRequired(runId).traceId);
+        },
+      });
+      registerWebBriefRoutes(app, { service: webBrief, config: webBriefConfig });
+    }
 
     writes.recoverOpenAttempts();
     recovery.planPendingReconnects("google");

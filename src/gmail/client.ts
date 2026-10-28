@@ -77,7 +77,7 @@ export class GoogleGmailClientProvider implements GmailClientProvider {
             ["q", input.query],
             ["maxResults", String(input.maxResults)],
             ["includeSpamTrash", "false"],
-            ["fields", "messages(id,threadId),resultSizeEstimate"],
+            ["fields", "messages(id,threadId),nextPageToken,resultSizeEstimate"],
           ],
           maximumMetadataResponseBytes,
           input.signal,

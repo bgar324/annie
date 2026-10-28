@@ -18,7 +18,8 @@ export type AgentRunPhase = "pending" | "running" | "finalizing" | "completed" |
 
 export type AgentRunSource =
   | { kind: "inbound"; inboundId: InboundId }
-  | { kind: "daily_brief"; jobId: JobId };
+  | { kind: "daily_brief"; jobId: JobId }
+  | { kind: "web_brief"; webBriefId: string };
 
 export interface AgentRunRecord {
   id: RunId;
@@ -49,6 +50,7 @@ interface RunRow {
   id: RunId;
   inbound_id: InboundId | null;
   scheduled_job_id: JobId | null;
+  web_brief_id: string | null;
   trace_id: TraceId;
   phase: AgentRunPhase;
   model_requests: number;
@@ -94,25 +96,25 @@ export class AgentRunStore {
     deadlineAtMs: number;
   }): AgentRunRecord {
     const transaction = this.#db.transaction(() => {
-      const existing =
-        input.source.kind === "inbound"
-          ? this.#db
-              .prepare<{ inbound_id: string }, RunRow>(
-                `${runSelect} WHERE inbound_id = @inbound_id`,
-              )
-              .get({ inbound_id: input.source.inboundId })
-          : this.#db
-              .prepare<{ scheduled_job_id: string }, RunRow>(
-                `${runSelect} WHERE scheduled_job_id = @scheduled_job_id`,
-              )
-              .get({ scheduled_job_id: input.source.jobId });
+      const now = Date.now();
+      if (input.source.kind === "web_brief") {
+        const active = this.#db.prepare<{ id: string; trace_id: string; now_ms: number }, { id: string }>(`
+          SELECT id FROM web_brief_runs WHERE id = @id AND trace_id = @trace_id
+            AND state = 'running' AND lease_expires_at_ms > @now_ms AND deadline_at_ms > @now_ms
+        `).get({ id: input.source.webBriefId, trace_id: input.traceId, now_ms: now });
+        if (active === undefined) throw new Error("Web brief run is not actively leased");
+      }
+      const existing = input.source.kind === "inbound"
+        ? this.#db.prepare<{ id: string }, RunRow>(`${runSelect} WHERE inbound_id = @id`).get({ id: input.source.inboundId })
+        : input.source.kind === "daily_brief"
+          ? this.#db.prepare<{ id: string }, RunRow>(`${runSelect} WHERE scheduled_job_id = @id`).get({ id: input.source.jobId })
+          : this.#db.prepare<{ id: string }, RunRow>(`${runSelect} WHERE web_brief_id = @id`).get({ id: input.source.webBriefId });
       if (existing !== undefined) {
         if (existing.trace_id !== input.traceId) {
           throw new Error("Agent run source is already bound to another trace");
         }
         return toRun(existing);
       }
-      const now = Date.now();
       if (input.source.kind === "inbound") {
         const inbound = this.#db
           .prepare<{ id: string; now_ms: number }, { id: InboundId }>(`
@@ -125,7 +127,7 @@ export class AgentRunStore {
         if (inbound === undefined) {
           throw new Error(`Inbound message ${input.source.inboundId} is not ready`);
         }
-      } else {
+      } else if (input.source.kind === "daily_brief") {
         const scheduled = this.#db
           .prepare<
             { id: string; trace_id: string },
@@ -146,18 +148,19 @@ export class AgentRunStore {
           id: string;
           inbound_id: string | null;
           scheduled_job_id: string | null;
+          web_brief_id: string | null;
           trace_id: string;
           deadline_at_ms: number;
           now_ms: number;
         }>(`
           INSERT INTO agent_runs(
-            id, inbound_id, scheduled_job_id, trace_id, phase, model_requests,
+            id, inbound_id, scheduled_job_id, web_brief_id, trace_id, phase, model_requests,
             maintenance_requests, tool_calls, provider_writes, deadline_at_ms,
             transcript_bytes, memory_maintenance_status, memory_before_digest,
             memory_after_digest, ambiguous_write_id, final_response, failure_code,
             created_at_ms, updated_at_ms
           ) VALUES (
-            @id, @inbound_id, @scheduled_job_id, @trace_id, 'running', 0,
+            @id, @inbound_id, @scheduled_job_id, @web_brief_id, @trace_id, 'running', 0,
             0, 0, 0, @deadline_at_ms, 0, 'pending', NULL, NULL, NULL, NULL,
             NULL, @now_ms, @now_ms
           )
@@ -166,6 +169,7 @@ export class AgentRunStore {
           id: runId,
           inbound_id: input.source.kind === "inbound" ? input.source.inboundId : null,
           scheduled_job_id: input.source.kind === "daily_brief" ? input.source.jobId : null,
+          web_brief_id: input.source.kind === "web_brief" ? input.source.webBriefId : null,
           trace_id: input.traceId,
           deadline_at_ms: input.deadlineAtMs,
           now_ms: now,
@@ -618,18 +622,20 @@ export class AgentLimitError extends Error {
 }
 
 const runSelect = `
-  SELECT id, inbound_id, scheduled_job_id, trace_id, phase, model_requests, tool_calls,
+  SELECT id, inbound_id, scheduled_job_id, web_brief_id, trace_id, phase, model_requests, tool_calls,
          provider_writes, deadline_at_ms, final_response, failure_code
   FROM agent_runs
 `;
 
 function toRun(row: RunRow): AgentRunRecord {
   const source: AgentRunSource =
-    row.inbound_id !== null && row.scheduled_job_id === null
+    row.inbound_id !== null && row.scheduled_job_id === null && row.web_brief_id === null
       ? { kind: "inbound", inboundId: row.inbound_id }
-      : row.inbound_id === null && row.scheduled_job_id !== null
+      : row.inbound_id === null && row.scheduled_job_id !== null && row.web_brief_id === null
         ? { kind: "daily_brief", jobId: row.scheduled_job_id }
-        : (() => {
+        : row.inbound_id === null && row.scheduled_job_id === null && row.web_brief_id !== null
+          ? { kind: "web_brief", webBriefId: row.web_brief_id }
+          : (() => {
             throw new Error(`Agent run ${row.id} has an invalid source`);
           })();
   return {

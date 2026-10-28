@@ -877,6 +877,102 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX sendblue_wake_hints_due ON sendblue_wake_hints(due_at_ms);
     `,
   },
+  {
+    version: 12,
+    rebuildsForeignKeys: true,
+    sql: `
+      CREATE TABLE web_brief_runs (
+        id TEXT PRIMARY KEY,
+        local_date TEXT NOT NULL,
+        request_id TEXT NOT NULL UNIQUE,
+        trace_id TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (state IN ('running', 'completed', 'failed', 'expired')),
+        lease_token_hash TEXT NOT NULL UNIQUE,
+        lease_expires_at_ms INTEGER NOT NULL,
+        deadline_at_ms INTEGER NOT NULL,
+        credential_generation INTEGER NOT NULL CHECK (credential_generation > 0),
+        context_json TEXT NOT NULL CHECK (json_valid(context_json)),
+        completion_digest TEXT,
+        completion_json TEXT CHECK (completion_json IS NULL OR json_valid(completion_json)),
+        failure_code TEXT,
+        returned_bytes INTEGER NOT NULL DEFAULT 0 CHECK (returned_bytes >= 0),
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+      ) STRICT;
+      CREATE UNIQUE INDEX web_brief_one_active ON web_brief_runs(state) WHERE state = 'running';
+      CREATE TABLE web_brief_auth (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        state TEXT NOT NULL CHECK (state IN ('ready', 'in_use', 'reauth_required')),
+        checked_out_run_id TEXT REFERENCES web_brief_runs(id),
+        key_version INTEGER NOT NULL,
+        nonce BLOB NOT NULL,
+        ciphertext BLOB NOT NULL,
+        auth_tag BLOB NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        CHECK ((state = 'in_use' AND checked_out_run_id IS NOT NULL) OR
+          (state <> 'in_use' AND checked_out_run_id IS NULL))
+      ) STRICT;
+      CREATE TABLE agent_runs_v12 (
+        id TEXT PRIMARY KEY,
+        inbound_id TEXT UNIQUE REFERENCES inbound_messages(id),
+        scheduled_job_id TEXT UNIQUE REFERENCES jobs(id),
+        web_brief_id TEXT UNIQUE REFERENCES web_brief_runs(id),
+        trace_id TEXT NOT NULL UNIQUE,
+        phase TEXT NOT NULL CHECK (phase IN ('pending','running','finalizing','completed','failed','blocked')),
+        model_requests INTEGER NOT NULL DEFAULT 0 CHECK (model_requests >= 0),
+        maintenance_requests INTEGER NOT NULL DEFAULT 0 CHECK (maintenance_requests >= 0),
+        tool_calls INTEGER NOT NULL DEFAULT 0 CHECK (tool_calls >= 0),
+        provider_writes INTEGER NOT NULL DEFAULT 0 CHECK (provider_writes >= 0),
+        deadline_at_ms INTEGER NOT NULL,
+        transcript_bytes INTEGER NOT NULL DEFAULT 0 CHECK (transcript_bytes >= 0),
+        memory_maintenance_status TEXT NOT NULL CHECK (memory_maintenance_status IN (
+          'pending','attempting','unchanged','updated','invalid','failed')),
+        memory_before_digest TEXT,
+        memory_after_digest TEXT,
+        ambiguous_write_id TEXT,
+        final_response TEXT,
+        failure_code TEXT,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        request_scope TEXT CHECK (request_scope IS NULL OR request_scope IN (
+          'conversation','read','notion_write','connect_google','connect_notion')),
+        CHECK ((inbound_id IS NOT NULL) + (scheduled_job_id IS NOT NULL) + (web_brief_id IS NOT NULL) = 1)
+      ) STRICT;
+      INSERT INTO agent_runs_v12(
+        id,inbound_id,scheduled_job_id,web_brief_id,trace_id,phase,model_requests,
+        maintenance_requests,tool_calls,provider_writes,deadline_at_ms,transcript_bytes,
+        memory_maintenance_status,memory_before_digest,memory_after_digest,ambiguous_write_id,
+        final_response,failure_code,created_at_ms,updated_at_ms,request_scope
+      ) SELECT id,inbound_id,scheduled_job_id,NULL,trace_id,phase,model_requests,
+        maintenance_requests,tool_calls,provider_writes,deadline_at_ms,transcript_bytes,
+        memory_maintenance_status,memory_before_digest,memory_after_digest,ambiguous_write_id,
+        final_response,failure_code,created_at_ms,updated_at_ms,request_scope FROM agent_runs;
+      DROP TABLE agent_runs;
+      ALTER TABLE agent_runs_v12 RENAME TO agent_runs;
+      CREATE TABLE web_brief_sources (
+        id TEXT PRIMARY KEY,
+        web_brief_id TEXT NOT NULL REFERENCES web_brief_runs(id) ON DELETE CASCADE,
+        tool_execution_id TEXT NOT NULL UNIQUE REFERENCES tool_executions(id) ON DELETE CASCADE,
+        label TEXT NOT NULL,
+        value_json TEXT NOT NULL CHECK (json_valid(value_json)),
+        byte_count INTEGER NOT NULL CHECK (byte_count >= 0)
+      ) STRICT;
+      CREATE TABLE web_brief_editions (
+        local_date TEXT PRIMARY KEY,
+        web_brief_id TEXT NOT NULL UNIQUE REFERENCES web_brief_runs(id),
+        edition_json TEXT NOT NULL CHECK (json_valid(edition_json)),
+        generated_at_ms INTEGER NOT NULL
+      ) STRICT;
+      CREATE TABLE web_brief_attempts (
+        web_brief_id TEXT NOT NULL REFERENCES web_brief_runs(id) ON DELETE CASCADE,
+        attempt_id TEXT NOT NULL,
+        operation TEXT NOT NULL CHECK (operation IN ('model','refresh','models','bootstrap')),
+        created_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (web_brief_id, attempt_id)
+      ) STRICT;
+    `,
+  },
 ];
 
 export function runMigrations(

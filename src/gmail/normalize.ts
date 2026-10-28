@@ -57,6 +57,7 @@ const messageListSchema = z
   .object({
     messages: z.array(z.object({ id: z.string().min(1), threadId: z.string().optional() }).loose()).optional(),
     resultSizeEstimate: z.number().int().nonnegative().optional(),
+    nextPageToken: z.string().optional(),
   })
   .loose();
 const threadSchema = z
@@ -112,6 +113,7 @@ export interface NormalizedGmailThread {
 export function parseGmailMessageList(data: unknown): {
   messages: readonly { id: string; threadId: string | null }[];
   resultSizeEstimate: number | null;
+  hasMore: boolean;
 } {
   const parsed = messageListSchema.parse(data);
   return {
@@ -120,6 +122,7 @@ export function parseGmailMessageList(data: unknown): {
       threadId: message.threadId ?? null,
     })),
     resultSizeEstimate: parsed.resultSizeEstimate ?? null,
+    hasMore: (parsed.nextPageToken?.length ?? 0) > 0,
   };
 }
 

@@ -97,6 +97,28 @@ UCLA/Westwood uses the [National Weather Service](https://www.weather.gov/docume
 
 On October 7, 2026, daily brief trace `tr_a3f52b2fcd374f29a4fb96fd66a3c8e5` recorded Open-Meteo HTTP 429 for the fixed campus forecast, then passed `weather_unavailable` to the model. A later read from the production container returned “Daily API request limit exceeded. Please try again tomorrow.” The original response body was not retained, and shared-IP quota exhaustion remains an inference, not a measured attribution. Restoring the independent NWS path removes this quota dependency from the default brief without changing saved-city behavior or retrying the brief.
 
+## Private web brief
+
+The optional web publisher runs alongside the existing iMessage assistant. It does not replace the 08:00 iMessage brief or change inbound behavior. The public Annie repository contains only the authenticated backend. The subscription workflow and Vercel reader live in the separate private `bgar324/annie-brief` repository.
+
+Set all three distinct `WEB_BRIEF_RUNNER_TOKEN`, `WEB_BRIEF_READER_TOKEN`, and `WEB_BRIEF_ADMIN_TOKEN` values to enable the broker. With none set, its routes are absent. The runner can claim work, heartbeat, record network attempts, execute the six daily reads, and complete a run. The reader can fetch only the published edition. The admin credential can seed a dedicated managed ChatGPT session; it cannot authorize provider mutations.
+
+Migration 12 adds a genuine `web_brief` run source and its execution ledger without inventing inbound messages or scheduled jobs. Web runs use the exact production `ToolRegistry` instance. The broker enforces the six-name read allowlist, denies Contacts, binds each execution to its actual account, and checks the same per-account Calendar, Drive and Tasks windows as the existing daily brief. An async execution scope suppresses only that caller's reconnect notices. The shared refresh producer still updates connection health and credentials; ordinary callers can independently plan idempotent recovery after observing the outcome.
+
+The broker owns one encrypted dedicated-CI Codex session. Claim commits exclusive checkout before returning it. A live lease and matching credential generation fence tool execution, attempt recording, checkpointing, and publication. An expired checked-out session requires a fresh login rather than replaying possibly rotated credentials. Completion saves valid final credentials even when the brief fails validation. An exact duplicate completion is idempotent; conflicting or stale completion is rejected.
+
+The private runner pins official Codex 0.165.0. It uses a fresh home, an explicit tool-restricted model catalog, and exactly six host-owned dynamic read tools. Shell, patch, filesystem, browser, app, plugin and agent capabilities are disabled and tested against a synthetic provider. On GitHub Linux, Codex runs as a separate UID whose firewall permits only loopback. A parent-owned TLS proxy forwards only fixed OpenAI destinations after an acknowledged durable trace attempt, including OAuth refresh and bootstrap reads. WebSocket upgrades receive 426 so the native client falls back to audited HTTP. Neither Annie's database/key nor integration credentials leave Railway.
+
+The broker permits work only from 06:00 through 09:59 Pacific. The private workflow requests generation at 06:47, 07:17, 07:42 and 08:12; a published date is not regenerated. Scheduling is best effort, not an 08:00 delivery guarantee. Model output is bounded structured text with same-run source IDs. Infrastructure supplies source metadata, dates and coverage. The reader renders escaped components, reports stale/partial editions, and keeps its backend token server-side. Vercel Authentication must protect **All Deployments**, including production, before enabling the reader.
+
+Offline end-to-end proof, from this repository after `pnpm build`, with the private companion checkout beside it:
+
+```text
+pnpm exec tsx ../annie-brief/scripts/smoke-end-to-end.mjs
+```
+
+This runs the actual native Codex app-server, actual HTTP broker, SQLite, registry and adapters against synthetic model/Google/Notion responses. It forces a native OAuth refresh, rejects an invalid edition while checkpointing the new credentials, starts a fresh native process with the rotated session, publishes, and checks date idempotency. It performs no live provider requests, sends, or mutations. The private repository's `npm test` and `npm run verify:isolation` cover transport boundaries and the pinned capability controls. Actual account eligibility and observed scheduled-morning delivery remain deployment checks, not conclusions from this synthetic proof.
+
 ## Agent boundary and limits
 
 The model receives:

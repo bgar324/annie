@@ -173,6 +173,7 @@ export class GmailToolService {
     return boundedSearchResult({
       account: { label: connection.safeLabel },
       resultSizeEstimate: list.resultSizeEstimate,
+      messagesTruncated: list.hasMore || list.messages.length > listedMessages.length,
       messages: metadataResult.value,
       ...(hydrationResult.value === undefined
         ? {}
@@ -429,6 +430,7 @@ function boundedSearchResult(input: {
   readonly account: { readonly label: string };
   readonly resultSizeEstimate: number | null;
   readonly messages: readonly NormalizedGmailMessage[];
+  readonly messagesTruncated: boolean;
   readonly hydration?: SearchHydration;
 }) {
   const messages: NormalizedGmailMessage[] = [];
@@ -437,7 +439,7 @@ function boundedSearchResult(input: {
       account: input.account,
       resultSizeEstimate: input.resultSizeEstimate,
       messages: [...messages, message],
-      messagesTruncated: false,
+      messagesTruncated: input.messagesTruncated,
       ...(input.hydration === undefined ? {} : { hydration: input.hydration }),
     };
     if (Buffer.byteLength(JSON.stringify(candidate)) > maximumSearchResultBytes) {
@@ -449,7 +451,7 @@ function boundedSearchResult(input: {
     account: input.account,
     resultSizeEstimate: input.resultSizeEstimate,
     messages,
-    messagesTruncated: messages.length < input.messages.length,
+    messagesTruncated: input.messagesTruncated || messages.length < input.messages.length,
     ...(input.hydration === undefined ? {} : { hydration: input.hydration }),
   };
 }
