@@ -157,7 +157,7 @@ export class GoogleApisWorkspaceClientProvider implements GoogleWorkspaceClientP
             showDeleted: false,
             maxResults: input.maxResults,
             maxAttendees: input.maxAttendees,
-            fields: "nextPageToken,items(id,status,summary,description,location,htmlLink,hangoutLink,start,end,attendees(email,displayName,responseStatus,organizer,optional),attendeesOmitted,recurrence,recurringEventId,updated)",
+            fields: "nextPageToken,items(id,iCalUID,status,summary,description,location,htmlLink,hangoutLink,start,end,attendees(email,displayName,responseStatus,organizer,optional),attendeesOmitted,recurrence,recurringEventId,updated)",
             ...(input.query === undefined ? {} : { q: input.query }),
             ...(input.pageToken === undefined ? {} : { pageToken: input.pageToken }),
           },

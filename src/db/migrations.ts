@@ -973,6 +973,19 @@ const MIGRATIONS: readonly Migration[] = [
       ) STRICT;
     `,
   },
+  {
+    version: 13,
+    sql: `
+      ALTER TABLE web_brief_runs ADD COLUMN purpose TEXT NOT NULL DEFAULT 'daily'
+        CHECK (purpose IN ('daily', 'preview'));
+      CREATE TRIGGER web_brief_purpose_immutable
+      BEFORE UPDATE OF purpose ON web_brief_runs
+      WHEN NEW.purpose <> OLD.purpose
+      BEGIN
+        SELECT RAISE(ABORT, 'web_brief_purpose_immutable');
+      END;
+    `,
+  },
 ];
 
 export function runMigrations(

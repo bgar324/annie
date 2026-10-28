@@ -7,11 +7,13 @@ import { ToolRegistry } from "../src/agent/tools.js";
 import { ConnectionStore } from "../src/connections/store.js";
 import { newTraceId } from "../src/core/ids.js";
 import { runMigrations } from "../src/db/migrations.js";
+import { parseCalendarEvents } from "../src/google/normalize.js";
 import { CredentialVault } from "../src/security/vault.js";
 import { createTraceRedactor } from "../src/tracing/redaction.js";
 import { TraceStore } from "../src/tracing/store.js";
 import { loadWebBriefConfig } from "../src/web-brief/config.js";
 import { registerWebBriefRoutes } from "../src/web-brief/routes.js";
+import { projectPreviewCalendar } from "../src/web-brief/preview.js";
 import { codexAuthSchema, webBriefToolNames } from "../src/web-brief/schema.js";
 import { WebBriefService } from "../src/web-brief/service.js";
 import { WebBriefStore } from "../src/web-brief/store.js";
@@ -294,5 +296,258 @@ describe("private web brief lease and publication", () => {
     expect(loadWebBriefConfig({})).toBeNull();
     expect(() => loadWebBriefConfig({ WEB_BRIEF_RUNNER_TOKEN: "r".repeat(40) })).toThrow();
     expect(() => loadWebBriefConfig({ WEB_BRIEF_RUNNER_TOKEN: "r".repeat(40), WEB_BRIEF_READER_TOKEN: "r".repeat(40), WEB_BRIEF_ADMIN_TOKEN: "a".repeat(40) })).toThrow();
+  });
+});
+
+const previewWeather = { location: "UCLA / Westwood", timeZone: "America/Los_Angeles", days: [
+  { date: "2026-10-28", highF: 72, lowF: null, condition: "Sunny" },
+] };
+async function previewClaimed(h: WebBriefHarness, requestId = "preview-one") {
+  vi.spyOn(h.service.input, "loadContext").mockResolvedValue({ memory: "canonical user preferences", weather: previewWeather });
+  await h.service.bootstrap(auth);
+  return claimResult.parse(await h.service.claimPreview(requestId));
+}
+
+describe("non-publishing fixed real-data preview", () => {
+  it("keeps scheduled work outside its window while allowing an explicit preview with the same global lease", async () => {
+    const h = harness();
+    vi.setSystemTime(new Date("2026-10-28T20:00:00Z"));
+    await h.service.bootstrap(auth);
+    expect(await h.service.claim("scheduled-outside")).toEqual({ kind: "not_due", date: "2026-10-28" });
+    expect(h.store.auth()?.state).toBe("ready");
+    const claim = claimResult.parse(await h.service.claimPreview("manual-afternoon"));
+    expect(claim.date).toBe("2026-10-28");
+    expect(await h.service.claimPreview("parallel-preview")).toMatchObject({ kind: "busy" });
+    expect(h.db.prepare("SELECT purpose FROM web_brief_runs").get()).toEqual({ purpose: "preview" });
+    expect(() => h.db.prepare("UPDATE web_brief_runs SET purpose='daily'").run()).toThrow("web_brief_purpose_immutable");
+  });
+
+  it("returns one bounded artifact, retains metadata only, and does not consume the daily edition date", async () => {
+    const h = harness();
+    const claim = await previewClaimed(h);
+    const source = await mail(h, claim.leaseToken);
+    const completion = { ...claim, auth, brief: { todos: [{ title: "Review the requested draft", detail: null, due: null, sourceIds: [source.sourceId ?? "foreign"] }] }, errorCode: null };
+    const response = await h.service.completePreview(completion);
+    expect(response).toMatchObject({ kind: "previewed", errorCode: null, preview: {
+      version: 1, date: "2026-10-28", timeZone: "America/Los_Angeles", weather: previewWeather, calendar: [],
+      todos: [{ title: "Review the requested draft", detail: null, due: null, sourceIds: [source.sourceId] }],
+      coverage: [{ account: "Work", product: "gmail", status: "complete" }],
+    } });
+    expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(262_144);
+    expect(await h.service.completePreview(completion)).toEqual({ kind: "previewed", date: claim.date, errorCode: null });
+    const retained = h.db.prepare<[], { completion_json: string; context_json: string }>("SELECT completion_json,context_json FROM web_brief_runs").get();
+    expect(retained?.completion_json).not.toContain("Review the requested draft");
+    expect(retained?.context_json).toBe("{}");
+    expect(h.service.edition().edition).toBeNull();
+    expect(h.db.prepare("SELECT * FROM web_brief_editions").all()).toEqual([]);
+    const daily = claimResult.parse(await h.service.claim("same-date-daily"));
+    const dailySource = await mail(h, daily.leaseToken);
+    expect(await h.service.complete({ ...daily, auth, brief: brief(daily.date, dailySource.sourceId ?? "foreign"), errorCode: null })).toMatchObject({ kind: "published" });
+    expect(await h.service.claimPreview("preview-after-publication")).toMatchObject({ kind: "claimed" });
+    expect(h.db.prepare<[], { count: number }>("SELECT count(*) count FROM write_intents").get()?.count).toBe(0);
+    expect(h.db.prepare<[], { count: number }>("SELECT count(*) count FROM egress_messages").get()?.count).toBe(0);
+  });
+
+  it.each(["daily_to_preview", "preview_to_daily"])("refuses %s before checkpointing or consuming the lease", async (direction) => {
+    const h = harness();
+    const claim = direction === "daily_to_preview" ? await claimed(h) : await previewClaimed(h);
+    const input = { ...claim, auth: { ...auth, tokens: { ...auth.tokens, refresh_token: "must-not-be-saved" } }, brief: { todos: [] }, errorCode: null };
+    await expect(direction === "daily_to_preview" ? h.service.completePreview(input) : h.service.complete(input)).rejects.toMatchObject({ code: "purpose_mismatch" });
+    expect(h.store.auth()?.generation).toBe(1);
+    expect(h.store.auth()?.state).toBe("in_use");
+    expect(h.db.prepare("SELECT state,completion_digest FROM web_brief_runs").get()).toEqual({ state: "running", completion_digest: null });
+    expect(h.released).toEqual([]);
+  });
+
+  it.each([
+    { brief: { todos: [], weather: { highF: 99 } }, code: "invalid_preview" },
+    { brief: { todos: [{ title: "Unproven", detail: null, due: null, sourceIds: ["foreign"] }] }, code: "invalid_citation" },
+    { brief: { todos: [{ title: "Bad date", detail: null, due: "2026-02-30", sourceIds: ["foreign"] }] }, code: "invalid_preview" },
+    { brief: { todos: [] }, code: "source_coverage_missing" },
+  ])("checkpoints valid rotated auth on invalid preview output ($code)", async ({ brief: draft, code }) => {
+    const h = harness();
+    const claim = await previewClaimed(h);
+    const renewed = { ...auth, tokens: { ...auth.tokens, refresh_token: "preview-rotated-synthetic" } };
+    expect(await h.service.completePreview({ ...claim, auth: renewed, brief: draft, errorCode: null })).toMatchObject({ kind: "failed", errorCode: code });
+    const saved = h.store.auth();
+    expect(saved?.generation).toBe(2);
+    expect(saved === undefined ? null : h.store.openAuth(saved).tokens.refresh_token).toBe("preview-rotated-synthetic");
+    expect(h.service.edition().edition).toBeNull();
+  });
+
+  it("seals the provider weather snapshot and ignores model-generated weather/calendar", async () => {
+    const h = harness();
+    const claim = await previewClaimed(h);
+    const retained = h.db.prepare<[], { context_json: string }>("SELECT context_json FROM web_brief_runs").get()?.context_json ?? "";
+    expect(retained).not.toContain("UCLA");
+    expect(retained).not.toContain("Sunny");
+    await mail(h, claim.leaseToken);
+    expect(await h.service.completePreview({ ...claim, auth, brief: { todos: [], calendar: [] }, errorCode: null })).toMatchObject({ kind: "failed", errorCode: "invalid_preview" });
+    expect(h.store.auth()?.state).toBe("ready");
+  });
+
+  it("projects only persisted exact-window normalized calendar reads and exposes unavailable coverage", async () => {
+    const event = { eventId: "real-one", iCalUID: "underlying-one", calendar: { label: "Main", primary: true },
+      summary: "Recorded meeting", location: "Room 1", start: { kind: "dateTime", value: "2026-10-28T16:00:00-07:00", timeZone: "America/Los_Angeles" },
+      end: { kind: "dateTime", value: "2026-10-28T17:00:00-07:00", timeZone: "America/Los_Angeles" }, updatedAt: null };
+    const h = harness("all", { results: [
+      { product: "calendar", ok: true, events: [event], truncated: false },
+      { product: "drive", ok: false, error: { code: "unavailable" } },
+      { product: "tasks", ok: true, tasks: [], truncated: false },
+    ] });
+    const claim = await previewClaimed(h);
+    await mail(h, claim.leaseToken);
+    const args = { account: "Work", queries: [
+      { product: "calendar", timeMin: claim.context.window.calendarStart, timeMax: claim.context.window.calendarEnd, maxResults: 20 },
+      { product: "drive", modifiedAfter: claim.context.window.modifiedAfter, maxResults: 20 },
+      { product: "tasks", dueBefore: claim.context.window.calendarEnd, includeCompleted: false, maxResults: 20 },
+    ] };
+    await h.service.tool({ leaseToken: claim.leaseToken, callId: "exact-google", name: "google.search", arguments: args });
+    expect(await h.service.completePreview({ ...claim, auth, brief: { todos: [] }, errorCode: null })).toMatchObject({ kind: "previewed", preview: {
+      weather: previewWeather, calendar: [{ title: event.summary, start: event.start.value, end: event.end.value, allDay: false, location: event.location }],
+      coverage: expect.arrayContaining([{ account: "Work", product: "drive", status: "unavailable" }]),
+    } });
+  });
+
+  it("keeps failed source reads visible as unavailable rather than requiring invented todos", async () => {
+    const h = harness();
+    const claim = await previewClaimed(h);
+    vi.spyOn(h.service.input.tools, "execute").mockRejectedValue(new Error("private provider details"));
+    await mail(h, claim.leaseToken);
+    expect(await h.service.completePreview({ ...claim, auth, brief: { todos: [] }, errorCode: null })).toMatchObject({ kind: "previewed", preview: {
+      todos: [], coverage: [{ account: "Work", product: "gmail", status: "unavailable" }],
+    } });
+  });
+
+  it("fences preview routes with the runner token, not the reader token", async () => {
+    const h = harness();
+    const config = { runnerToken: "r".repeat(40), readerToken: "v".repeat(40), adminToken: "a".repeat(40) };
+    const app = Fastify({ logger: false });
+    registerWebBriefRoutes(app, { service: h.service, config });
+    await h.service.bootstrap(auth);
+    vi.setSystemTime(new Date("2026-10-28T20:00:00Z"));
+    try {
+      expect((await app.inject({ method: "POST", url: "/internal/brief/preview/claim", headers: { authorization: `Bearer ${config.readerToken}` }, payload: { requestId: "reader" } })).statusCode).toBe(401);
+      const response = await app.inject({ method: "POST", url: "/internal/brief/preview/claim", headers: { authorization: `Bearer ${config.runnerToken}` }, payload: { requestId: "operator" } });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({ kind: "claimed", outputSchema: { required: ["todos"] } });
+      expect(response.headers["cache-control"]).toContain("no-store");
+    } finally { await app.close(); }
+  });
+
+  it("requires every Gmail account independently even when Notion has no tasks", async () => {
+    const h = harness();
+    h.service.input.connections.saveAuthorization({ traceId: newTraceId(), provider: "google", providerAccountId: "personal-private",
+      safeLabel: "Personal", safeMetadata: {}, providerState: {}, capabilities: ["gmail.read"], credentials: { refreshToken: "synthetic" } });
+    h.service.input.connections.saveAuthorization({ traceId: newTraceId(), provider: "notion", providerAccountId: "notes-private",
+      safeLabel: "Notes", safeMetadata: {}, providerState: {}, capabilities: ["notion.search", "notion.fetch"], credentials: { accessToken: "synthetic" } });
+    const claim = await previewClaimed(h);
+    vi.spyOn(h.service.input.tools, "execute").mockImplementation(async ({ name }) => name === "notion.search"
+      ? { workspace: { label: "Notes" }, result: { results: [], pages: [], truncated: false } }
+      : { messages: [], messagesTruncated: false });
+    await mail(h, claim.leaseToken);
+    await h.service.tool({ leaseToken: claim.leaseToken, callId: "notes-empty", name: "notion.search", arguments: { workspace: "Notes", query: "tasks", pageSize: 10, hydrate: 3, view: "full" } });
+    expect(await h.service.completePreview({ ...claim, auth, brief: { todos: [] }, errorCode: null })).toMatchObject({ kind: "failed", errorCode: "source_coverage_missing" });
+    const second = claimResult.parse(await h.service.claimPreview("all-inboxes"));
+    await mail(h, second.leaseToken);
+    await h.service.tool({ leaseToken: second.leaseToken, callId: "personal-mail", name: "gmail.search", arguments: { account: "Personal", query: "newer_than:1d is:unread", maxResults: 20 } });
+    await h.service.tool({ leaseToken: second.leaseToken, callId: "notes-empty", name: "notion.search", arguments: { workspace: "Notes", query: "tasks", pageSize: 10, hydrate: 3, view: "full" } });
+    expect(await h.service.completePreview({ ...second, auth, brief: { todos: [] }, errorCode: null })).toMatchObject({ kind: "previewed", preview: {
+      todos: [], coverage: expect.arrayContaining([
+        { account: "Work", product: "gmail", status: "complete" },
+        { account: "Personal", product: "gmail", status: "complete" },
+        { account: "Notes", product: "notion", status: "complete" },
+      ]),
+    } });
+  });
+
+  it("rejects non-window calendar reads as coverage while still checkpointing preview auth", async () => {
+    const h = harness("all", { results: [{ product: "calendar", ok: true, events: [] }, { product: "drive", ok: true }, { product: "tasks", ok: true }] });
+    const claim = await previewClaimed(h);
+    await mail(h, claim.leaseToken);
+    await h.service.tool({ leaseToken: claim.leaseToken, callId: "wrong-window", name: "google.search", arguments: { account: "Work", queries: [
+      { product: "calendar", timeMin: "2026-10-27T15:00:00Z", timeMax: claim.context.window.calendarEnd, maxResults: 20 },
+      { product: "drive", modifiedAfter: claim.context.window.modifiedAfter, maxResults: 20 },
+      { product: "tasks", dueBefore: claim.context.window.calendarEnd, includeCompleted: false, maxResults: 20 },
+    ] } });
+    expect(await h.service.completePreview({ ...claim, auth, brief: { todos: [] }, errorCode: null })).toMatchObject({ kind: "failed", errorCode: "source_coverage_missing" });
+    expect(h.store.auth()?.generation).toBe(2);
+  });
+});
+
+describe("deterministic preview calendar projection", () => {
+  const base = { eventId: "event-one", iCalUID: "uid-one", calendar: { label: "Main", primary: true },
+    summary: "Same title", location: null, updatedAt: null,
+    start: { kind: "dateTime", value: "2026-10-28T09:00:00-07:00", timeZone: "America/Los_Angeles" },
+    end: { kind: "dateTime", value: "2026-10-28T10:00:00-07:00", timeZone: "America/Los_Angeles" } };
+
+  it("honors all-day exclusive dates, offsets, missing times and same-item identity without title collapse", () => {
+    const projected = projectPreviewCalendar({ date: "2026-10-28", results: [
+      { account: "Work", value: { ok: true, events: [
+        base,
+        { ...base, eventId: "distinct", iCalUID: "uid-two" },
+        { ...base, eventId: "all-day", iCalUID: null, start: { kind: "date", value: "2026-10-28" }, end: { kind: "date", value: "2026-10-29" } },
+        { ...base, eventId: "ended", iCalUID: null, start: { kind: "date", value: "2026-10-27" }, end: { kind: "date", value: "2026-10-28" } },
+        { ...base, eventId: "tomorrow", iCalUID: null, start: { kind: "dateTime", value: "2026-10-29T01:00:00-07:00" } },
+        { ...base, eventId: "missing-time", iCalUID: null, start: null, end: null },
+        { ...base, eventId: "cancelled", iCalUID: null, status: "cancelled" },
+      ] } },
+      { account: "Personal", value: { ok: true, events: [{ ...base, eventId: "copy", start: { kind: "dateTime", value: "2026-10-28T16:00:00Z" } }] } },
+    ] });
+    expect(projected.calendar).toHaveLength(4);
+    expect(new Set(projected.calendar.map((event) => event.id)).size).toBe(4);
+    expect(projected.calendar[0]).toMatchObject({ allDay: true, start: "2026-10-28", end: "2026-10-29" });
+    expect(projected.calendar.filter((event) => !event.allDay && event.start !== null)).toHaveLength(2);
+    expect(projected.calendar.at(-1)).toMatchObject({ start: null, end: null, allDay: false });
+    expect(projected.truncatedAccounts).toEqual(new Set(["Work"]));
+    expect(JSON.stringify(projected.calendar)).not.toMatch(/Work|Personal|uid-one|Main/u);
+  });
+
+  it("marks missing or malformed calendar data incomplete rather than silently complete-empty", () => {
+    const result = projectPreviewCalendar({ date: "2026-10-28", results: [
+      { account: "Unavailable", value: { ok: false } },
+      { account: "Missing", value: { ok: true } },
+      { account: "Malformed", value: { ok: true, events: [{ ...base, start: { kind: "dateTime", value: "not-a-time" } }] } },
+    ] });
+    expect(result.calendar).toEqual([]);
+    expect(result.truncatedAccounts).toEqual(new Set(["Unavailable", "Missing", "Malformed"]));
+  });
+
+  it("keeps recurring instances distinct and requires an occurrence start before cross-account UID merging", () => {
+    const result = projectPreviewCalendar({ date: "2026-10-28", results: [
+      { account: "Work", value: { ok: true, events: [
+        base,
+        { ...base, eventId: "second-instance", start: { kind: "dateTime", value: "2026-10-28T13:00:00-07:00" }, end: { kind: "dateTime", value: "2026-10-28T14:00:00-07:00" } },
+        { ...base, eventId: "unknown-first", start: null, end: null },
+      ] } },
+      { account: "Personal", value: { ok: true, events: [{ ...base, eventId: "unknown-second", start: null, end: null }] } },
+    ] });
+    expect(result.calendar).toHaveLength(4);
+    expect(result.calendar.filter((event) => event.start === null)).toHaveLength(2);
+  });
+});
+
+describe("preview migration and normalized calendar identity", () => {
+  it("backfills existing v12 runs as daily and prevents purpose changes", () => {
+    const db = new Database(":memory:");
+    try {
+      runMigrations(db, 12);
+      db.exec(`INSERT INTO web_brief_runs(id,local_date,request_id,trace_id,state,lease_token_hash,
+        lease_expires_at_ms,deadline_at_ms,credential_generation,context_json,created_at_ms,updated_at_ms)
+        VALUES('legacy','2026-10-28','legacy-request','legacy-trace','failed','legacy-hash',1,1,1,'{}',1,1)`);
+      runMigrations(db);
+      expect(db.prepare("SELECT purpose FROM web_brief_runs WHERE id='legacy'").get()).toEqual({ purpose: "daily" });
+      expect(() => db.prepare("UPDATE web_brief_runs SET purpose='preview' WHERE id='legacy'").run()).toThrow("web_brief_purpose_immutable");
+      expect(() => db.prepare("UPDATE web_brief_runs SET purpose='unknown' WHERE id='legacy'").run()).toThrow();
+    } finally { db.close(); }
+  });
+
+  it("projects Google iCalUID as application identity while keeping account identifiers out of events", () => {
+    const result = parseCalendarEvents({ items: [{ id: "google-resource", iCalUID: "shared-occurrence@example.test",
+      summary: "Recorded event", start: { date: "2026-10-28" }, end: { date: "2026-10-29" } }] },
+    { id: "private-calendar@example.test", label: "Main", primary: true, description: null, accessRole: "owner", timeZone: "America/Los_Angeles" });
+    expect(result.events[0]).toMatchObject({ eventId: "google-resource", iCalUID: "shared-occurrence@example.test",
+      calendar: { label: "Main", primary: true }, start: { kind: "date", value: "2026-10-28" } });
+    expect(JSON.stringify(result)).not.toContain("private-calendar");
   });
 });

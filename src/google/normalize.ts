@@ -38,6 +38,7 @@ const attendeeSchema = z
 const eventSchema = z
   .object({
     id: z.string().min(1),
+    iCalUID: z.string().min(1).nullish(),
     status: z.string().nullish(),
     summary: z.string().nullish(),
     description: z.string().nullish(),
@@ -183,6 +184,7 @@ export interface CalendarResource {
 
 export interface NormalizedCalendarEvent {
   eventId: string;
+  iCalUID: string | null;
   calendar: { label: string; primary: boolean };
   status: string | null;
   summary: string;
@@ -280,6 +282,7 @@ export function parseCalendarEvents(
       const attendees = (event.attendees ?? []).slice(0, 20);
       return {
         eventId: event.id,
+        iCalUID: event.iCalUID ?? null,
         calendar: { label: calendar.label, primary: calendar.primary },
         status: event.status ?? null,
         summary: truncateUtf8(event.summary ?? "(No title)", 512).value,

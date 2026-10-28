@@ -7,6 +7,7 @@ import { codexAuthSchema, type CodexAuth } from "./schema.js";
 export interface WebRunRow {
   id: string;
   local_date: string;
+  purpose: "daily" | "preview";
   request_id: string;
   trace_id: TraceId;
   state: "running" | "completed" | "failed" | "expired";

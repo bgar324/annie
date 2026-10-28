@@ -28,10 +28,12 @@ export function registerWebBriefRoutes(app: FastifyInstance, input: { service: W
       return input.service.bootstrap(body.auth);
     });
     scope.post("/internal/brief/claim", options, async (request) => input.service.claim(parse(claimSchema, request.body).requestId));
+    scope.post("/internal/brief/preview/claim", options, async (request) => input.service.claimPreview(parse(claimSchema, request.body).requestId));
     scope.post("/internal/brief/heartbeat", options, async (request) => input.service.heartbeat(parse(leaseSchema, request.body).leaseToken));
     scope.post("/internal/brief/attempt", options, async (request) => input.service.attempt(parse(attemptSchema, request.body)));
     scope.post("/internal/brief/tool", options, async (request) => input.service.tool(parse(toolSchema, request.body)));
     scope.post("/internal/brief/complete", options, async (request) => input.service.complete(parse(completionSchema, request.body)));
+    scope.post("/internal/brief/preview/complete", options, async (request) => input.service.completePreview(parse(completionSchema, request.body)));
     scope.get("/internal/brief/status", { logLevel: "silent" }, async () => input.service.status());
     scope.get("/internal/brief/edition", { logLevel: "silent" }, async () => input.service.edition());
   });
