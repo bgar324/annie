@@ -39,6 +39,7 @@ describe("assistant prompt", () => {
       memory,
       audience: {
         kind: "inbound",
+        taskProvider: "notion",
         connections: [
           {
             provider: "google",

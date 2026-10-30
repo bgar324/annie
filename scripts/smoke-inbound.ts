@@ -1,5 +1,5 @@
 // The inbound request matrix: real DeepSeek decisions against synthetic Google, Notion,
-// and Sendblue. Measures pass rate, pass-through rate, and latency together, so a prompt
+// website tasks, and Sendblue. Measures pass rate, pass-through rate, and latency together, so a prompt
 // or runtime change is judged on both at once.
 //
 //   pnpm smoke:inbound                          every case once
@@ -19,7 +19,7 @@ import { newTraceId } from "../src/core/ids.js";
 import type { InboundMessage, MessageGateway } from "../src/messages/types.js";
 import { createRuntime, type AssistantRuntime } from "../src/runtime.js";
 import { cases, type Category, type Observation, type SmokeCase } from "./smoke/cases.js";
-import { line, seedDeliveredExchange, seedFailedHistory, syntheticGoogle, syntheticNotion, user } from "./smoke/synthetic.js";
+import { line, seedDeliveredExchange, seedFailedHistory, syntheticGoogle, syntheticNotion, syntheticTodo, user } from "./smoke/synthetic.js";
 
 const args = process.argv.slice(2).filter((arg) => arg !== "--");
 if (args.includes("--list")) {
@@ -47,7 +47,7 @@ const deepseek = Object.fromEntries([
   const value = process.env[key] ?? local[key];
   return value === undefined ? [] : [[key, value]];
 }));
-assert(deepseek.DEEPSEEK_API_KEY, "DEEPSEEK_API_KEY is required");
+const deepseekApiKey = z.string().min(1, "DEEPSEEK_API_KEY is required").parse(deepseek.DEEPSEEK_API_KEY);
 const allowedOrigin = new URL(deepseek.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com").origin;
 const networkFetch = globalThis.fetch;
 
@@ -123,6 +123,7 @@ interface CaseResult {
 
 async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseResult> {
   const directory = mkdtempSync(join(tmpdir(), "annie-smoke-"));
+  const todoToken = randomBytes(32).toString("hex");
   const config = loadRuntimeConfig({
     NODE_ENV: "test", DATA_DIR: directory,
     PUBLIC_BASE_URL: "https://annie.invalid", SENDBLUE_BASE_URL: "https://sendblue.invalid",
@@ -132,10 +133,12 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
     GOOGLE_CLIENT_ID: "synthetic", GOOGLE_CLIENT_SECRET: "synthetic-secret",
     CREDENTIAL_ENCRYPTION_KEY: randomBytes(32).toString("base64"),
     DAILY_BRIEF_ENABLED: "false", ...deepseek,
+    ...(smokeCase.todoEnabled === true ? { TODO_API_URL: "https://todo.invalid", TODO_AGENT_TOKEN: todoToken } : {}),
   });
   writeFileSync(config.memoryPath, `# Memory\n\n- My todo list is Daily tasks in Personal.\n- Use UTC for dates.\n${smokeCase.memory ?? ""}`);
   const notion = syntheticNotion(smokeCase.notion);
   const google = syntheticGoogle(smokeCase.google);
+  const todo = syntheticTodo(todoToken);
   const inbox: InboundMessage[] = [];
   const sent: string[] = [];
   const sentAt: number[] = [];
@@ -155,6 +158,7 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
   const overrides = {
     messageGateway: gateway, notionClients: notion.clients, logger: false as const,
     gmailClients: google.gmailClients, googleWorkspaceClients: google.googleWorkspaceClients,
+    todoFetch: todo.fetch,
     weatherFetch: async (input: string | URL | Request) => {
       const url = new URL(new Request(input).url);
       assert(["api.weather.gov", "api.open-meteo.com", "geocoding-api.open-meteo.com"].includes(url.hostname));
@@ -244,7 +248,7 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
       replies: db.prepare<[], { purpose: string; state: string }>(
         "SELECT purpose, state FROM egress_messages WHERE id <> 'eg_offer' ORDER BY created_at_ms",
       ).all(),
-      sent, notion, google, config, runtime,
+      sent, notion, google, todo, config, runtime,
       tools: db.prepare<[], { tool_name: string; status: string }>(
         "SELECT tool_name, status FROM tool_executions ORDER BY rowid",
       ).all(),
@@ -286,6 +290,12 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
         assert(call.messages.some((message) => message.role === "system" && (message.content ?? "").includes(past)),
           "Prior requests stay quoted as closed system data");
       }
+    }
+    for (const secret of [todoToken, deepseekApiKey]) {
+      assert(!JSON.stringify(modelCalls).includes(secret), "Server credentials must never enter model messages or tools");
+      assert(!JSON.stringify(result).includes(secret), "Server credentials must never enter smoke output");
+      const traces = db.prepare("SELECT * FROM trace_event_spool").all();
+      assert(!JSON.stringify(traces).includes(secret), "Server credentials must never enter stored trace events");
     }
     assert.equal(blockedRequests, 0, "A provider tried to escape the synthetic boundary");
     smokeCase.expect(observation);

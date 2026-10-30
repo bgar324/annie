@@ -7,12 +7,12 @@ import { readFileSync } from "node:fs";
 import { readDailyBriefWeatherCity } from "../../src/memory/weather.js";
 import type { RuntimeConfig } from "../../src/config.js";
 import type { AssistantRuntime } from "../../src/runtime.js";
-import type { GoogleOptions, GoogleWorld, NotionOptions, NotionWorld, SeededExchange } from "./synthetic.js";
-import { archivePage } from "./synthetic.js";
+import type { GoogleOptions, GoogleWorld, NotionOptions, NotionWorld, SeededExchange, TodoWorld } from "./synthetic.js";
+import { archivePage, isoDate } from "./synthetic.js";
 
 export type Category =
   | "notion_write" | "notion_read" | "google_read" | "follow_up" | "conversation"
-  | "decline" | "connect" | "burst" | "weather";
+  | "decline" | "connect" | "burst" | "weather" | "todo";
 
 export interface Observation {
   texts: readonly string[];
@@ -23,6 +23,7 @@ export interface Observation {
   writes: readonly { state: string }[];
   notion: NotionWorld;
   google: GoogleWorld;
+  todo: TodoWorld;
   config: RuntimeConfig;
   runtime: AssistantRuntime;
 }
@@ -36,6 +37,7 @@ export interface SmokeCase {
   notion?: NotionOptions;
   google?: GoogleOptions;
   weatherAvailable?: boolean;
+  todoEnabled?: boolean;
   memory?: string;
   /** Expected egress purpose of the last turn; a failure notice is a pass only when declared. */
   purpose?: "reply" | "failure" | "recovery";
@@ -110,6 +112,65 @@ function checkedOff(o: Observation, from: string, to: string): void {
 }
 
 export const cases: readonly SmokeCase[] = [
+  {
+    name: "todo_default_list", category: "todo", todoEnabled: true,
+    texts: ["What are my tasks?"],
+    expect(o) {
+      noProviderWrite(o); answeredInText(o);
+      assert(toolNames(o).includes("todo.list"), "Ordinary tasks must read the website despite the legacy Notion memory");
+      assert(toolNames(o).every((name) => name.startsWith("todo.")), "Do not mix in another task provider");
+      assert.match(lastReply(o), /buy tea/iu);
+      assert.equal(o.todo.tasks.length, 1);
+    },
+  },
+  {
+    name: "todo_default_create", category: "todo", todoEnabled: true,
+    texts: ["Add buy coffee to my todo list for tomorrow."],
+    expect(o) {
+      answeredInText(o);
+      assert(toolNames(o).includes("todo.create"), "Ordinary task creation must use the website");
+      assert(toolNames(o).every((name) => name.startsWith("todo.")), "Do not write to another task provider");
+      assert.equal(o.notion.mutations(), 0);
+      assert.deepEqual(o.writes, [{ state: "succeeded" }]);
+      assert.equal(o.todo.calls.filter((method) => method === "POST").length, 1);
+      assert.equal(o.todo.tasks.length, 2);
+      assert.match(o.todo.tasks[1]?.title ?? "", /buy coffee/iu);
+      assert.equal(o.todo.tasks[1]?.dueDate, isoDate(1));
+    },
+  },
+  {
+    name: "todo_explicit_notion_list", category: "todo", todoEnabled: true,
+    texts: ["What's on today's Notion Daily tasks list in Personal?"],
+    expect(o) {
+      noProviderWrite(o); answeredInText(o);
+      assert(toolNames(o).includes("notion.search"));
+      assert.deepEqual(o.todo.calls, [], "An explicit Notion request must not touch the website");
+      assert.match(lastReply(o), /clean restroom/iu);
+    },
+  },
+  {
+    name: "todo_explicit_notion_create", category: "todo", todoEnabled: true,
+    texts: ["Add buy coffee to my Notion Daily tasks list in Personal."],
+    expect(o) {
+      answeredInText(o);
+      assert(toolNames(o).includes("notion.update_page"));
+      assert.equal(o.notion.mutations(), 1);
+      assert.deepEqual(o.writes, [{ state: "succeeded" }]);
+      assert.match(o.notion.pages.get("daily") ?? "", /buy coffee/iu);
+      assert.deepEqual(o.todo.calls, [], "An explicit Notion write must not touch the website");
+    },
+  },
+  {
+    name: "todo_explicit_google_list", category: "todo", todoEnabled: true,
+    texts: ["List my open Google Tasks."],
+    expect(o) {
+      noProviderWrite(o); answeredInText(o);
+      assert(toolNames(o).includes("google.search"));
+      assert(o.google.calls.some((call) => call.startsWith("tasks.items:")));
+      assert.deepEqual(o.todo.calls, [], "An explicit Google Tasks request must not touch the website");
+      assert.match(lastReply(o), /dentist/iu);
+    },
+  },
   {
     name: "ucla_weather", category: "weather",
     texts: ["What's today's weather? Give me the high and low in Fahrenheit."],

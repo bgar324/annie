@@ -7,6 +7,7 @@ import type { GmailApi, GmailClientProvider } from "../../src/gmail/client.js";
 import type { GoogleWorkspaceApi, GoogleWorkspaceClientProvider } from "../../src/google/client.js";
 import type { NotionClientProvider } from "../../src/notion/client.js";
 import type { AssistantRuntime } from "../../src/runtime.js";
+import type { ProviderFetch } from "../../src/providers/fetch.js";
 
 export const line = "+15550000001";
 export const user = "+15550000002";
@@ -110,6 +111,69 @@ export function syntheticNotion(options: NotionOptions = {}): NotionWorld {
     },
   };
   return { clients, pages, original, yesterday, today, createdTitles, mutations: () => mutations };
+}
+
+// Website tasks stay in memory. No network request reaches a todo server.
+interface SyntheticTodo {
+  id: string;
+  title: string;
+  notes: string;
+  dueDate: string | null;
+  priority: "low" | "medium" | "high";
+  completedAt: string | null;
+  position: number;
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TodoWorld {
+  fetch: ProviderFetch;
+  tasks: SyntheticTodo[];
+  calls: string[];
+}
+
+export function syntheticTodo(token: string): TodoWorld {
+  const now = new Date().toISOString();
+  const tasks: SyntheticTodo[] = [{
+    id: "09ce4aaa-5e5b-4569-a9e0-dcf7f70ef5d2", title: "Buy tea", notes: "",
+    dueDate: isoDate(0), priority: "medium", completedAt: null, position: 0,
+    revision: 1, createdAt: now, updatedAt: now,
+  }];
+  const calls: string[] = [];
+  const create = z.object({
+    title: z.string().min(1), notes: z.string().optional(),
+    dueDate: z.iso.date().nullable().optional(), priority: z.enum(["low", "medium", "high"]).optional(),
+  }).strict();
+  return {
+    tasks, calls,
+    async fetch(input, init) {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      assert.equal(url.origin, "https://todo.invalid");
+      assert.equal(url.pathname, "/api/todos");
+      assert(request.headers.get("authorization") === `Bearer ${token}`, "Synthetic todo authentication required");
+      assert.equal(request.redirect, "error");
+      calls.push(request.method);
+      if (request.method === "GET") {
+        const dueDate = url.searchParams.get("dueDate");
+        const status = url.searchParams.get("status") ?? "all";
+        return Response.json({ todos: tasks.filter((task) =>
+          (dueDate === null || task.dueDate === dueDate) &&
+          (status === "all" || (status === "open" ? task.completedAt === null : task.completedAt !== null))) });
+      }
+      assert.equal(request.method, "POST", "Only list/create are allowed by this synthetic website");
+      assert(request.headers.has("idempotency-key"), "Website writes require a durable idempotency key");
+      const args = create.parse(await request.json());
+      const task: SyntheticTodo = {
+        id: "cfc85dde-ae18-44e3-8e8d-6c3703890b64", title: args.title, notes: args.notes ?? "",
+        dueDate: args.dueDate ?? null, priority: args.priority ?? "medium", completedAt: null,
+        position: tasks.length, revision: 1, createdAt: now, updatedAt: now,
+      };
+      tasks.push(task);
+      return Response.json({ todo: task }, { status: 201 });
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------------------

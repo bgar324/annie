@@ -376,6 +376,7 @@ export class InboundTurnService {
       memory,
       audience: {
         kind: "inbound",
+        taskProvider: this.#config.todo === undefined ? "notion" : "todo",
         connections: this.#connections.list().map(toSafeConnectionView),
       },
     });
