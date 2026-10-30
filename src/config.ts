@@ -1,6 +1,7 @@
 import { loadEnvFile } from "node:process";
 import { isAbsolute, relative, resolve } from "node:path";
 import { z } from "zod";
+import { loadTodoConfig, type TodoConfig } from "./todo/config.js";
 
 const nodeEnvSchema = z.enum(["development", "test", "production"]);
 const nonEmpty = z.string().trim().min(1);
@@ -136,6 +137,7 @@ export interface RuntimeConfig extends StorageConfig {
     enabled: boolean;
     timeZone: typeof dailyBriefTimeZone;
   };
+  todo?: TodoConfig;
   limits: {
     maxAgentToolRounds: number;
     maxAgentRunMs: number;
@@ -215,6 +217,7 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
       }
     }
   }
+  const todo = loadTodoConfig(env, parsed.NODE_ENV);
 
 
   return {
@@ -255,6 +258,7 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
       enabled: parsed.DAILY_BRIEF_ENABLED,
       timeZone: dailyBriefTimeZone,
     },
+    ...(todo === undefined ? {} : { todo }),
     limits: {
       maxAgentToolRounds: parsed.MAX_AGENT_TOOL_ROUNDS,
       maxAgentRunMs: parsed.MAX_AGENT_RUN_MS,
@@ -275,6 +279,7 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
       parsed.CREDENTIAL_ENCRYPTION_KEY,
       ...(parsed.SENDBLUE_WEBHOOK_SECRET === undefined ? [] : [parsed.SENDBLUE_WEBHOOK_SECRET]),
       ...(parsed.WAKE_SECRET === undefined ? [] : [parsed.WAKE_SECRET]),
+      ...(todo === undefined ? [] : [todo.agentToken]),
     ],
   };
 }

@@ -14,6 +14,7 @@ export type WriteKind =
   | "gmail_send_draft"
   | "notion_create_page"
   | "notion_update_page"
+  | "todo_mutation"
   | "sendblue_send_message";
 
 export type WriteState =

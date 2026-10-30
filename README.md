@@ -16,8 +16,9 @@ This is deliberately not a general-purpose bot framework. It is built around one
 - Maintain one bounded `MEMORY.md` document for durable user preferences.
 - Render every run as a redacted, replayable trace.
 - Open an SSH-tunneled loopback UI for account health, Google connection, and direct `MEMORY.md` editing.
+- Optionally list and edit the same tasks as a separate simple-to-do website through six narrow inbound tools.
 
-Gmail is read-only. Annie cannot delete, archive, move, or invoke arbitrary provider methods.
+Gmail and Google Workspace are read-only. The optional simple-to-do adapter can delete an identified task only with explicit user authorization. Annie cannot archive, move, or invoke arbitrary provider methods.
 
 ## Safety model
 
@@ -82,6 +83,15 @@ openssl rand -base64 32
 ```
 
 Put the generated value in `CREDENTIAL_ENCRYPTION_KEY`, then fill the remaining required values in `.env`. Never commit that file.
+
+### Optional simple-to-do website
+
+Set `TODO_API_URL` to the website's origin and `TODO_AGENT_TOKEN` to its server-side agent token, at least 32 characters. Omit both to leave all six `todo.*` tools disabled. Partial configuration fails startup. Production requires a public HTTPS hostname without credentials, path, query, or fragment; local development also permits loopback HTTP.
+
+Inbound conversations can list, create, update, complete or reopen, delete, and reorder tasks. Existing-task changes require exact UUIDs and revisions from a current list. Delete and bulk reorder require explicit user authorization and `confirmed: true`. A stale revision returns a conflict instead of overwriting website edits. After any dispatched write fails, no more todo writes may run in that request.
+
+The token stays server-side and is redacted from traces. Every mutation records a durable intent before dispatch, sends that intent ID as `Idempotency-Key`, and makes one request without automatic retry. Unknown acceptance blocks the agent turn; replay cannot perform writes. Account-provider tools and both daily brief read allowlists are unchanged.
+
 
 Start the development process:
 

@@ -59,6 +59,7 @@ import { createTraceRedactor } from "./tracing/redaction.js";
 import { TraceStore } from "./tracing/store.js";
 import { TraceRetentionService, emergencyTrimTraceFiles } from "./tracing/retention.js";
 import { WriteStore } from "./writes/store.js";
+import { TodoToolService, todoToolNames } from "./todo/tools.js";
 import { loadWebBriefConfig } from "./web-brief/config.js";
 import { registerWebBriefRoutes } from "./web-brief/routes.js";
 import { WebBriefService } from "./web-brief/service.js";
@@ -77,6 +78,7 @@ export interface RuntimeOverrides {
   googleWorkspaceClients?: GoogleWorkspaceClientProvider;
   notionClients?: NotionClientProvider;
   weatherFetch?: ProviderFetch;
+  todoFetch?: ProviderFetch;
   logger?: false;
 }
 
@@ -199,6 +201,10 @@ export async function createRuntime(
     const providerTools = [...gmail.tools(), ...workspace.tools(), ...notion.tools()];
     const tools = new ToolRegistry(providerTools);
     assertProductionTools(tools);
+    const todoTools = config.todo === undefined ? [] : new TodoToolService({
+      db: database.db, config: config.todo, traces, writes, timeoutMs: config.limits.providerRequestTimeoutMs,
+      ...(overrides.todoFetch === undefined ? {} : { fetchImpl: overrides.todoFetch }),
+    }).tools();
     const agentTools = new ToolRegistry([
       ...providerTools,
       ...connectionTools(connections),
@@ -206,8 +212,9 @@ export async function createRuntime(
         traces,
         ...(overrides.weatherFetch === undefined ? {} : { fetchImpl: overrides.weatherFetch }),
       }),
+      ...todoTools,
     ]);
-    assertAgentTools(agentTools, tools);
+    assertAgentTools(agentTools, tools, todoTools.length > 0);
     const model = overrides.model ?? new DeepSeekChatModel({ config, traces });
     const agentLimits = {
       maxToolRounds: config.limits.maxAgentToolRounds,
@@ -560,12 +567,13 @@ function assertProductionTools(tools: ToolRegistry): void {
   }
 }
 
-function assertAgentTools(agentTools: ToolRegistry, providerTools: ToolRegistry): void {
+function assertAgentTools(agentTools: ToolRegistry, providerTools: ToolRegistry, todoEnabled: boolean): void {
   const expected = [
     ...providerTools.definitions().map((tool) => tool.name),
     "connections.list",
     "connections.connect",
     "weather.get",
+    ...(todoEnabled ? todoToolNames : []),
   ];
   const actual = agentTools.definitions().map((tool) => tool.name);
   if (actual.length !== expected.length || actual.some((name, index) => name !== expected[index])) {

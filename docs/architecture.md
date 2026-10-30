@@ -4,7 +4,7 @@
 
 This service is a private iMessage assistant for one configured sender. One Node.js 24 process polls the Sendblue Free Sandbox for inbound iMessages, runs a bounded DeepSeek tool loop, accesses explicitly connected Google Workspace and Notion accounts, maintains one local memory document, and sends replies from the configured Sendblue line.
 
-The service does not support group chats, multiple assistant users, arbitrary autonomous schedules, destructive provider operations, or generic provider method execution. It supports one fixed read-only daily brief.
+The service does not support group chats, multiple assistant users, arbitrary autonomous schedules, destructive account-provider operations, or generic provider method execution. It supports one fixed read-only daily brief. An optional separate simple-to-do adapter permits explicitly authorized deletion of a task.
 
 ## Transport account model
 
@@ -184,11 +184,18 @@ The production registry contains exactly these tools:
 | `notion.create_page` | Write | Create one page |
 | `notion.update_page` | Write | Update one page |
 
-There are no delete, archive, move, raw request, or catch-all tools. Daily brief runs use the same registry but can execute only the six read tools; a pre-execution policy rejects Contacts search and detail arguments before a provider call.
+The account-provider registry has no delete, archive, move, raw request, or catch-all tools. Daily brief runs use the same registry but can execute only the six read tools; a pre-execution policy rejects Contacts search and detail arguments before a provider call.
 
 `connections.list` and `connections.connect` are inbound control tools outside the eight-tool provider registry. Each inbound prompt already contains one safe connection snapshot. `connections.list` reads current SQLite state when explicitly asked about connection status or when that snapshot may be stale; ordinary reads do not spend a model round rediscovering labels. `connections.connect` accepts only `google` or `notion` and returns an opaque confirmation that infrastructure will append a link; it never returns a signed URL. Their calls and results use the normal durable agent transcript, and the model authors the final reply in the following round. Daily brief runs never receive either control tool.
 
 `weather.get` is an inbound read-only utility alongside those control tools, not a ninth account-provider tool. It accepts an optional `city`, such as `"West Covina, California"` or `"Tokyo, Japan"`, and invokes the same `fetchDailyWeather` reader used by scheduled briefs without account selection or authentication. An empty object uses UCLA/Westwood. The read itself never saves a preference: only an explicit request to change future daily briefs reaches canonical memory maintenance. The tool returns normalized Fahrenheit daily forecasts, candidate cities for clarification, or an unavailable/not-found error. Scheduled briefs retain their prefetch and six-tool allowlist, so they neither expose nor dispatch `weather.get`.
+
+The optional `src/todo` adapter adds `todo.list`, `todo.create`, `todo.update`, `todo.complete`, `todo.delete`, and `todo.reorder` only to the inbound registry when both `TODO_API_URL` and `TODO_AGENT_TOKEN` are configured. The account-provider registry stays at eight tools, and neither brief path receives the todo tools. The URL is a fixed origin, never a model argument; configuration rejects partial credentials, embedded URL credentials, non-origin URLs, and unsafe production hosts or protocols. Redirects are forbidden. The server-side bearer token is included in trace and memory secret protection, not tool definitions or model results.
+
+The adapter validates task JSON at the network boundary and caps response bodies at 1 MiB. Requests and body consumption share the provider timeout and the agent context's abort signal. Existing-task mutations require a UUID and expected revision. Delete and reorder accept only `confirmed: true`, which certifies explicit user authorization, not authorization derived from task content. Reorder sends the exact ordered set of open tasks for one date, including every revision; the website rejects stale or incomplete sets.
+
+Migration 14 adds `todo_mutation` to the durable write-kind constraint without changing existing intents. The adapter prepares an intent and commits `attempting` before its single dispatch, using the intent ID as `Idempotency-Key`. Documented pre-mutation HTTP rejections become `confirmed_failed`; transport failures, 5xx responses, cancellation after attempting, and invalid success payloads become `ambiguous`. No todo mutation can follow a failed or unresolved todo write in the same run, including a fresh model call after a conflict. The normal ambiguity stop and replay write prohibition remain in force.
+
 
 Gmail is read-only. A search fetches message metadata in order with at most five concurrent requests. A targeted search can hydrate zero to three top distinct threads in the same tool call, bounded to 8 KiB per thread, 24 KiB across hydration, and 120 KiB for the complete search result; a failed hydration preserves the metadata result. `google.search` accepts one account and a closed batch of unique product queries. `google.read` accepts only a Drive file ID, Contacts resource ID, or Tasks list-and-task ID. Calendar searches already return complete bounded event records, so Calendar has no detail-read branch. Drive content reads stream at most 64 KiB of text. Google Docs and Slides export as plain text. Google Sheets export as CSV from the first sheet and report that limitation. Unsupported binary, download-restricted, and client-side encrypted files return metadata without content.
 

@@ -16,7 +16,7 @@ This service controls real Google Workspace, Notion, and iMessage accounts. Pres
 - Treat healthy capable accounts as one logical source for unscoped reads. Enumerate exact safe labels, call each account separately, and merge the results. Deduplicate the same underlying item across accounts without collapsing distinct items that share a title. Never ask the user to choose an account only because several are connected. Keep writes single-account and ask only when the target cannot be inferred safely.
 - Change only the affected connection's health.
 - Keep `MEMORY.md` as the only canonical long-term memory file.
-- Keep the production registry at exactly eight tools. Do not expose destructive or catch-all provider methods.
+- Keep the production account-provider registry at exactly eight tools. Optional `todo.*` inbound tools are separate and absent without both todo configuration variables. No catch-all provider methods.
 - Run daily briefs through the same eight-tool production registry, but expose and enforce only `gmail.search`, `gmail.read_thread`, `google.search`, `google.read`, `notion.search`, and `notion.fetch` for that run.
 - Skip daily brief work outside its same-morning window, and cancel only still-prepared daily egress when it expires or the feature is disabled.
 
@@ -49,7 +49,8 @@ Use Node 24. Railway starts `node dist/main.js` directly so the process receives
 - `src/core` and `src/providers`: shared identifiers, canonical JSON, error types, and the traced timeout-bounded fetch used by provider adapters.
 - `src/writes`: write-intent preparation, attempt records, and ambiguous-write recovery.
 - `src/agent`: provider-neutral messages, DeepSeek wire mapping, bounds, and the fixed tool registry.
-- `src/gmail`, `src/google`, and `src/notion`: the only provider tool adapters.
+- `src/gmail`, `src/google`, and `src/notion`: the account-provider tool adapters.
+- `src/todo`: optional single-user simple-to-do REST tools, bounded authenticated requests, and durable mutation intents. Delete and reorder require explicit user authorization through `confirmed: true`; failed writes cannot be retried in the same run.
 - `src/memory`: bounded load, maintenance validation, diff, and atomic replacement.
 
 Provider wire types stay inside their adapter. Core code consumes normalized application types.
