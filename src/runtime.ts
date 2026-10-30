@@ -201,10 +201,11 @@ export async function createRuntime(
     const providerTools = [...gmail.tools(), ...workspace.tools(), ...notion.tools()];
     const tools = new ToolRegistry(providerTools);
     assertProductionTools(tools);
-    const todoTools = config.todo === undefined ? [] : new TodoToolService({
+    const todo = config.todo === undefined ? undefined : new TodoToolService({
       db: database.db, config: config.todo, traces, writes, timeoutMs: config.limits.providerRequestTimeoutMs,
       ...(overrides.todoFetch === undefined ? {} : { fetchImpl: overrides.todoFetch }),
-    }).tools();
+    });
+    const todoTools = todo?.tools() ?? [];
     const agentTools = new ToolRegistry([
       ...providerTools,
       ...connectionTools(connections),
@@ -262,6 +263,7 @@ export async function createRuntime(
       traces,
       projector,
       ...(overrides.weatherFetch === undefined ? {} : { weatherFetch: overrides.weatherFetch }),
+      ...(todo === undefined ? {} : { todo }),
     });
     const turn = new InboundTurnService({
       db: database.db,

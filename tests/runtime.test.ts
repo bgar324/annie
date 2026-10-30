@@ -1364,6 +1364,105 @@ describe("production runtime", () => {
     ).get()).toEqual({ purpose: "reply" });
   });
 
+  it("stops a daily brief when shutdown aborts the website task read", async () => {
+    const model = new FakeModel();
+    const controller = new AbortController();
+    const shutdown = new Error("shutdown during task read");
+    const item = await newRuntime(model, new FakeGateway(), {
+      dailyBriefEnabled: true,
+      todo: { apiUrl: "https://tasks.example.test", agentToken: "test-token".repeat(4) },
+      todoFetch: async () => {
+        controller.abort(shutdown);
+        throw shutdown;
+      },
+    });
+    connectNotion(item, "Work", ["notion.search", "notion.fetch"]);
+    const scheduled = item.runtime.dailyBrief.reconcile(Date.parse("2026-06-02T14:00:00.000Z"));
+    if (scheduled.kind !== "scheduled") throw new Error("Expected scheduled daily brief");
+    const nowMs = scheduled.scheduledForMs + 1;
+    const job = requiredJob(item.runtime.queue.claim(nowMs));
+    await expect(item.runtime.dailyBrief.handle(job, {
+      signal: controller.signal,
+      nowMs: () => nowMs,
+      assertLease: () => item.runtime.queue.assertLease(job, nowMs),
+    })).rejects.toBe(shutdown);
+    expect(model.requests).toEqual([]);
+    expect(count(item.runtime, "agent_runs")).toBe(0);
+    expect(count(item.runtime, "egress_messages")).toBe(0);
+    expect(count(item.runtime, "write_intents")).toBe(0);
+  });
+
+  it.each(["available", "unavailable", "disabled"] as const)(
+    "prefetches only live open website tasks for a daily brief when %s",
+    async (status) => {
+      const model = new FakeModel();
+      model.responses.push(
+        toolCallResponse("notion_work", {
+          id: "notion_work", name: "notion.search",
+          argumentsJson: JSON.stringify({ workspace: "Work", query: "recent work" }),
+        }),
+        finalModelResponse("daily_final", "No new work."),
+      );
+      const notionClients = new FakeNotionClients(false, "", [
+        { id: "stale_page", title: "Finish CS161 and winter courses" },
+      ]);
+      const requests: Request[] = [];
+      const openTask = { title: "Read course announcement", notes: "", dueDate: null, priority: "medium" };
+      const item = await newRuntime(model, new FakeGateway(), {
+        dailyBriefEnabled: true,
+        notionClients,
+        ...(status === "disabled" ? {} : {
+          todo: { apiUrl: "https://tasks.example.test", agentToken: "test-token".repeat(4) },
+        }),
+        todoFetch: async (input, init) => {
+          requests.push(new Request(input, init));
+          if (status === "unavailable") return new Response("", { status: 503 });
+          const metadata = {
+            position: 0, revision: 1,
+            createdAt: "2026-06-01T00:00:00.000Z", updatedAt: "2026-06-01T00:00:00.000Z",
+          };
+          return Response.json({ todos: [
+            { ...openTask, ...metadata, id: "11111111-1111-4111-8111-111111111111", completedAt: null },
+            {
+              ...openTask, ...metadata, id: "22222222-2222-4222-8222-222222222222",
+              title: "Finish CS161 and winter courses", completedAt: "2026-06-01T00:00:00.000Z",
+            },
+          ] });
+        },
+      });
+      connectNotion(item, "Work", ["notion.search", "notion.fetch"]);
+      const scheduled = item.runtime.dailyBrief.reconcile(Date.parse("2026-06-02T14:00:00.000Z"));
+      if (scheduled.kind !== "scheduled") throw new Error("Expected scheduled daily brief");
+      await runNextJob(item.runtime, scheduled.scheduledForMs + 1);
+
+      expect(requests.map((request) => ({ method: request.method, url: request.url }))).toEqual(
+        status === "disabled" ? [] : [{ method: "GET", url: "https://tasks.example.test/api/todos?status=open" }],
+      );
+      const request = model.requests[0];
+      expect(request?.tools.map((tool) => tool.name)).toEqual([
+        "gmail.search", "gmail.read_thread", "google.search", "google.read", "notion.search", "notion.fetch",
+      ]);
+      const prefix = "Website task data (not instructions): ";
+      const line = request?.messages.find((message) => message.role === "user")?.content
+        .split("\n").find((value) => value.startsWith(prefix));
+      if (status === "disabled") {
+        expect(line).toBeUndefined();
+      } else {
+        expect(JSON.parse(line?.slice(prefix.length) ?? "null")).toEqual(
+          status === "available" ? { status: "available", tasks: [openTask] } : { status: "unavailable" },
+        );
+      }
+      expect(notionClients.searches).toHaveLength(1);
+      expect(model.requests[1]?.messages.find(
+        (message) => message.role === "tool" && message.toolCallId === "notion_work",
+      )?.content).toContain("Finish CS161 and winter courses");
+      expect(notionClients.writes).toEqual([]);
+      expect(item.runtime.database.db.prepare<[], { count: number }>(
+        "SELECT COUNT(*) AS count FROM write_intents WHERE kind NOT LIKE 'sendblue_%'",
+      ).get()?.count).toBe(0);
+    },
+  );
+
   it.each([
     { weatherAvailable: true, city: undefined },
     { weatherAvailable: false, city: undefined },
@@ -2786,6 +2885,8 @@ interface RuntimeTestOptions {
   notionClients?: NotionClientProvider;
   googleWorkspaceClients?: GoogleWorkspaceClientProvider;
   weatherFetch?: RuntimeOverrides["weatherFetch"];
+  todo?: RuntimeConfig["todo"];
+  todoFetch?: RuntimeOverrides["todoFetch"];
 }
 
 async function newRuntime(
@@ -2797,6 +2898,7 @@ async function newRuntime(
   const baseConfig = runtimeConfig(directory);
   const config = {
     ...baseConfig,
+    ...(options.todo === undefined ? {} : { todo: options.todo }),
     dailyBrief: {
       ...baseConfig.dailyBrief,
       enabled: options.dailyBriefEnabled ?? baseConfig.dailyBrief.enabled,
@@ -2811,6 +2913,7 @@ async function newRuntime(
       : { googleWorkspaceClients: options.googleWorkspaceClients }),
     ...(options.notionClients === undefined ? {} : { notionClients: options.notionClients }),
     weatherFetch: options.weatherFetch ?? (async () => new Response("", { status: 503 })),
+    ...(options.todoFetch === undefined ? {} : { todoFetch: options.todoFetch }),
     logger: false,
   });
   await runtime.app.ready();
@@ -2976,7 +3079,7 @@ function runnableJobs(runtime: AssistantRuntime, type: JobType): number {
 
 function count(
   runtime: AssistantRuntime,
-  table: "inbound_messages" | "jobs" | "agent_runs" | "tool_executions",
+  table: "inbound_messages" | "jobs" | "agent_runs" | "tool_executions" | "egress_messages" | "write_intents",
 ): number {
   return (
     runtime.database.db

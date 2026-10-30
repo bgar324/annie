@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import { z } from "zod";
 import { parseToolArguments, ToolRegistryError, type RegisteredTool, type ToolExecutionContext } from "../agent/tools.js";
 import { ModelSafeError } from "../core/errors.js";
+import type { TraceId } from "../core/ids.js";
 import { createTracedProviderFetch, type ProviderFetch } from "../providers/fetch.js";
 import type { TraceStore } from "../tracing/store.js";
 import type { WriteStore } from "../writes/store.js";
@@ -49,6 +50,8 @@ const manySchema = z.object({ todos: z.array(todoSchema).max(5_000) });
 const deletedSchema = z.object({ deleted: z.literal(true) });
 const maximumResponseBytes = 1_048_576;
 
+export type OpenTodoTask = Pick<z.infer<typeof todoSchema>, "title" | "notes" | "dueDate" | "priority">;
+
 export const todoToolNames = [
   "todo.list", "todo.create", "todo.update", "todo.complete", "todo.delete", "todo.reorder",
 ] as const;
@@ -95,6 +98,13 @@ export class TodoToolService {
     ];
   }
 
+  async readOpenTasks(input: { traceId: TraceId; signal: AbortSignal }): Promise<readonly OpenTodoTask[]> {
+    const result = await this.#read({ method: "GET", path: "/api/todos?status=open" }, manySchema, input);
+    return result.todos
+      .filter((task) => task.completedAt === null)
+      .map(({ title, notes, dueDate, priority }) => ({ title, notes, dueDate, priority }));
+  }
+
   #tool<T extends z.ZodType>(
     name: string, description: string, schema: T, operationClass: "read" | "write",
     execute: (args: z.output<T>, context: ToolExecutionContext) => Promise<unknown>,
@@ -114,7 +124,7 @@ export class TodoToolService {
     };
   }
 
-  async #read<T extends z.ZodType>(spec: RequestSpec, schema: T, context: ToolExecutionContext): Promise<z.output<T>> {
+  async #read<T extends z.ZodType>(spec: RequestSpec, schema: T, context: Pick<ToolExecutionContext, "traceId" | "signal">): Promise<z.output<T>> {
     try {
       const response = await this.#request(spec, context);
       if (!response.ok) throw apiError(response.status);
@@ -172,7 +182,7 @@ export class TodoToolService {
     }
   }
 
-  async #request(spec: RequestSpec, context: ToolExecutionContext, idempotencyKey?: string): Promise<{ ok: boolean; status: number; body: unknown }> {
+  async #request(spec: RequestSpec, context: Pick<ToolExecutionContext, "traceId" | "signal">, idempotencyKey?: string): Promise<{ ok: boolean; status: number; body: unknown }> {
     const signal = AbortSignal.any([
       AbortSignal.timeout(this.#timeoutMs), ...(context.signal === undefined ? [] : [context.signal]),
     ]);

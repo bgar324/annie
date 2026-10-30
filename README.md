@@ -90,6 +90,8 @@ Set `TODO_API_URL` to the website's origin and `TODO_AGENT_TOKEN` to its server-
 
 Inbound conversations can list, create, update, complete or reopen, delete, and reorder tasks. Existing-task changes require exact UUIDs and revisions from a current list. Delete and bulk reorder require explicit user authorization and `confirmed: true`. A stale revision returns a conflict instead of overwriting website edits. After any dispatched write fails, no more todo writes may run in that request.
 
+The scheduled iMessage brief reads current open website tasks when this integration is enabled. Completed tasks are omitted, and old Notion or remembered task lists are not used as substitutes. If the website cannot be read, the brief reports that rather than presenting stale tasks. The model keeps its existing six read-only tools; infrastructure fetches the website task snapshot. Without this configuration, the existing Notion task source remains.
+
 The token stays server-side and is redacted from traces. Every mutation records a durable intent before dispatch, sends that intent ID as `Idempotency-Key`, and makes one request without automatic retry. Unknown acceptance blocks the agent turn; replay cannot perform writes. Account-provider tools and both daily brief read allowlists are unchanged.
 
 

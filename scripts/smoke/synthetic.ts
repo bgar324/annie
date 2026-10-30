@@ -133,13 +133,26 @@ export interface TodoWorld {
   calls: string[];
 }
 
-export function syntheticTodo(token: string): TodoWorld {
+export interface TodoOptions {
+  unavailable?: boolean;
+  completedTitle?: string;
+  noOpenTasks?: boolean;
+}
+
+export function syntheticTodo(token: string, options: TodoOptions = {}): TodoWorld {
   const now = new Date().toISOString();
-  const tasks: SyntheticTodo[] = [{
+  const tasks: SyntheticTodo[] = options.noOpenTasks === true ? [] : [{
     id: "09ce4aaa-5e5b-4569-a9e0-dcf7f70ef5d2", title: "Buy tea", notes: "",
     dueDate: isoDate(0), priority: "medium", completedAt: null, position: 0,
     revision: 1, createdAt: now, updatedAt: now,
   }];
+  if (options.completedTitle !== undefined) {
+    tasks.push({
+      id: "f1b72da1-169b-4557-b23a-fdab8b3b9bfb", title: options.completedTitle, notes: "",
+      dueDate: isoDate(-1), priority: "medium", completedAt: new Date(Date.now() - day).toISOString(), position: 1,
+      revision: 2, createdAt: now, updatedAt: now,
+    });
+  }
   const calls: string[] = [];
   const create = z.object({
     title: z.string().min(1), notes: z.string().optional(),
@@ -156,6 +169,7 @@ export function syntheticTodo(token: string): TodoWorld {
       assert.equal(request.redirect, "error");
       calls.push(request.method);
       if (request.method === "GET") {
+        if (options.unavailable === true) return new Response("", { status: 503 });
         const dueDate = url.searchParams.get("dueDate");
         const status = url.searchParams.get("status") ?? "all";
         return Response.json({ todos: tasks.filter((task) =>

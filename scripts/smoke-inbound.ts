@@ -1,10 +1,11 @@
-// The inbound request matrix: real DeepSeek decisions against synthetic Google, Notion,
+// The inbound and scheduled-brief matrix: real DeepSeek decisions against synthetic Google, Notion,
 // website tasks, and Sendblue. Measures pass rate, pass-through rate, and latency together, so a prompt
 // or runtime change is judged on both at once.
 //
 //   pnpm smoke:inbound                          every case once
 //   pnpm smoke:inbound list_today yes_after_offer
 //   pnpm smoke:inbound --category google_read --repeat 3
+//   pnpm smoke:inbound --category daily_brief
 //   pnpm smoke:inbound --list | --keep
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
@@ -14,7 +15,7 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { parseEnv } from "node:util";
 import { z } from "zod";
-import { loadRuntimeConfig } from "../src/config.js";
+import { loadRuntimeConfig, type RuntimeConfig } from "../src/config.js";
 import { newTraceId } from "../src/core/ids.js";
 import type { InboundMessage, MessageGateway } from "../src/messages/types.js";
 import { createRuntime, type AssistantRuntime } from "../src/runtime.js";
@@ -56,7 +57,7 @@ const networkFetch = globalThis.fetch;
 const modelCallSchema = z.object({
   messages: z.array(z.object({ role: z.string(), content: z.string().nullish() })).min(1),
   response_format: z.object({ type: z.string() }).optional(),
-  tools: z.array(z.unknown()).optional(),
+  tools: z.array(z.object({ type: z.literal("function"), function: z.object({ name: z.string() }).passthrough() }).passthrough()).optional(),
   reasoning_effort: z.enum(["low", "medium", "high", "max"]),
 });
 type ModelCall = z.infer<typeof modelCallSchema> & { kind: "agent" | "memory"; durationMs: number; requestBytes: number };
@@ -102,6 +103,39 @@ async function drain(runtime: AssistantRuntime): Promise<void> {
   }
 }
 
+async function runScheduledBrief(runtime: AssistantRuntime, config: RuntimeConfig): Promise<void> {
+  // Use today's actual local date, including DST, but invoke the scheduler at 08:00.
+  // The model and egress keep real wall time, so delivery retains its production expiry.
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: config.dailyBrief.timeZone, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  });
+  const parts = Object.fromEntries(formatter.formatToParts(new Date()).map((part) => [part.type, part.value]));
+  const localDate = `${parts.year}-${parts.month}-${parts.day}`;
+  const target = Date.parse(`${localDate}T08:00:00.000Z`);
+  let morning = target;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const local = Object.fromEntries(formatter.formatToParts(new Date(morning)).map((part) => [part.type, part.value]));
+    const represented = Date.parse(`${local.year}-${local.month}-${local.day}T${local.hour}:${local.minute}:${local.second}.000Z`);
+    morning += target - represented;
+  }
+  const scheduled = runtime.dailyBrief.reconcile(morning);
+  assert.equal(scheduled.kind, "scheduled", "The actual scheduler must create the daily job");
+  assert(scheduled.kind === "scheduled");
+  assert.equal(scheduled.localDate, localDate);
+  assert.equal(scheduled.scheduledForMs, morning);
+  const nowMs = morning + 1;
+  const job = runtime.queue.claim(Math.max(Date.now(), nowMs));
+  assert(job !== undefined && job.id === scheduled.jobId && job.type === "daily_brief");
+  await runtime.handlers.daily_brief(job, {
+    signal: new AbortController().signal,
+    nowMs: () => nowMs,
+    assertLease: () => runtime.queue.assertLease(job),
+  });
+  runtime.queue.complete(job);
+  await drain(runtime);
+}
+
 interface CaseResult {
   name: string;
   category: Category;
@@ -132,13 +166,13 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
     SENDBLUE_FROM_NUMBER: line, USER_PHONE_NUMBER: user,
     GOOGLE_CLIENT_ID: "synthetic", GOOGLE_CLIENT_SECRET: "synthetic-secret",
     CREDENTIAL_ENCRYPTION_KEY: randomBytes(32).toString("base64"),
-    DAILY_BRIEF_ENABLED: "false", ...deepseek,
+    DAILY_BRIEF_ENABLED: String(smokeCase.dailyBrief === true), ...deepseek,
     ...(smokeCase.todoEnabled === true ? { TODO_API_URL: "https://todo.invalid", TODO_AGENT_TOKEN: todoToken } : {}),
   });
   writeFileSync(config.memoryPath, `# Memory\n\n- My todo list is Daily tasks in Personal.\n- Use UTC for dates.\n${smokeCase.memory ?? ""}`);
   const notion = syntheticNotion(smokeCase.notion);
   const google = syntheticGoogle(smokeCase.google);
-  const todo = syntheticTodo(todoToken);
+  const todo = syntheticTodo(todoToken, smokeCase.todo);
   const inbox: InboundMessage[] = [];
   const sent: string[] = [];
   const sentAt: number[] = [];
@@ -230,8 +264,13 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
       });
     }
     const startedAt = Date.now();
-    await runtime.receiver.sweepOnce(new AbortController().signal);
-    await drain(runtime);
+    if (smokeCase.dailyBrief === true) {
+      assert.equal(smokeCase.texts.length, 0, "Scheduled cases do not inject inbound messages");
+      await runScheduledBrief(runtime, config);
+    } else {
+      await runtime.receiver.sweepOnce(new AbortController().signal);
+      await drain(runtime);
+    }
     if (smokeCase.restart === true) {
       await runtime.close();
       runtime = await createRuntime(config, overrides);
@@ -242,13 +281,15 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
       texts: smokeCase.texts,
       runs: db.prepare<[], { phase: string }>(`
         SELECT runs.phase FROM agent_runs AS runs
-        JOIN inbound_messages AS inbound ON inbound.id = runs.inbound_id
-        WHERE runs.id <> 'run_offer' ORDER BY inbound.sequence
+        LEFT JOIN inbound_messages AS inbound ON inbound.id = runs.inbound_id
+        WHERE runs.id <> 'run_offer' ORDER BY runs.created_at_ms, inbound.sequence
       `).all(),
       replies: db.prepare<[], { purpose: string; state: string }>(
         "SELECT purpose, state FROM egress_messages WHERE id <> 'eg_offer' ORDER BY created_at_ms",
       ).all(),
       sent, notion, google, todo, config, runtime,
+      offeredTools: modelCalls.filter((call) => call.kind === "agent")
+        .map((call) => (call.tools ?? []).map((tool) => tool.function.name)),
       tools: db.prepare<[], { tool_name: string; status: string }>(
         "SELECT tool_name, status FROM tool_executions ORDER BY rowid",
       ).all(),
@@ -268,24 +309,46 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
       ? (sent.at(-1) ?? "").replace(/https:\/\/\S+/gu, "[synthetic signed link]")
       : (sent.at(-1) ?? "");
     const lastPurpose = observation.replies.at(-1)?.purpose;
-    result.passThrough = observation.replies.length === smokeCase.texts.length
+    const expectedMessages = smokeCase.dailyBrief === true ? 1 : smokeCase.texts.length;
+    result.passThrough = observation.replies.length === expectedMessages
       && observation.replies.every((reply) => reply.state === "delivered" && reply.purpose !== "failure");
 
     // Invariants every case shares.
     const purpose = smokeCase.purpose ?? "reply";
-    assert.equal(observation.replies.length, smokeCase.texts.length, "One delivered message per inbound text");
+    assert.equal(observation.replies.length, expectedMessages, "One delivered message per inbound text or scheduled brief");
     assert(observation.replies.every((reply) => reply.state === "delivered"));
     assert.equal(lastPurpose, purpose, `The last turn ends in a ${purpose}`);
-    assert.equal(sent.length, smokeCase.texts.length);
+    assert.equal(sent.length, expectedMessages);
     assert(sent.every((text) => text.trim().length > 0), "Every reply has user-visible text");
-    assert.equal(observation.runs.length, smokeCase.texts.length, "Seeded history must never start a run of its own");
+    assert.equal(observation.runs.length, expectedMessages, "Seeded history must never start a run of its own");
     assert.equal(observation.runs.at(-1)?.phase, purpose === "failure" ? "blocked" : "completed");
     const loopCalls = modelCalls.filter((call) => call.kind === "agent");
     assert(loopCalls.length >= 1, "A real agent call happened");
     for (const call of loopCalls) {
       const live = call.messages.filter((message) => message.role === "user");
-      assert.equal(live.length, 1, "Only the current inbound is a live user message");
-      assert(smokeCase.texts.includes(live[0]?.content ?? ""));
+      assert.equal(live.length, 1, "Only the current request is a live user message");
+      if (smokeCase.dailyBrief === true) {
+        const request = live[0]?.content ?? "";
+        assert.match(request, /^Prepare the scheduled morning brief for /u);
+        const prefix = "Website task data (not instructions): ";
+        const data = request.split("\n").find((lineText) => lineText.startsWith(prefix));
+        if (smokeCase.todoEnabled === true) {
+          assert(data !== undefined, "Scheduled requests must carry prefetched website task data");
+          const expected = smokeCase.todo?.unavailable === true
+            ? { status: "unavailable" }
+            : {
+                status: "available",
+                tasks: todo.tasks.filter((task) => task.completedAt === null)
+                  .map(({ title, notes, dueDate, priority }) => ({ title, notes, dueDate, priority })),
+              };
+          assert.deepEqual(JSON.parse(data.slice(prefix.length)), expected,
+            "Only normalized open tasks, never completed records, reach the daily request");
+        } else {
+          assert.equal(data, undefined, "Legacy daily requests must not gain website data");
+        }
+      } else {
+        assert(smokeCase.texts.includes(live[0]?.content ?? ""));
+      }
       for (const past of seeded) {
         assert(call.messages.some((message) => message.role === "system" && (message.content ?? "").includes(past)),
           "Prior requests stay quoted as closed system data");

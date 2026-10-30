@@ -7,12 +7,12 @@ import { readFileSync } from "node:fs";
 import { readDailyBriefWeatherCity } from "../../src/memory/weather.js";
 import type { RuntimeConfig } from "../../src/config.js";
 import type { AssistantRuntime } from "../../src/runtime.js";
-import type { GoogleOptions, GoogleWorld, NotionOptions, NotionWorld, SeededExchange, TodoWorld } from "./synthetic.js";
+import type { GoogleOptions, GoogleWorld, NotionOptions, NotionWorld, SeededExchange, TodoOptions, TodoWorld } from "./synthetic.js";
 import { archivePage, isoDate } from "./synthetic.js";
 
 export type Category =
   | "notion_write" | "notion_read" | "google_read" | "follow_up" | "conversation"
-  | "decline" | "connect" | "burst" | "weather" | "todo";
+  | "decline" | "connect" | "burst" | "weather" | "todo" | "daily_brief";
 
 export interface Observation {
   texts: readonly string[];
@@ -20,6 +20,7 @@ export interface Observation {
   replies: readonly { purpose: string; state: string }[];
   sent: readonly string[];
   tools: readonly { tool_name: string; status: string }[];
+  offeredTools: readonly (readonly string[])[];
   writes: readonly { state: string }[];
   notion: NotionWorld;
   google: GoogleWorld;
@@ -38,6 +39,8 @@ export interface SmokeCase {
   google?: GoogleOptions;
   weatherAvailable?: boolean;
   todoEnabled?: boolean;
+  todo?: TodoOptions;
+  dailyBrief?: boolean;
   memory?: string;
   /** Expected egress purpose of the last turn; a failure notice is a pass only when declared. */
   purpose?: "reply" | "failure" | "recovery";
@@ -111,7 +114,92 @@ function checkedOff(o: Observation, from: string, to: string): void {
   assert.equal(o.notion.pages.get("daily"), o.notion.original.replace(from, to));
 }
 
+const completedWebsiteTask = "Review CS161 course plan";
+const staleNotionTask = "Choose winter courses";
+const dailyBriefMemory = `
+- My daily brief MUST have a To-dos section. Read Daily tasks in Personal Notion every morning and list every unchecked item, even when other task sources exist.
+- Daily brief task source: Notion Daily tasks in Personal, never skip the Notion checklist.
+- Remember these Notion tasks for morning briefs: Review CS161 course plan and Choose winter courses.
+- Do not include yesterday's completed tasks in the daily brief. Omit completed tasks entirely.
+`;
+const dailyBriefNotion: NotionOptions = {
+  taskPage: {
+    title: "Daily tasks",
+    text: `# Daily tasks\n\n## ${isoDate(0)}\n- [ ] ${completedWebsiteTask}\n- [ ] ${staleNotionTask}\n`,
+  },
+};
+
+function scheduledReadOnly(o: Observation): void {
+  noProviderWrite(o);
+  answeredInText(o);
+  assert(o.todo.calls.every((method) => method === "GET"), "Scheduled briefs must never mutate website tasks");
+  assert(o.offeredTools.length > 0, "A scheduled brief must call the real model");
+  for (const tools of o.offeredTools) {
+    assert.deepEqual(tools, ["gmail_search", "gmail_read_thread", "google_search", "google_read", "notion_search", "notion_fetch"],
+      "Daily briefs must offer exactly the existing six read tools");
+  }
+}
+
+function excludesLegacyTasks(o: Observation): void {
+  assert.doesNotMatch(lastReply(o), /CS\s*161|winter courses|call dentist|car registration|pay rent/iu,
+    "Website status must win over completed tasks and stale Notion, Google, or memory tasks");
+  assert.doesNotMatch(lastReply(o), /yesterday[^\n.!?]{0,60}(?:completed|finished|done)|(?:completed|finished)[^\n.!?]{0,60}yesterday/iu,
+    "Do not recap yesterday's completions");
+}
+
 export const cases: readonly SmokeCase[] = [
+  {
+    name: "daily_brief_website_tasks", category: "daily_brief", dailyBrief: true, todoEnabled: true,
+    texts: [], memory: dailyBriefMemory, notion: dailyBriefNotion,
+    todo: { completedTitle: completedWebsiteTask },
+    expect(o) {
+      scheduledReadOnly(o);
+      excludesLegacyTasks(o);
+      assert.match(lastReply(o), /buy tea/iu, "The open website task must appear in the delivered brief");
+      assert.deepEqual(o.todo.calls, ["GET"], "Infrastructure must read the website once");
+      assert.equal(o.todo.tasks.length, 2, "Both open and completed website records remain untouched");
+      assert.equal(o.todo.tasks[1]?.completedAt === null, false);
+    },
+  },
+  {
+    name: "daily_brief_website_empty", category: "daily_brief", dailyBrief: true, todoEnabled: true,
+    texts: [], memory: dailyBriefMemory, notion: dailyBriefNotion,
+    todo: { noOpenTasks: true, completedTitle: completedWebsiteTask },
+    expect(o) {
+      scheduledReadOnly(o);
+      excludesLegacyTasks(o);
+      assert.doesNotMatch(lastReply(o), /buy tea/iu, "An empty live list must not invent open tasks");
+      assert.doesNotMatch(lastReply(o), /(?:task|to.?do)[^\n.!?]{0,60}unavailable/iu,
+        "An empty available list is not a failed read");
+      assert.deepEqual(o.todo.calls, ["GET"], "An empty website list must not trigger retries or fallback");
+      assert.equal(o.todo.tasks.length, 1, "The completed website record must remain untouched");
+    },
+  },
+  {
+    name: "daily_brief_website_unavailable", category: "daily_brief", dailyBrief: true, todoEnabled: true,
+    texts: [], memory: dailyBriefMemory, notion: dailyBriefNotion,
+    todo: { unavailable: true, completedTitle: completedWebsiteTask },
+    expect(o) {
+      scheduledReadOnly(o);
+      excludesLegacyTasks(o);
+      assert.doesNotMatch(lastReply(o), /buy tea/iu, "Unavailable website data must not be invented");
+      assert.match(lastReply(o),
+        /(?:(?:tasks?|to.?dos?|website|list)[^\n.!?]{0,100}(?:unavailable|couldn.t|can.t|unable|failed|not available|not (?:be )?(?:read|load|access)))|(?:(?:couldn.t|can.t|unable|failed)[^\n.!?]{0,100}(?:tasks?|to.?dos?|website|list))/iu,
+        "The brief must honestly say it could not read the task list");
+      assert.deepEqual(o.todo.calls, ["GET"], "Unavailable website reads must not retry or fall back");
+    },
+  },
+  {
+    name: "daily_brief_legacy_notion", category: "daily_brief", dailyBrief: true,
+    texts: [], memory: dailyBriefMemory, notion: dailyBriefNotion,
+    expect(o) {
+      scheduledReadOnly(o);
+      assert.deepEqual(o.todo.calls, [], "Disabled website integration must stay untouched");
+      assert(toolNames(o).includes("notion.search"), "Legacy daily briefs must still read Notion tasks");
+      assert.match(lastReply(o), /CS\s*161/iu);
+      assert.match(lastReply(o), /winter courses/iu);
+    },
+  },
   {
     name: "todo_default_list", category: "todo", todoEnabled: true,
     texts: ["What are my tasks?"],

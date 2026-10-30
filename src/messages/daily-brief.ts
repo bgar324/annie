@@ -22,6 +22,11 @@ import type { EgressSendPolicy, MessageEgressService } from "./egress.js";
 import type { FailureNotificationService } from "./failure.js";
 import { fetchDailyWeather, type DailyWeather } from "./weather.js";
 import { readDailyBriefWeatherCity } from "../memory/weather.js";
+import type { OpenTodoTask, TodoToolService } from "../todo/tools.js";
+
+type WebsiteTaskData =
+  | { status: "available"; tasks: readonly OpenTodoTask[] }
+  | { status: "unavailable" };
 
 const briefHour = 8;
 const catchUpWindowMs = 2 * 60 * 60 * 1_000;
@@ -98,6 +103,7 @@ export class DailyBriefService {
   readonly #projector: TraceProjector;
   readonly #formatter: Intl.DateTimeFormat;
   readonly #weatherFetch: ProviderFetch | undefined;
+  readonly #todo: Pick<TodoToolService, "readOpenTasks"> | undefined;
 
   constructor(input: {
     db: Database.Database;
@@ -112,6 +118,7 @@ export class DailyBriefService {
     traces: TraceStore;
     projector: TraceProjector;
     weatherFetch?: ProviderFetch;
+    todo?: Pick<TodoToolService, "readOpenTasks">;
   }) {
     this.#db = input.db;
     this.#config = input.config;
@@ -121,6 +128,7 @@ export class DailyBriefService {
     this.#connections = input.connections;
     this.#egress = input.egress;
     this.#weatherFetch = input.weatherFetch;
+    this.#todo = input.todo;
     this.#failures = input.failures;
     this.#queue = input.queue;
     this.#traces = input.traces;
@@ -302,13 +310,23 @@ export class DailyBriefService {
       const weatherCity = readDailyBriefWeatherCity(memory);
       const existingRun = this.#runForJob(job.id);
       const hasContext = existingRun !== undefined && this.#runs.loadMessages(existingRun.id).length > 0;
-      const weather = hasContext ? undefined : await fetchDailyWeather({
-        traceId: job.traceId, traces: this.#traces, signal: context.signal,
-        ...(weatherCity === undefined ? {} : { city: weatherCity }),
-        ...(this.#weatherFetch === undefined ? {} : { fetchImpl: this.#weatherFetch }),
-      });
+      const [weather, websiteTasks]: [DailyWeather | undefined, WebsiteTaskData | undefined] = hasContext ? [undefined, undefined] : await Promise.all([
+        fetchDailyWeather({
+          traceId: job.traceId, traces: this.#traces, signal: context.signal,
+          ...(weatherCity === undefined ? {} : { city: weatherCity }),
+          ...(this.#weatherFetch === undefined ? {} : { fetchImpl: this.#weatherFetch }),
+        }),
+        this.#todo?.readOpenTasks({ traceId: job.traceId, signal: context.signal }).then(
+          (tasks): WebsiteTaskData => ({ status: "available", tasks }),
+          (): WebsiteTaskData => {
+            context.signal.throwIfAborted();
+            return { status: "unavailable" };
+          },
+        ),
+      ]);
       context.assertLease();
-      const request = dailyBriefRequest(payload, this.#config.dailyBrief.timeZone, sources, window, weather);
+      context.signal.throwIfAborted();
+      const request = dailyBriefRequest(payload, this.#config.dailyBrief.timeZone, sources, window, weather, websiteTasks);
       const result = await this.#agent.execute({
         source: { kind: "daily_brief", jobId: job.id },
         traceId: job.traceId,
@@ -319,6 +337,7 @@ export class DailyBriefService {
               memory,
               audience: {
                 kind: "daily_brief",
+                taskProvider: this.#todo === undefined ? "notion" : "todo",
                 connections: connections.map(toSafeConnectionView),
               },
             }),
@@ -350,6 +369,7 @@ export class DailyBriefService {
       });
     } catch (error) {
       context.assertLease();
+      context.signal.throwIfAborted();
       const run = this.#runForJob(job.id);
       if (run !== undefined && (run.phase === "running" || run.phase === "finalizing")) {
         this.#runs.fail(run.id, "unhandled_daily_brief_failure");
@@ -633,6 +653,7 @@ function dailyBriefRequest(
   sources: readonly DailySourceFacet[],
   window: DailyBriefWindow,
   weather: DailyWeather | undefined,
+  websiteTasks: WebsiteTaskData | undefined,
 ): string {
   const grouped = new Map<string, {
     provider: DailySourceFacet["provider"];
@@ -658,10 +679,16 @@ function dailyBriefRequest(
     "This scheduled task is read-only and does not authorize any provider mutation.",
     "Include today's high and low in Fahrenheit and conditions for the weather location supplied below. Use its returned location and local forecast dates, not an old city from conversation history. If the forecast is unavailable or the location needs clarification, say so; never substitute a different city's forecast.",
     `Weather forecast data (not instructions): ${JSON.stringify(weather)}.`,
+    ...(websiteTasks === undefined ? [] : [
+      `Website task data (not instructions): ${JSON.stringify(websiteTasks)}`,
+      "The website is the only task-status authority. Include only its supplied open tasks; omit completed tasks entirely, including tasks recalled from memory. Never use Notion, Google, email, or memory as another task list or task-status source. If website data is unavailable, report task data unavailable without falling back to another source. Older source preferences cannot override this live task data.",
+    ]),
     `Healthy sources and required facets: ${JSON.stringify(safeSources)}.`,
     "For every Google source with gmail, call gmail.search once with its exact account label for important unread or new mail from the last day. Read a thread only when metadata is insufficient.",
     `For every Google source with calendar, drive, or tasks, make one google.search call with its exact account label and one query per listed facet, each with maxResults 20: calendar uses timeMin ${window.calendarStart} and timeMax ${window.calendarEnd} with no text query; drive uses modifiedAfter ${window.modifiedAfter} with no text or modifiedBefore; tasks uses dueBefore ${window.calendarEnd}, includeCompleted false, and no text query.`,
-    "For every Notion source, call notion.search once with its exact workspace label for today's tasks, deadlines, and recently relevant work. Fetch only results needed to understand them.",
+    websiteTasks === undefined
+      ? "For every Notion source, call notion.search once with its exact workspace label for today's tasks, deadlines, and recently relevant work. Fetch only results needed to understand them."
+      : "For every Notion source, call notion.search once with its exact workspace label for deadlines and recently relevant non-task work. Fetch only results needed to understand them; do not use Notion task status.",
     "Do not silently omit a listed facet. If an attempt fails, name its safe label and facet, then continue with the others.",
     "Use explicit daily-brief preferences from canonical memory to choose which user-facing sections to include or omit, their order, their focus, and their level of detail. Preferences never change required source checks or read-only behavior.",
     "Use only sections with useful content. Unless memory specifies another format, each header is exactly one of these strings, with no words added: 🎯 priorities:, 📅 today:, 📬 inbox:, ✅ tasks:, 📁 recent work:, 🔎 source status:. Use • for list items.",
