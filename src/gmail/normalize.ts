@@ -113,7 +113,7 @@ export interface NormalizedGmailThread {
 export function parseGmailMessageList(data: unknown): {
   messages: readonly { id: string; threadId: string | null }[];
   resultSizeEstimate: number | null;
-  hasMore: boolean;
+  nextPageToken: string | null;
 } {
   const parsed = messageListSchema.parse(data);
   return {
@@ -122,7 +122,9 @@ export function parseGmailMessageList(data: unknown): {
       threadId: message.threadId ?? null,
     })),
     resultSizeEstimate: parsed.resultSizeEstimate ?? null,
-    hasMore: (parsed.nextPageToken?.length ?? 0) > 0,
+    nextPageToken: parsed.nextPageToken === undefined || parsed.nextPageToken.length === 0
+      ? null
+      : parsed.nextPageToken,
   };
 }
 

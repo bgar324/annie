@@ -137,6 +137,298 @@ describe("Gmail read tools", () => {
     expect(JSON.stringify(result)).not.toContain("opaque-provider-cursor");
   });
 
+  it("drains matching pages through the registered search tool, including read mail and overlaps", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(harness, "sub_all_mail", "All mail", "all@example.test");
+    const query = "after:1793430000 before:1793516400";
+    const ids = Array.from({ length: 32 }, (_, index) => `message_${index}`);
+    const requestedIds: string[] = [];
+    const pageTokens: (string | undefined)[] = [];
+    const api = stubGmailApi({
+      async listMessages(input) {
+        expect(input.query).toBe(query);
+        expect(input.maxResults).toBeLessThanOrEqual(500);
+        pageTokens.push(input.pageToken);
+        return response({
+          messages: (input.pageToken === undefined ? ids.slice(0, 21) : ids.slice(19))
+            .map((id) => ({ id, threadId: `thread_${id}` })),
+          resultSizeEstimate: ids.length,
+          ...(input.pageToken === undefined ? { nextPageToken: "private-next-page" } : {}),
+        });
+      },
+      async getMessage(input) {
+        requestedIds.push(input.messageId);
+        return response({
+          id: input.messageId,
+          threadId: `thread_${input.messageId}`,
+          labelIds: ["INBOX"],
+        });
+      },
+    });
+    const service = gmailService(harness, fixedClient(connection.id, api));
+    const search = service.tools().find((tool) => tool.definition.name === "gmail.search");
+    if (search === undefined) {
+      throw new Error("Missing registered Gmail search");
+    }
+    const context = toolContext(harness, "gmail.search");
+    const result = await search.execute({ query }, context);
+
+    expect(result).toEqual({
+      account: { label: "All mail" },
+      resultSizeEstimate: ids.length,
+      messagesTruncated: false,
+      messages: ids.map((id) => expect.objectContaining({ id, labels: ["INBOX"] })),
+    });
+    expect(requestedIds).toEqual(ids);
+    expect(pageTokens).toEqual([undefined, "private-next-page"]);
+    expect(JSON.stringify(result)).not.toContain("private-next-page");
+    const requests = harness.traces.list(context.traceId)
+      .filter((event) => event.component === "gmail");
+    expect(requests.filter((event) => event.event === "request_attempted")).toHaveLength(34);
+    expect(requests.filter((event) => event.event === "request_succeeded")).toHaveLength(34);
+  });
+
+  it("accepts an explicit total above twenty and stops before an unused page", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(harness, "sub_total_cap", "Total cap", "cap@example.test");
+    const ids = Array.from({ length: 30 }, (_, index) => `message_${index}`);
+    const requestedPages: { token: string | undefined; maximum: number }[] = [];
+    const fetched: string[] = [];
+    const api = stubGmailApi({
+      async listMessages(input) {
+        requestedPages.push({ token: input.pageToken, maximum: input.maxResults });
+        return response({
+          messages: (input.pageToken === undefined ? ids.slice(0, 20) : ids.slice(20, 25))
+            .map((id) => ({ id })),
+          nextPageToken: input.pageToken === undefined ? "page_two" : "unused_page_three",
+        });
+      },
+      async getMessage(input) {
+        fetched.push(input.messageId);
+        return response({ id: input.messageId });
+      },
+    });
+    const service = gmailService(harness, fixedClient(connection.id, api));
+    const search = service.tools().find((tool) => tool.definition.name === "gmail.search");
+    if (search === undefined) {
+      throw new Error("Missing registered Gmail search");
+    }
+    const result = await search.execute(
+      { query: "from:alice", maxResults: 25 },
+      toolContext(harness, "gmail.search"),
+    );
+
+    expect(result).toMatchObject({
+      messagesTruncated: true,
+      messages: ids.slice(0, 25).map((id) => expect.objectContaining({ id })),
+    });
+    expect(fetched).toEqual(ids.slice(0, 25));
+    expect(requestedPages).toEqual([
+      { token: undefined, maximum: 25 },
+      { token: "page_two", maximum: 5 },
+    ]);
+  });
+
+  it("marks a repeated cursor incomplete and reads duplicate IDs only once", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(harness, "sub_cursor_loop", "Cursor loop", "loop@example.test");
+    let pages = 0;
+    const fetched: string[] = [];
+    const api = stubGmailApi({
+      async listMessages() {
+        pages += 1;
+        return response({
+          messages: pages === 1
+            ? [{ id: "first" }, { id: "first" }]
+            : [{ id: "first" }, { id: "second" }],
+          nextPageToken: "repeated_cursor",
+        });
+      },
+      async getMessage(input) {
+        fetched.push(input.messageId);
+        return response({ id: input.messageId });
+      },
+    });
+    const service = gmailService(harness, fixedClient(connection.id, api));
+    await expect(service.search({ query: "after:1 before:2" }, toolContext(harness, "gmail.search")))
+      .resolves.toMatchObject({
+        messagesTruncated: true,
+        messages: [{ id: "first" }, { id: "second" }],
+      });
+    expect(pages).toBe(2);
+    expect(fetched).toEqual(["first", "second"]);
+  });
+
+  it("continues through an empty page that has a fresh cursor", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(harness, "sub_empty_page", "Empty page", "empty@example.test");
+    const tokens: (string | undefined)[] = [];
+    const api = stubGmailApi({
+      async listMessages(input) {
+        tokens.push(input.pageToken);
+        return response(input.pageToken === undefined
+          ? { messages: [], nextPageToken: "nonempty_page" }
+          : { messages: [{ id: "after_empty" }] });
+      },
+      async getMessage() {
+        return response({ id: "after_empty" });
+      },
+    });
+    const service = gmailService(harness, fixedClient(connection.id, api));
+    await expect(service.search({ query: "after:1 before:2" }, toolContext(harness, "gmail.search")))
+      .resolves.toMatchObject({
+        messagesTruncated: false,
+        messages: [{ id: "after_empty" }],
+      });
+    expect(tokens).toEqual([undefined, "nonempty_page"]);
+  });
+
+  it("stops metadata waves and pagination at the serialized result byte budget", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(harness, "sub_search_bytes", "Search bytes", "bytes@example.test");
+    let pages = 0;
+    let metadataReads = 0;
+    const api = stubGmailApi({
+      async listMessages() {
+        pages += 1;
+        return response({
+          messages: Array.from({ length: 500 }, (_, index) => ({ id: `message_${index}` })),
+          nextPageToken: "must_not_be_read",
+        });
+      },
+      async getMessage(input) {
+        metadataReads += 1;
+        return response({
+          id: input.messageId,
+          snippet: '"'.repeat(512),
+          labelIds: Array.from({ length: 50 }, (_, index) => `${index}${'"'.repeat(128)}`),
+          payload: { headers: [
+            { name: "From", value: '"'.repeat(2048) },
+            { name: "To", value: '"'.repeat(2048) },
+            { name: "Subject", value: '"'.repeat(1024) },
+          ] },
+        });
+      },
+    });
+    const service = gmailService(harness, fixedClient(connection.id, api));
+    const result = await service.search({ query: "after:1 before:2" }, toolContext(harness, "gmail.search"));
+    expect(result).toMatchObject({
+      messagesTruncated: true,
+      messages: expect.arrayContaining([expect.objectContaining({ id: "message_0" })]),
+    });
+    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(120 * 1024);
+    expect(metadataReads).toBeLessThan(20);
+    expect(pages).toBe(1);
+  });
+
+  it("fits optional hydration into the remaining aggregate search budget", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(harness, "sub_hydration_bytes", "Hydration bytes", "hydrate@example.test");
+    const threadReads: string[] = [];
+    const api = stubGmailApi({
+      async listMessages() {
+        return response({
+          messages: Array.from({ length: 150 }, (_, index) => ({
+            id: `message_${index}`,
+            threadId: `thread_${index}`,
+          })),
+        });
+      },
+      async getMessage(input) {
+        return response({
+          id: input.messageId,
+          snippet: "s".repeat(512),
+          payload: { headers: [{ name: "Subject", value: "s".repeat(1024) }] },
+        });
+      },
+      async getThread(input) {
+        threadReads.push(input.threadId);
+        return response({
+          id: input.threadId,
+          messages: [{
+            id: `${input.threadId}_full`,
+            payload: {
+              mimeType: "text/plain",
+              body: { data: Buffer.from("body".repeat(1000)).toString("base64url") },
+            },
+          }],
+        });
+      },
+    });
+    const service = gmailService(harness, fixedClient(connection.id, api));
+    const result = await service.search(
+      { query: "from:alice", hydrateThreads: 3 },
+      toolContext(harness, "gmail.search"),
+    );
+    expect(result).toMatchObject({
+      messagesTruncated: true,
+      hydration: { requested: 3, truncated: true },
+    });
+    expect(threadReads).toEqual(["thread_0", "thread_1", "thread_2"]);
+    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(120 * 1024);
+  });
+
+  it("fails rather than presenting a partial success when a later page fails", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(harness, "sub_page_failure", "Page failure", "failure@example.test");
+    let pages = 0;
+    const api = stubGmailApi({
+      async listMessages(input) {
+        pages += 1;
+        if (input.pageToken !== undefined) {
+          throw providerError(400);
+        }
+        return response({ messages: [{ id: "first" }], nextPageToken: "failed_page" });
+      },
+      async getMessage() {
+        return response({ id: "first" });
+      },
+    });
+    const service = gmailService(harness, fixedClient(connection.id, api));
+    const context = toolContext(harness, "gmail.search");
+    await expect(service.search({ query: "after:1 before:2" }, context))
+      .rejects.toMatchObject({ code: "provider_read_failed" });
+    expect(pages).toBe(2);
+    expect(harness.traces.list(context.traceId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        component: "gmail",
+        event: "request_failed",
+        outcome: "messages.list",
+      }),
+    ]));
+  });
+
+  it("propagates a later-page abort without returning partial messages or fetching again", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(harness, "sub_page_abort", "Page abort", "abort@example.test");
+    const controller = new AbortController();
+    let pages = 0;
+    let metadataReads = 0;
+    const api = stubGmailApi({
+      async listMessages(input) {
+        pages += 1;
+        if (input.pageToken !== undefined) {
+          controller.abort();
+          input.signal?.throwIfAborted();
+        }
+        return response({ messages: [{ id: "first" }], nextPageToken: "aborted_page" });
+      },
+      async getMessage() {
+        metadataReads += 1;
+        return response({ id: "first" });
+      },
+    });
+    const waits: number[] = [];
+    const service = gmailService(harness, fixedClient(connection.id, api), waits);
+    await expect(service.search({ query: "after:1 before:2" }, {
+      ...toolContext(harness, "gmail.search"),
+      signal: controller.signal,
+    })).rejects.toMatchObject({ name: "AbortError" });
+    expect(pages).toBe(2);
+    expect(metadataReads).toBe(1);
+    expect(waits).toEqual([]);
+  });
+
   it("fetches message metadata in bounded concurrent waves and preserves list order", async () => {
     const harness = gmailHarness();
     const connection = addGoogleConnection(
@@ -452,6 +744,88 @@ describe("Gmail read tools", () => {
       thread.messages.reduce((count, message) => count + message.attachments.length, 0),
     ).toBeLessThanOrEqual(100);
     expect(Buffer.byteLength(JSON.stringify(thread))).toBeLessThanOrEqual(120 * 1_024);
+  });
+
+  it("sends private page tokens and bounded page sizes over read-only Gmail HTTP", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(harness, "sub_paged_http", "Paged HTTP", "http@example.test");
+    const refresh = {
+      async credentials() {
+        return { accessToken: "synthetic-access-token" };
+      },
+    } as unknown as RefreshCoordinator;
+    const requests: URL[] = [];
+    const query = "after:1793430000 before:1793516400";
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = new URL(String(input));
+      requests.push(url);
+      expect(init?.method).toBe("GET");
+      const data = url.pathname.endsWith("/messages")
+        ? url.searchParams.has("pageToken")
+          ? { messages: [{ id: "read_second" }] }
+          : { messages: [{ id: "read_first" }], nextPageToken: "opaque/token+two" }
+        : { id: url.pathname.split("/").at(-1), labelIds: ["INBOX"] };
+      return Response.json(data);
+    };
+    const provider = new GoogleGmailClientProvider(harness.config, refresh, fetchImpl);
+    const service = gmailService(harness, provider);
+    const context = toolContext(harness, "gmail.search");
+    const result = await service.search({ query, maxResults: 1000 }, context);
+
+    expect(result).toMatchObject({
+      messagesTruncated: false,
+      messages: [{ id: "read_first" }, { id: "read_second" }],
+    });
+    const pages = requests.filter((url) => url.pathname.endsWith("/messages"));
+    expect(pages).toHaveLength(2);
+    expect(pages.map((url) => url.searchParams.get("pageToken"))).toEqual([null, "opaque/token+two"]);
+    for (const page of pages) {
+      expect(page.searchParams.get("q")).toBe(query);
+      expect(page.searchParams.get("maxResults")).toBe("500");
+      expect(page.searchParams.get("includeSpamTrash")).toBe("false");
+    }
+    expect(JSON.stringify(result)).not.toContain("opaque/token+two");
+    expect(harness.traces.list(context.traceId).filter((event) =>
+      event.component === "gmail" && event.event === "request_attempted",
+    )).toHaveLength(requests.length);
+  });
+
+  it("retries only a failing later page while retaining its cursor and prior metadata", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(harness, "sub_page_retry", "Page retry", "retry-page@example.test");
+    const tokens: (string | undefined)[] = [];
+    const fetched: string[] = [];
+    let failures = 0;
+    const api = stubGmailApi({
+      async listMessages(input) {
+        tokens.push(input.pageToken);
+        if (input.pageToken === undefined) {
+          return response({ messages: [{ id: "first" }], nextPageToken: "retry_page" });
+        }
+        failures += 1;
+        if (failures === 1) {
+          throw providerError(503);
+        }
+        return response({ messages: [{ id: "second" }] });
+      },
+      async getMessage(input) {
+        fetched.push(input.messageId);
+        return response({ id: input.messageId });
+      },
+    });
+    const waits: number[] = [];
+    const service = gmailService(harness, fixedClient(connection.id, api), waits);
+    const context = toolContext(harness, "gmail.search");
+    await expect(service.search({ query: "after:1 before:2" }, context)).resolves.toMatchObject({
+      messagesTruncated: false,
+      messages: [{ id: "first" }, { id: "second" }],
+    });
+    expect(tokens).toEqual([undefined, "retry_page", "retry_page"]);
+    expect(fetched).toEqual(["first", "second"]);
+    expect(waits).toEqual([250]);
+    expect(harness.traces.list(context.traceId).filter((event) =>
+      event.component === "gmail" && event.event === "request_failed",
+    )).toHaveLength(1);
   });
 
   it("bounds full-thread transport before parsing and requests only required fields", async () => {

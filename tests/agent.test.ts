@@ -62,13 +62,10 @@ describe("assistant prompt", () => {
       Buffer.byteLength(prompt) +
       Buffer.byteLength(assistantResponseFormatReminder) -
       Buffer.byteLength(memory);
-    // Prompt-bloat tripwire, not a provider limit. Raised 4096 → 4352 for the tone line,
-    // → 4608 for the one-retry rule, → 4864 for the never-show-accounts rule, → 5120 for
-    // the act-from-history rule, and → 5376 for the closing brevity rule that cut a
-    // measured reply from 35 words to 21 (measured 5194); every raise is a deliberate trade.
+    // Prompt-bloat tripwire, not a provider limit. Keep the existing ceiling when
+    // replacing response guidance; a smaller prompt does not prove better replies.
     expect(fixedWireBytes).toBeLessThan(5_376);
   });
-
 });
 
 describe("DeepSeek model adapter", () => {

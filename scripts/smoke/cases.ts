@@ -162,6 +162,87 @@ export const cases: readonly SmokeCase[] = [
     },
   },
   {
+    name: "daily_brief_all_mail_late_read_actions", category: "daily_brief", dailyBrief: true, todoEnabled: true,
+    texts: [], memory: dailyBriefMemory, notion: dailyBriefNotion,
+    google: { mailboxScenario: "brief_late_actions" },
+    todo: { completedTitle: completedWebsiteTask },
+    expect(o) {
+      scheduledReadOnly(o);
+      excludesLegacyTasks(o);
+      assert.match(lastReply(o), /buy tea/iu, "The open website task must still appear");
+      assert.deepEqual(o.todo.calls, ["GET"], "Email actions must not replace or mutate website tasks");
+      assert.equal(o.todo.tasks.length, 2, "Open and completed website records must remain untouched");
+      const baseline = o.runtime.database.db.prepare<[], { result_json: string; count: number; truncated: number }>(`
+        SELECT result_json, json_array_length(result_json, '$.messages') AS count,
+               json_extract(result_json, '$.messagesTruncated') AS truncated
+        FROM tool_executions
+        WHERE tool_name = 'gmail.search' AND status = 'succeeded'
+          AND json_type(arguments_json, '$.maxResults') IS NULL
+          AND COALESCE(json_extract(arguments_json, '$.hydrateThreads'), 0) = 0
+          AND json_array_length(result_json, '$.messages') = 24
+      `).get();
+      assert(baseline !== undefined, "An uncapped baseline must return all 24 in-window messages, including read mail");
+      assert.equal(baseline.truncated, 0, "This small mailbox must be fully covered, not silently partial");
+      const ids = o.runtime.database.db.prepare<{ result: string }, { id: string; unread: number }>(`
+        SELECT json_extract(message.value, '$.id') AS id,
+               EXISTS(SELECT 1 FROM json_each(message.value, '$.labels') WHERE value = 'UNREAD') AS unread
+        FROM json_each(@result, '$.messages') AS message
+      `).all({ result: baseline.result_json });
+      assert.deepEqual(ids.map((message) => message.id),
+        [...Array.from({ length: 22 }, (_, index) => `m_brief_news_${index}`), "m_brief_interview", "m_brief_github"],
+        "Exact epoch boundaries must include the starting second but exclude older, end-boundary, future, spam, and trash mail");
+      assert(ids.slice(-2).every((message) => message.unread === 0), "Both late-page actions must already be read");
+      assert(o.google.calls.some((call) => call.startsWith("gmail.page:20:") && call.includes("m_brief_interview") && call.includes("m_brief_github")),
+        "The actual provider must return both actions on a later page, not the first 20 IDs");
+      assert(o.google.calls.includes("gmail.message:m_brief_interview") && o.google.calls.includes("gmail.message:m_brief_github"),
+        "Both late-page messages must be read into the model's source evidence");
+      assert.match(lastReply(o),
+        /(?:(?:interview|meridian)[^\n.!?]{0,160}(?:availab|schedul|reply|respond|send|time slots))|(?:(?:availab|schedul|reply|respond|send|time slots)[^\n.!?]{0,160}(?:interview|meridian))/iu,
+        "The delivered brief must include the interview scheduling action despite the email already being read");
+      assert.match(lastReply(o),
+        /(?:(?:github|lattice.?labs)[^\n.!?]{0,160}(?:accept|join|invit))|(?:(?:accept|join|invit)[^\n.!?]{0,160}(?:github|lattice.?labs))/iu,
+        "The delivered brief must separately include the GitHub invitation");
+      assert.doesNotMatch(lastReply(o), /aurora|cobalt|saffron|topaz|onyx/iu,
+        "Out-of-window, spam, and trash actions must not enter the delivered brief");
+    },
+  },
+  {
+    name: "daily_brief_gmail_byte_budget_partial", category: "daily_brief", dailyBrief: true, todoEnabled: true,
+    texts: [], notion: dailyBriefNotion,
+    memory: `${dailyBriefMemory}\n- Omit routine inbox updates and the source-status section from my daily brief.\n`,
+    google: { mailboxScenario: "brief_byte_budget" },
+    todo: { completedTitle: completedWebsiteTask },
+    expect(o) {
+      scheduledReadOnly(o);
+      excludesLegacyTasks(o);
+      assert.match(lastReply(o), /buy tea/iu, "Partial email coverage must not hide the live website task");
+      assert.deepEqual(o.todo.calls, ["GET"], "Budget exhaustion must not retry or mutate website tasks");
+      const baseline = o.runtime.database.db.prepare<[], { count: number; truncated: number; estimate: number; bytes: number }>(`
+        SELECT json_array_length(result_json, '$.messages') AS count,
+               json_extract(result_json, '$.messagesTruncated') AS truncated,
+               json_extract(result_json, '$.resultSizeEstimate') AS estimate,
+               length(CAST(result_json AS BLOB)) AS bytes
+        FROM tool_executions
+        WHERE tool_name = 'gmail.search' AND status = 'succeeded'
+          AND json_type(arguments_json, '$.maxResults') IS NULL
+          AND COALESCE(json_extract(arguments_json, '$.hydrateThreads'), 0) = 0
+          AND json_extract(result_json, '$.messagesTruncated') = 1
+      `).get();
+      assert(baseline !== undefined, "The actual Gmail adapter byte budget must produce partial coverage");
+      assert.equal(baseline.truncated, 1);
+      assert.equal(baseline.estimate, 181, "Provider pagination must honestly report the full matching mailbox");
+      assert(baseline.count > 20 && baseline.count < baseline.estimate, "Only a bounded prefix may fit");
+      assert(baseline.bytes > 110 * 1_024 && baseline.bytes <= 120 * 1_024,
+        "Real normalized metadata, not a fabricated truncation flag, must exhaust the 120KiB adapter budget");
+      assert(!o.google.calls.includes("gmail.message:m_budget_hidden_interview"),
+        "The adapter must stop before fetching an unused later-page interview");
+      assert.doesNotMatch(lastReply(o), /sequoia/iu, "The brief cannot invent an action in unreviewed mail");
+      assert.match(lastReply(o).replace(/\s+/gu, " "),
+        /(?:(?:gmail|inbox|e.?mail).{0,240}(?:incomplete|partial|not (?:fully|completely)|couldn.t|could not|not all|limit|cut short|unreviewed))|(?:(?:incomplete|partial|couldn.t|could not|not all|only (?:reviewed|read|checked)|could only|limit|cut short|unreviewed).{0,240}(?:gmail|inbox|e.?mail))/iu,
+        "The delivered reply must explicitly disclose incomplete email review even when memory omits routine source status");
+    },
+  },
+  {
     name: "daily_brief_website_empty", category: "daily_brief", dailyBrief: true, todoEnabled: true,
     texts: [], memory: dailyBriefMemory, notion: dailyBriefNotion,
     todo: { noOpenTasks: true, completedTitle: completedWebsiteTask },
@@ -224,6 +305,37 @@ export const cases: readonly SmokeCase[] = [
       assert.equal(o.todo.tasks.length, 2);
       assert.match(o.todo.tasks[1]?.title ?? "", /buy coffee/iu);
       assert.equal(o.todo.tasks[1]?.dueDate, isoDate(1));
+    },
+  },
+  {
+    name: "todo_acknowledgment_requested_action_only", category: "todo", todoEnabled: true,
+    texts: ["Add to my todo: email 161 teammates", "Mark email 161 teammates done"],
+    memory: "- Other open tasks: do fafsa form and study for stripe onsite.\n",
+    exchange: {
+      question: "Mark add people to exploretech done",
+      reply: "✅ add people to exploretech done. fafsa and stripe onsite still open.",
+      ageMs: 60_000, state: "delivered",
+    },
+    todo: { openTitles: ["do fafsa form", "study for stripe onsite"] },
+    expect(o) {
+      answeredInText(o);
+      assert.equal(o.notion.mutations(), 0);
+      assert.deepEqual(o.writes, [{ state: "succeeded" }, { state: "succeeded" }]);
+      assert.deepEqual(o.todo.calls.filter((method) => method !== "GET"), ["POST", "PATCH"]);
+      const requested = o.todo.tasks.find((task) => /email 161 teammates/iu.test(task.title));
+      assert(requested?.completedAt !== null && requested?.completedAt !== undefined,
+        "The requested task must really be completed, not just acknowledged");
+      assert(o.todo.tasks.filter((task) => task !== requested).every((task) => task.completedAt === null),
+        "Unrequested tasks must remain untouched");
+      assert.equal(o.sent.length, 2);
+      for (const reply of o.sent) {
+        assert.match(reply, /email\s*161\s*teammates/iu, "Identify only the requested task");
+        assert.doesNotMatch(reply, /fafsa|stripe|still open|remain|anything else|want me to/iu,
+          "Do not append unrelated task status, reassurance, or offers");
+        assert.equal(reply.trim().split("\n").length, 1, "A successful mutation needs one acknowledgment, not a recap");
+      }
+      assert.match(o.sent[0] ?? "", /added|created/iu, "Creating a task is not completing it");
+      assert.match(lastReply(o), /done|complet/iu, "Confirm the requested completion");
     },
   },
   {

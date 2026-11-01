@@ -12,6 +12,7 @@ export interface GmailApi {
   listMessages(input: {
     query: string;
     maxResults: number;
+    pageToken?: string;
     signal?: AbortSignal;
   }): Promise<GmailProviderResponse>;
   getMessage(input: {
@@ -71,14 +72,18 @@ export class GoogleGmailClientProvider implements GmailClientProvider {
       );
     return {
       async listMessages(input) {
+        const query: [string, string][] = [
+          ["q", input.query],
+          ["maxResults", String(Math.min(500, input.maxResults))],
+          ["includeSpamTrash", "false"],
+          ["fields", "messages(id,threadId),nextPageToken,resultSizeEstimate"],
+        ];
+        if (input.pageToken !== undefined) {
+          query.push(["pageToken", input.pageToken]);
+        }
         return request(
           "messages",
-          [
-            ["q", input.query],
-            ["maxResults", String(input.maxResults)],
-            ["includeSpamTrash", "false"],
-            ["fields", "messages(id,threadId),nextPageToken,resultSizeEstimate"],
-          ],
+          query,
           maximumMetadataResponseBytes,
           input.signal,
         );

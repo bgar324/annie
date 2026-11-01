@@ -137,15 +137,18 @@ export interface TodoOptions {
   unavailable?: boolean;
   completedTitle?: string;
   noOpenTasks?: boolean;
+  openTitles?: readonly string[];
 }
 
 export function syntheticTodo(token: string, options: TodoOptions = {}): TodoWorld {
   const now = new Date().toISOString();
-  const tasks: SyntheticTodo[] = options.noOpenTasks === true ? [] : [{
-    id: "09ce4aaa-5e5b-4569-a9e0-dcf7f70ef5d2", title: "Buy tea", notes: "",
-    dueDate: isoDate(0), priority: "medium", completedAt: null, position: 0,
-    revision: 1, createdAt: now, updatedAt: now,
-  }];
+  const tasks: SyntheticTodo[] = (options.noOpenTasks === true ? [] : options.openTitles ?? ["Buy tea"]).map(
+    (title, index) => ({
+      id: `09ce4aaa-5e5b-4569-a9e0-${String(index + 1).padStart(12, "0")}`, title, notes: "",
+      dueDate: isoDate(0), priority: "medium", completedAt: null, position: index,
+      revision: 1, createdAt: now, updatedAt: now,
+    }),
+  );
   if (options.completedTitle !== undefined) {
     tasks.push({
       id: "f1b72da1-169b-4557-b23a-fdab8b3b9bfb", title: options.completedTitle, notes: "",
@@ -164,10 +167,24 @@ export function syntheticTodo(token: string, options: TodoOptions = {}): TodoWor
       const request = new Request(input, init);
       const url = new URL(request.url);
       assert.equal(url.origin, "https://todo.invalid");
-      assert.equal(url.pathname, "/api/todos");
+      assert(url.pathname === "/api/todos" || /^\/api\/todos\/[a-f0-9-]{36}$/u.test(url.pathname),
+        "Synthetic todo path must identify the collection or one task");
       assert(request.headers.get("authorization") === `Bearer ${token}`, "Synthetic todo authentication required");
       assert.equal(request.redirect, "error");
       calls.push(request.method);
+      if (request.method === "PATCH") {
+        assert(request.headers.has("idempotency-key"), "Website writes require a durable idempotency key");
+        const args = z.object({
+          expectedRevision: z.number().int().min(1), completed: z.boolean(),
+        }).strict().parse(await request.json());
+        const task = tasks.find((candidate) => url.pathname === `/api/todos/${candidate.id}`);
+        if (task === undefined) return Response.json({ error: "not_found" }, { status: 404 });
+        if (task.revision !== args.expectedRevision) return Response.json({ error: "conflict" }, { status: 409 });
+        task.completedAt = args.completed ? new Date().toISOString() : null;
+        task.revision += 1;
+        task.updatedAt = new Date().toISOString();
+        return Response.json({ todo: task });
+      }
       if (request.method === "GET") {
         if (options.unavailable === true) return new Response("", { status: 503 });
         const dueDate = url.searchParams.get("dueDate");
@@ -176,7 +193,7 @@ export function syntheticTodo(token: string, options: TodoOptions = {}): TodoWor
           (dueDate === null || task.dueDate === dueDate) &&
           (status === "all" || (status === "open" ? task.completedAt === null : task.completedAt !== null))) });
       }
-      assert.equal(request.method, "POST", "Only list/create are allowed by this synthetic website");
+      assert.equal(request.method, "POST", "Only list/create/complete are allowed by this synthetic website");
       assert(request.headers.has("idempotency-key"), "Website writes require a durable idempotency key");
       const args = create.parse(await request.json());
       const task: SyntheticTodo = {
@@ -196,6 +213,7 @@ export function syntheticTodo(token: string, options: TodoOptions = {}): TodoWor
 export interface GoogleOptions {
   gmailFails?: boolean;
   inboxSize?: number;
+  mailboxScenario?: "brief_late_actions" | "brief_byte_budget";
 }
 
 export interface GoogleWorld {
@@ -204,7 +222,16 @@ export interface GoogleWorld {
   calls: string[];
 }
 
-interface Mail { id: string; threadId: string; from: string; subject: string; body: string; ageMs: number; unread: boolean }
+interface Mail {
+  id: string;
+  threadId: string;
+  from: string;
+  subject: string;
+  body: string;
+  ageMs: number;
+  unread: boolean;
+  folder?: "SPAM" | "TRASH";
+}
 
 const base64url = (text: string): string => Buffer.from(text, "utf8").toString("base64url");
 
@@ -225,12 +252,79 @@ function mailbox(size: number): Mail[] {
   return [...fixed, ...filler];
 }
 
-function gmailMessage(mail: Mail, format: "metadata" | "full"): Record<string, unknown> {
-  const sentAt = new Date(Date.now() - mail.ageMs);
+// Match the runner's mocked LA morning, not the wall-clock hour when the smoke starts.
+function briefMorning(nowMs: number, dayOffset: number): number {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  });
+  const parts = Object.fromEntries(formatter.formatToParts(new Date(nowMs)).map((part) => [part.type, part.value]));
+  const localDate = new Date(`${parts.year}-${parts.month}-${parts.day}T08:00:00.000Z`);
+  localDate.setUTCDate(localDate.getUTCDate() + dayOffset);
+  const target = localDate.getTime();
+  let morning = target;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const local = Object.fromEntries(formatter.formatToParts(new Date(morning)).map((part) => [part.type, part.value]));
+    morning += target - Date.parse(`${local.year}-${local.month}-${local.day}T${local.hour}:${local.minute}:${local.second}.000Z`);
+  }
+  return morning;
+}
+
+function briefMailbox(nowMs: number): Mail[] {
+  const start = briefMorning(nowMs, -1);
+  const end = briefMorning(nowMs, 0);
+  const mail = (id: string, sentAtMs: number, subject: string, body: string): Mail => ({
+    id, threadId: `t_${id}`, from: "Updates <updates@example.test>", subject, body,
+    ageMs: nowMs - sentAtMs, unread: false,
+  });
+  return [
+    mail("m_after_window", end + 1_000, "Aurora scholarship application needed", "Submit the Aurora scholarship application."),
+    mail("m_at_window_end", end, "Cobalt grant application needed", "Submit the Cobalt grant application."),
+    ...Array.from({ length: 22 }, (_, index) => ({
+      ...mail(`m_brief_news_${index}`, end - (index + 1) * 30 * 60_000,
+        `Community newsletter ${index}`, "A community photo digest. No action, deadline, invitation, or response needed."),
+      unread: true,
+    })),
+    {
+      ...mail("m_brief_interview", start + 60_000, "Meridian interview scheduling: send your availability",
+        "Meridian recruiting would like to schedule your engineering interview. Reply with three available time slots by tomorrow. You have read this email but have not replied."),
+      from: "Meridian Recruiting <recruiting@meridian.example.test>",
+    },
+    {
+      ...mail("m_brief_github", start, "GitHub invitation to join the lattice-labs organization",
+        "lattice-labs invited you to join their GitHub organization. Accept the invitation from your GitHub invitations page before it expires tomorrow. You have read this email but have not accepted."),
+      from: "GitHub <noreply@github.example.test>",
+    },
+    mail("m_before_window", start - 1_000, "Saffron fellowship application needed", "Submit the Saffron fellowship application."),
+    { ...mail("m_brief_spam", end - 60_000, "Topaz prize claim needed", "Claim the Topaz prize."), folder: "SPAM" },
+    { ...mail("m_brief_trash", end - 60_000, "Onyx survey response needed", "Complete the Onyx survey."), folder: "TRASH" },
+  ];
+}
+
+function budgetMailbox(nowMs: number): Mail[] {
+  const end = briefMorning(nowMs, 0);
+  const digests: Mail[] = Array.from({ length: 180 }, (_, index) => ({
+    id: `m_budget_digest_${index}`, threadId: `t_budget_digest_${index}`,
+    from: `Community digest ${"regional chapter ".repeat(18)}<digest${index}@example.test>`,
+    subject: `Community archive ${index}: ${"photos, reports, and meeting notes; ".repeat(24)}`,
+    body: "A routine archived community digest. There is no pending request or deadline.",
+    ageMs: nowMs - (end - (index + 1) * 60_000), unread: false,
+  }));
+  return [...digests, {
+    id: "m_budget_hidden_interview", threadId: "t_budget_hidden_interview",
+    from: "Sequoia Recruiting <recruiting@sequoia.example.test>",
+    subject: "Sequoia interview: send availability",
+    body: "Reply with your availability to schedule the interview.",
+    ageMs: nowMs - (end - 181 * 60_000), unread: false,
+  }];
+}
+
+function gmailMessage(mail: Mail, format: "metadata" | "full", nowMs: number): Record<string, unknown> {
+  const sentAt = new Date(nowMs - mail.ageMs);
   return {
     id: mail.id, threadId: mail.threadId, snippet: mail.body.slice(0, 80),
     internalDate: String(sentAt.getTime()),
-    labelIds: mail.unread ? ["INBOX", "UNREAD"] : ["INBOX"],
+    labelIds: [mail.folder ?? "INBOX", ...(mail.unread ? ["UNREAD"] : [])],
     payload: {
       mimeType: "text/plain",
       headers: [
@@ -243,7 +337,20 @@ function gmailMessage(mail: Mail, format: "metadata" | "full"): Record<string, u
   };
 }
 
-function matchesQuery(mail: Mail, query: string): boolean {
+function matchesQuery(mail: Mail, query: string, nowMs: number): boolean {
+  const sentAtSeconds = (nowMs - mail.ageMs) / 1_000;
+  const after = /(?:^|\s)after:(\d+)(?:\s|$)/u.exec(query)?.[1];
+  const before = /(?:^|\s)before:(\d+)(?:\s|$)/u.exec(query)?.[1];
+  if (after !== undefined && sentAtSeconds <= Number(after)) return false;
+  if (before !== undefined && sentAtSeconds >= Number(before)) return false;
+  if (/(?:^|\s)is:unread(?:\s|$)/iu.test(query) && !mail.unread) return false;
+  if (/(?:^|\s)is:read(?:\s|$)/iu.test(query) && mail.unread) return false;
+  for (const match of query.matchAll(/(?:^|\s)(newer_than|older_than):(\d+)([dhmy])(?:\s|$)/giu)) {
+    const unit = match[3]?.toLowerCase();
+    const duration = Number(match[2]) * (unit === "h" ? 3_600_000 : unit === "m" ? 30 * day : unit === "y" ? 365 * day : day);
+    if (match[1]?.toLowerCase() === "newer_than" ? mail.ageMs >= duration : mail.ageMs <= duration) return false;
+  }
+  if (mail.folder !== undefined) return false;
   const terms = query.toLowerCase().split(/\s+/u)
     .map((token) => token.replace(/^(from|to|subject):/u, ""))
     .filter((token) => token.length > 0 && !/^(is:|in:|has:|label:|newer_than:|older_than:|after:|before:|-)/u.test(token))
@@ -255,13 +362,17 @@ function matchesQuery(mail: Mail, query: string): boolean {
 
 export function syntheticGoogle(options: GoogleOptions = {}): GoogleWorld {
   const calls: string[] = [];
-  const mails = mailbox(options.inboxSize ?? 4);
-  const at = (hoursFromNow: number): string => new Date(Date.now() + hoursFromNow * 3_600_000).toISOString();
-  const todayAt = (hour: number): string => `${isoDate(0)}T${String(hour).padStart(2, "0")}:00:00.000Z`;
+  const nowMs = Date.now();
+  const mails = options.mailboxScenario === "brief_late_actions"
+    ? briefMailbox(nowMs)
+    : options.mailboxScenario === "brief_byte_budget" ? budgetMailbox(nowMs) : mailbox(options.inboxSize ?? 4);
+  const date = (offset: number): string => new Date(nowMs + offset * day).toISOString().slice(0, 10);
+  const at = (hoursFromNow: number): string => new Date(nowMs + hoursFromNow * 3_600_000).toISOString();
+  const todayAt = (hour: number): string => `${date(0)}T${String(hour).padStart(2, "0")}:00:00.000Z`;
   const events = [
     { id: "ev_standup", status: "confirmed", summary: "Team standup", start: { dateTime: todayAt(10) }, end: { dateTime: todayAt(10) }, location: "Zoom" },
     { id: "ev_gym", status: "confirmed", summary: "Pull day (gym)", start: { dateTime: todayAt(18) }, end: { dateTime: todayAt(19) } },
-    { id: "ev_dentist", status: "confirmed", summary: "Dentist", start: { dateTime: `${isoDate(1)}T15:00:00.000Z` }, end: { dateTime: `${isoDate(1)}T16:00:00.000Z` } },
+    { id: "ev_dentist", status: "confirmed", summary: "Dentist", start: { dateTime: `${date(1)}T15:00:00.000Z` }, end: { dateTime: `${date(1)}T16:00:00.000Z` } },
   ];
   const files = [
     { id: "doc_logit", name: "Logit thought dump", mimeType: "application/vnd.google-apps.document", modifiedTime: at(-20), createdTime: at(-200), capabilities: { canDownload: true } },
@@ -273,28 +384,42 @@ export function syntheticGoogle(options: GoogleOptions = {}): GoogleWorld {
     phoneNumbers: [{ value: "+15550000009", type: "mobile" }],
   }];
   const tasks = [
-    { id: "task_dentist", title: "Call dentist to confirm", status: "needsAction", due: `${isoDate(0)}T00:00:00.000Z`, updated: at(-30) },
-    { id: "task_reg", title: "Renew car registration", status: "needsAction", due: `${isoDate(1)}T00:00:00.000Z`, updated: at(-50) },
-    { id: "task_done", title: "Pay rent", status: "completed", due: `${isoDate(-2)}T00:00:00.000Z`, completed: at(-40), updated: at(-40) },
+    { id: "task_dentist", title: "Call dentist to confirm", status: "needsAction", due: `${date(0)}T00:00:00.000Z`, updated: at(-30) },
+    { id: "task_reg", title: "Renew car registration", status: "needsAction", due: `${date(1)}T00:00:00.000Z`, updated: at(-50) },
+    { id: "task_done", title: "Pay rent", status: "completed", due: `${date(-2)}T00:00:00.000Z`, completed: at(-40), updated: at(-40) },
   ];
   const gmail: GmailApi = {
     async listMessages(input) {
       calls.push(`gmail.list:${input.query}`);
       if (options.gmailFails === true) throw new Error("Synthetic Gmail unavailable");
-      const matched = mails.filter((mail) => matchesQuery(mail, input.query)).slice(0, input.maxResults);
-      return { data: { messages: matched.map((mail) => ({ id: mail.id, threadId: mail.threadId })), resultSizeEstimate: matched.length }, headers: {} };
+      const matched = mails.filter((mail) => matchesQuery(mail, input.query, nowMs));
+      const offset = input.pageToken === undefined ? 0 : Number(input.pageToken);
+      assert(Number.isSafeInteger(offset) && offset >= 0, "Invalid synthetic Gmail page token");
+      assert(Number.isInteger(input.maxResults) && input.maxResults > 0 && input.maxResults <= 500,
+        "Provider page size must be within Gmail's 1–500 range");
+      const page = matched.slice(offset, offset + Math.min(input.maxResults, 20));
+      calls.push(`gmail.page:${offset}:${page.map((mail) => mail.id).join(",")}`);
+      const nextOffset = offset + page.length;
+      return {
+        data: {
+          messages: page.map((mail) => ({ id: mail.id, threadId: mail.threadId })),
+          resultSizeEstimate: matched.length,
+          ...(nextOffset < matched.length ? { nextPageToken: String(nextOffset) } : {}),
+        },
+        headers: {},
+      };
     },
     async getMessage(input) {
       calls.push(`gmail.message:${input.messageId}`);
       const mail = mails.find((candidate) => candidate.id === input.messageId);
       assert(mail, "Model read an unknown synthetic message");
-      return { data: gmailMessage(mail, input.format), headers: {} };
+      return { data: gmailMessage(mail, input.format, nowMs), headers: {} };
     },
     async getThread(input) {
       calls.push(`gmail.thread:${input.threadId}`);
       const thread = mails.filter((mail) => mail.threadId === input.threadId);
       assert(thread.length > 0, "Model read an unknown synthetic thread");
-      return { data: { id: input.threadId, messages: thread.map((mail) => gmailMessage(mail, "full")) }, headers: {} };
+      return { data: { id: input.threadId, messages: thread.map((mail) => gmailMessage(mail, "full", nowMs)) }, headers: {} };
     },
   };
   const workspace: GoogleWorkspaceApi = {

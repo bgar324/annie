@@ -22,7 +22,7 @@ const searchArgumentsSchema = z
   .object({
     query: z.string().trim().min(1).max(512),
     account: accountSchema,
-    maxResults: z.number().int().min(1).max(20).default(5),
+    maxResults: z.number().int().min(1).optional(),
     hydrateThreads: z.number().int().min(0).max(3).optional(),
   })
   .strict();
@@ -75,13 +75,17 @@ export class GmailToolService {
       {
         definition: {
           name: "gmail.search",
-          description: "Search one connected Gmail account. For automatic multi-account reads, call once per exact safe label in connected account status. Set hydrateThreads to 1-3 only for a targeted query that needs the top matching thread contents; each hydrated thread is strictly bounded.",
+          description: "Search one connected Gmail account. Omit maxResults to retrieve all matching messages within the result byte budget; set it only for an intentional total limit. For automatic multi-account reads, call once per exact safe label in connected account status. Set hydrateThreads to 1-3 only for a targeted query that needs the top matching thread contents; each hydrated thread is strictly bounded.",
           parameters: {
             type: "object",
             properties: {
               query: { type: "string", minLength: 1, maxLength: 512 },
               account: { type: "string", minLength: 1, maxLength: 160 },
-              maxResults: { type: "integer", minimum: 1, maximum: 20, default: 5 },
+              maxResults: {
+                type: "integer",
+                minimum: 1,
+                description: "Optional total message limit. Omit to retrieve all matching pages within the result byte budget.",
+              },
               hydrateThreads: {
                 type: "integer",
                 minimum: 0,
@@ -132,53 +136,120 @@ export class GmailToolService {
       capabilities: ["gmail.read"],
       connectionId: selected.id,
     });
-    const listed = await this.#readRequest("messages.list", connection, context, () =>
-      api.listMessages({
-        query: input.query,
-        maxResults: input.maxResults,
-        ...(context.signal === undefined ? {} : { signal: context.signal }),
-      }),
-    );
-    const list = parseGmailMessageList(listed.data);
-    const listedMessages = list.messages.slice(0, input.maxResults);
-    const [metadataResult, hydrationResult] = await Promise.allSettled([
-      mapInWaves(listedMessages, 5, async (item) => {
-        const response = await this.#readRequest("messages.get", connection, context, () =>
-          api.getMessage({
-            messageId: item.id,
-            format: "metadata",
-            metadataHeaders: ["From", "To", "Subject", "Date", "Message-ID"],
-            ...(context.signal === undefined ? {} : { signal: context.signal }),
-          }),
-        );
-        return normalizeGmailMetadata(response.data);
-      }),
-      (input.hydrateThreads ?? 0) === 0
-        ? Promise.resolve(undefined)
-        : this.#hydrateThreads(
-            listedMessages,
-            input.hydrateThreads ?? 0,
-            api,
-            connection,
-            context,
-          ),
-    ]);
-    if (metadataResult.status === "rejected") {
-      throw metadataResult.reason;
-    }
-    if (hydrationResult.status === "rejected") {
-      throw hydrationResult.reason;
-    }
-    this.#markHealthy(connection, context.traceId);
-    return boundedSearchResult({
+    const messages: NormalizedGmailMessage[] = [];
+    const hydrationMessages: { id: string; threadId: string | null }[] = [];
+    const seenMessageIds = new Set<string>();
+    const seenPageTokens = new Set<string>();
+    const requestedHydration = input.hydrateThreads ?? 0;
+    const emptyHydration: SearchHydration | undefined = requestedHydration === 0
+      ? undefined
+      : { requested: requestedHydration, truncated: false, threads: [] };
+    let resultSizeEstimate: number | null = null;
+    let serializedBytes = Buffer.byteLength(JSON.stringify({
       account: { label: connection.safeLabel },
-      resultSizeEstimate: list.resultSizeEstimate,
-      messagesTruncated: list.hasMore || list.messages.length > listedMessages.length,
-      messages: metadataResult.value,
-      ...(hydrationResult.value === undefined
-        ? {}
-        : { hydration: hydrationResult.value }),
-    });
+      resultSizeEstimate,
+      messages,
+      messagesTruncated: false,
+      ...(emptyHydration === undefined ? {} : { hydration: emptyHydration }),
+    }));
+    let messagesTruncated = false;
+    let pageToken: string | undefined;
+    let firstPage = true;
+    pages: for (;;) {
+      const remaining = input.maxResults === undefined
+        ? 500
+        : input.maxResults - messages.length;
+      const listed = await this.#readRequest("messages.list", connection, context, () =>
+        api.listMessages({
+          query: input.query,
+          maxResults: Math.min(500, remaining),
+          ...(pageToken === undefined ? {} : { pageToken }),
+          ...(context.signal === undefined ? {} : { signal: context.signal }),
+        }),
+      );
+      context.signal?.throwIfAborted();
+      const list = parseGmailMessageList(listed.data);
+      if (firstPage) {
+        resultSizeEstimate = list.resultSizeEstimate;
+        serializedBytes += Buffer.byteLength(JSON.stringify(resultSizeEstimate)) - 4;
+        firstPage = false;
+      }
+      const uniqueMessages = list.messages.filter((message) => {
+        if (seenMessageIds.has(message.id)) {
+          return false;
+        }
+        seenMessageIds.add(message.id);
+        return true;
+      });
+      const pageMessages = uniqueMessages.slice(0, remaining);
+      for (let index = 0; index < pageMessages.length; index += 5) {
+        const wave = pageMessages.slice(index, index + 5);
+        const metadata = await mapInWaves(wave, 5, async (item) => {
+          const response = await this.#readRequest("messages.get", connection, context, () =>
+            api.getMessage({
+              messageId: item.id,
+              format: "metadata",
+              metadataHeaders: ["From", "To", "Subject", "Date", "Message-ID"],
+              ...(context.signal === undefined ? {} : { signal: context.signal }),
+            }),
+          );
+          return { listed: item, message: normalizeGmailMetadata(response.data) };
+        });
+        context.signal?.throwIfAborted();
+        for (const item of metadata) {
+          const messageBytes = Buffer.byteLength(JSON.stringify(item.message));
+          const separatorBytes = messages.length === 0 ? 0 : 1;
+          if (serializedBytes + separatorBytes + messageBytes > maximumSearchResultBytes) {
+            messagesTruncated = true;
+            break pages;
+          }
+          messages.push(item.message);
+          if (requestedHydration > 0) {
+            hydrationMessages.push(item.listed);
+          }
+          serializedBytes += separatorBytes + messageBytes;
+        }
+      }
+      if (uniqueMessages.length > pageMessages.length) {
+        messagesTruncated = true;
+        break;
+      }
+      if (list.nextPageToken === null) {
+        break;
+      }
+      if (
+        messages.length === input.maxResults ||
+        seenPageTokens.has(list.nextPageToken)
+      ) {
+        messagesTruncated = true;
+        break;
+      }
+      pageToken = list.nextPageToken;
+      seenPageTokens.add(pageToken);
+    }
+    const hydration = emptyHydration === undefined
+      ? undefined
+      : await this.#hydrateThreads(
+          hydrationMessages,
+          requestedHydration,
+          api,
+          connection,
+          context,
+          Math.min(
+            maximumHydrationBytes,
+            maximumSearchResultBytes - serializedBytes +
+              Buffer.byteLength(JSON.stringify(emptyHydration)),
+          ),
+        );
+    context.signal?.throwIfAborted();
+    this.#markHealthy(connection, context.traceId);
+    return {
+      account: { label: connection.safeLabel },
+      resultSizeEstimate,
+      messagesTruncated,
+      messages,
+      ...(hydration === undefined ? {} : { hydration }),
+    };
   }
 
   async readThread(
@@ -211,6 +282,7 @@ export class GmailToolService {
     api: Awaited<ReturnType<GmailClientProvider["forConnection"]>>,
     connection: ConnectionRecord,
     context: ToolExecutionContext,
+    maximumBytes: number,
   ): Promise<SearchHydration> {
     const threadIds: string[] = [];
     for (const message of messages) {
@@ -260,7 +332,7 @@ export class GmailToolService {
       }
       const itemBytes = Buffer.byteLength(JSON.stringify(item));
       const separatorBytes = threads.length === 0 ? 0 : 1;
-      if (serializedBytes + separatorBytes + itemBytes > maximumHydrationBytes) {
+      if (serializedBytes + separatorBytes + itemBytes > maximumBytes) {
         truncated = true;
         continue;
       }
@@ -426,35 +498,6 @@ function headerValue(headers: unknown, name: string): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
-function boundedSearchResult(input: {
-  readonly account: { readonly label: string };
-  readonly resultSizeEstimate: number | null;
-  readonly messages: readonly NormalizedGmailMessage[];
-  readonly messagesTruncated: boolean;
-  readonly hydration?: SearchHydration;
-}) {
-  const messages: NormalizedGmailMessage[] = [];
-  for (const message of input.messages) {
-    const candidate = {
-      account: input.account,
-      resultSizeEstimate: input.resultSizeEstimate,
-      messages: [...messages, message],
-      messagesTruncated: input.messagesTruncated,
-      ...(input.hydration === undefined ? {} : { hydration: input.hydration }),
-    };
-    if (Buffer.byteLength(JSON.stringify(candidate)) > maximumSearchResultBytes) {
-      break;
-    }
-    messages.push(message);
-  }
-  return {
-    account: input.account,
-    resultSizeEstimate: input.resultSizeEstimate,
-    messages,
-    messagesTruncated: input.messagesTruncated || messages.length < input.messages.length,
-    ...(input.hydration === undefined ? {} : { hydration: input.hydration }),
-  };
-}
 
 async function mapInWaves<T, R>(
   items: readonly T[],

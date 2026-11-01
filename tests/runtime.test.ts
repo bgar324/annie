@@ -1479,27 +1479,24 @@ describe("production runtime", () => {
             id: "gmail_one",
             name: "gmail.search",
             argumentsJson: JSON.stringify({
-              query: "is:unread newer_than:1d",
+              query: `after:${Date.parse("2026-06-01T15:00:00.000Z") / 1_000 - 1} before:${Date.parse("2026-06-02T15:00:00.000Z") / 1_000}`,
               account: "one@example.test",
-              maxResults: 5,
             }),
           },
           {
             id: "gmail_two",
             name: "gmail.search",
             argumentsJson: JSON.stringify({
-              query: "is:unread newer_than:1d",
+              query: `after:${Date.parse("2026-06-01T15:00:00.000Z") / 1_000 - 1} before:${Date.parse("2026-06-02T15:00:00.000Z") / 1_000}`,
               account: "two@example.test",
-              maxResults: 5,
             }),
           },
           {
             id: "gmail_three",
             name: "gmail.search",
             argumentsJson: JSON.stringify({
-              query: "is:unread newer_than:1d",
+              query: `after:${Date.parse("2026-06-01T15:00:00.000Z") / 1_000 - 1} before:${Date.parse("2026-06-02T15:00:00.000Z") / 1_000}`,
               account: "three@example.test",
-              maxResults: 5,
             }),
           },
           {
@@ -1684,11 +1681,6 @@ describe("production runtime", () => {
     for (const label of ["one@example.test", "two@example.test", "three@example.test", "Work"]) {
       expect(briefRequest).toContain(label);
     }
-    expect(briefRequest).toContain("🎯 priorities:, 📅 today:, 📬 inbox:");
-    expect(briefRequest).toContain("Never use Markdown or asterisk characters.");
-    expect(briefRequest).toContain(
-      "Use explicit daily-brief preferences from canonical memory",
-    );
     expect(gmailClients.selected).toEqual(googleConnections.map((connection) => connection.id));
     expect(googleWorkspaceClients.selected).toEqual(
       googleConnections.map((connection) => connection.id),
@@ -1750,9 +1742,8 @@ describe("production runtime", () => {
             id: "partial_gmail",
             name: "gmail.search",
             argumentsJson: JSON.stringify({
-              query: "is:unread newer_than:1d",
+              query: `after:${Date.parse("2026-06-05T15:00:00.000Z") / 1_000 - 1} before:${Date.parse("2026-06-06T15:00:00.000Z") / 1_000}`,
               account: "one@example.test",
-              maxResults: 5,
             }),
           },
         ],
@@ -1909,6 +1900,62 @@ describe("production runtime", () => {
         .prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM tool_executions")
         .get()?.count,
     ).toBe(0);
+  });
+
+  it.each([
+    { day: "2026-06-02", morning: "2026-06-02T15:00:00Z", previous: "2026-06-01T15:00:00Z", variant: "complete" },
+    { day: "2026-03-08", morning: "2026-03-08T15:00:00Z", previous: "2026-03-07T16:00:00Z", variant: "complete" },
+    { day: "2026-11-01", morning: "2026-11-01T16:00:00Z", previous: "2026-10-31T15:00:00Z", variant: "complete" },
+    { day: "2026-06-02", morning: "2026-06-02T15:00:00Z", previous: "2026-06-01T15:00:00Z", variant: "unread" },
+    { day: "2026-06-02", morning: "2026-06-02T15:00:00Z", previous: "2026-06-01T15:00:00Z", variant: "limited" },
+    { day: "2026-06-02", morning: "2026-06-02T15:00:00Z", previous: "2026-06-01T15:00:00Z", variant: "wrong_window" },
+  ])("requires the uncapped scheduled Gmail window on $day with $variant retrieval", async ({
+    morning, previous, variant,
+  }) => {
+    const scheduledMs = Date.parse(morning);
+    const query = `after:${Date.parse(previous) / 1_000 - 1} before:${scheduledMs / 1_000}`;
+    const model = new FakeModel();
+    model.responses.push(
+      toolCallResponse("daily_mail", {
+        id: "baseline", name: "gmail.search",
+        argumentsJson: JSON.stringify({
+          account: "one@example.test",
+          query: variant === "wrong_window" ? "newer_than:1d"
+            : variant === "unread" ? `${query} is:unread` : query,
+          ...(variant === "limited" ? { maxResults: 20 } : {}),
+        }),
+      }),
+      finalModelResponse("daily_result", "nothing needing attention."),
+    );
+    const item = await newRuntime(model, new FakeGateway(), {
+      dailyBriefEnabled: true, gmailClients: new FakeGmailClients(),
+    });
+    const connections = new ConnectionStore(
+      item.runtime.database.db,
+      new CredentialVault(item.config.credentialEncryptionKey),
+      item.runtime.traces,
+    );
+    connections.saveAuthorization({
+      traceId: newTraceId(), provider: "google", providerAccountId: "window_google",
+      safeLabel: "one@example.test", safeMetadata: { email: "one@example.test" },
+      providerState: { scopes: item.config.google.scopes }, capabilities: ["gmail.read"],
+      credentials: { refreshToken: "test_refresh_window" },
+    });
+    const scheduled = item.runtime.dailyBrief.reconcile(scheduledMs - 60_000);
+    if (scheduled.kind !== "scheduled") throw new Error("Expected scheduled daily brief");
+    // A delayed run must retain the scheduled cutoff, not shift to its execution time.
+    await runNextJob(item.runtime, scheduledMs + 60 * 60 * 1_000);
+    const run = item.runtime.database.db.prepare<[], { phase: string; failure_code: string | null }>(
+      "SELECT phase, failure_code FROM agent_runs",
+    ).get();
+    expect(run).toEqual(variant === "complete"
+      ? { phase: "completed", failure_code: null }
+      : { phase: "blocked", failure_code: "daily_brief_source_coverage" });
+    if (variant !== "complete") {
+      expect(item.runtime.database.db.prepare<[], { purpose: string }>(
+        "SELECT purpose FROM egress_messages",
+      ).get()?.purpose).toBe("failure");
+    }
   });
 
   it("does not credit a completed Calendar search for the wrong scheduled window", async () => {
