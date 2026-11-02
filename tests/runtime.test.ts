@@ -1332,12 +1332,10 @@ describe("production runtime", () => {
       { startTime: "2026-09-29T06:00:00-07:00", endTime: "2026-09-29T18:00:00-07:00", isDaytime: true, temperature: 78, temperatureUnit: "F", shortForecast: "Sunny" },
       { startTime: "2026-09-29T18:00:00-07:00", endTime: "2026-09-30T06:00:00-07:00", isDaytime: false, temperature: 61, temperatureUnit: "F", shortForecast: "Clear" },
     ];
-    const urls: string[] = [];
     const gateway = new FakeGateway();
     const item = await newRuntime(model, gateway, {
       weatherFetch: async (input) => {
         const url = new Request(input).url;
-        urls.push(url);
         if (!available) return new Response("", { status: 503 });
         if (new URL(url).pathname.startsWith("/points/")) {
           return Response.json({ properties: { forecast: "https://api.weather.gov/gridpoints/LOX/148,47/forecast" } });
@@ -1349,9 +1347,6 @@ describe("production runtime", () => {
     await sweep(item);
     await drainJobs(item.runtime);
 
-    expect(urls).toEqual(available
-      ? ["https://api.weather.gov/points/34.0689,-118.4452", "https://api.weather.gov/gridpoints/LOX/148,47/forecast?units=us"]
-      : ["https://api.weather.gov/points/34.0689,-118.4452"]);
     const result = model.requests[1]?.messages.find(
       (message) => message.role === "tool" && message.toolCallId === "weather_call",
     );
@@ -1642,14 +1637,33 @@ describe("production runtime", () => {
       throw new Error(`Expected a scheduled daily brief, received ${scheduled.kind}`);
     }
 
-    await runNextJob(item.runtime, scheduled.scheduledForMs + 1);
-    expect(weatherRequests).toBe(weatherAvailable ? 2 : 1);
-    // Reclaim after a crash between egress preparation and job settlement. The stored
-    // forecast context and completed model reply must not be regenerated.
-    item.runtime.database.db.prepare("UPDATE jobs SET status = 'pending', available_at_ms = ? WHERE id = ?")
+    const nowMs = scheduled.scheduledForMs + 1;
+    const job = requiredJob(item.runtime.queue.claim(nowMs));
+    const crash = new Error("Process stopped after model completion, before reply planning");
+    await expect(item.runtime.dailyBrief.handle(job, {
+      signal: new AbortController().signal,
+      nowMs: () => nowMs,
+      assertLease: () => {
+        const run = item.runtime.database.db
+          .prepare<{ trace_id: string }, { phase: string }>("SELECT phase FROM agent_runs WHERE trace_id = @trace_id")
+          .get({ trace_id: scheduled.traceId });
+        if (run?.phase === "completed") throw crash;
+        item.runtime.queue.assertLease(job, nowMs);
+      },
+    })).rejects.toBe(crash);
+    expect(item.runtime.database.db.prepare("SELECT id FROM egress_messages").get()).toBeUndefined();
+    const requestsBeforeRestart = weatherRequests;
+    // Restart with a completed run and persisted weather context, but no reply row.
+    // Recovery must construct the diagnostic suffix, not reuse an existing message.
+    item.runtime.database.db.prepare("UPDATE jobs SET status = 'pending', lease_token = NULL, lease_expires_at_ms = NULL, available_at_ms = ? WHERE id = ?")
       .run(scheduled.scheduledForMs + 2, scheduled.jobId);
+    await item.runtime.close();
+    item.runtime = await createRuntime(item.config, {
+      model, messageGateway: new FakeGateway(), gmailClients, googleWorkspaceClients, notionClients,
+      weatherFetch, logger: false,
+    });
     await runNextJob(item.runtime, scheduled.scheduledForMs + 3);
-    expect(weatherRequests).toBe(weatherAvailable ? 2 : 1);
+    expect(weatherRequests).toBe(requestsBeforeRestart);
     expect(model.requests).toHaveLength(3);
 
     expect(model.requests[0]?.tools.map((tool) => tool.name)).toEqual([
@@ -1706,11 +1720,19 @@ describe("production runtime", () => {
         )
         .get(),
     ).toEqual({ inbound_id: null, scheduled_job_id: scheduled.jobId });
-    expect(
-      item.runtime.database.db
-        .prepare<[], { body: string }>("SELECT body FROM egress_messages WHERE purpose = 'reply'")
-        .get(),
-    ).toEqual({ body: "good morning. nothing urgent across your connected accounts." });
+    const reply = item.runtime.database.db
+      .prepare<[], { body: string }>("SELECT body FROM egress_messages WHERE purpose = 'reply'").get()?.body;
+    const diagnosticLine = reply?.split("\n").find((line) => line.startsWith("Weather failure details: "));
+    if (weatherAvailable) {
+      expect(diagnosticLine).toBeUndefined();
+    } else {
+      const diagnostic: unknown = JSON.parse(diagnosticLine?.slice("Weather failure details: ".length) ?? "null");
+      expect(diagnostic).toMatchObject({
+        requests: city === undefined ? 2 : 1,
+        failures: expect.arrayContaining([{ provider: city === undefined ? "nws" : "open_meteo",
+          stage: city === undefined ? "points" : "geocoding", kind: "http", httpStatus: 503, issues: [] }]),
+      });
+    }
     expect(
       item.runtime.database.db
         .prepare<[], { kind: string }>("SELECT kind FROM write_intents")

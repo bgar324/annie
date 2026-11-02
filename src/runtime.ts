@@ -34,6 +34,7 @@ import { registerSendblueWebhook } from "./messages/webhook.js";
 import { WakeScheduler } from "./messages/wake-scheduler.js";
 import { InboundTurnService } from "./messages/turn.js";
 import { fetchDailyWeather, weatherTool } from "./messages/weather.js";
+import { NwsPointCache } from "./messages/weather-cache.js";
 import {
   MessagingProviderError,
   type MessageGateway,
@@ -206,11 +207,13 @@ export async function createRuntime(
       ...(overrides.todoFetch === undefined ? {} : { fetchImpl: overrides.todoFetch }),
     });
     const todoTools = todo?.tools() ?? [];
+    const weatherPointCache = new NwsPointCache(database.db);
     const agentTools = new ToolRegistry([
       ...providerTools,
       ...connectionTools(connections),
       weatherTool({
         traces,
+        pointCache: weatherPointCache,
         ...(overrides.weatherFetch === undefined ? {} : { fetchImpl: overrides.weatherFetch }),
       }),
       ...todoTools,
@@ -262,6 +265,7 @@ export async function createRuntime(
       queue,
       traces,
       projector,
+      weatherPointCache,
       ...(overrides.weatherFetch === undefined ? {} : { weatherFetch: overrides.weatherFetch }),
       ...(todo === undefined ? {} : { todo }),
     });
@@ -426,6 +430,7 @@ export async function createRuntime(
           const city = readDailyBriefWeatherCity(document);
           const weather = await fetchDailyWeather({
             traceId, traces, signal,
+            pointCache: weatherPointCache,
             ...(city === undefined ? {} : { city }),
             ...(overrides.weatherFetch === undefined ? {} : { fetchImpl: overrides.weatherFetch }),
           });

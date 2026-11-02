@@ -1030,6 +1030,16 @@ const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE write_intents_v14 RENAME TO write_intents;
     `,
   },
+  {
+    version: 15,
+    sql: `
+      CREATE TABLE nws_campus_mapping (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        forecast_url TEXT NOT NULL CHECK (length(forecast_url) <= 200),
+        checked_at_ms INTEGER NOT NULL CHECK (checked_at_ms >= 0)
+      ) STRICT;
+    `,
+  },
 ];
 
 export function runMigrations(

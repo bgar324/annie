@@ -21,6 +21,9 @@ import type { TraceStore } from "../tracing/store.js";
 import type { EgressSendPolicy, MessageEgressService } from "./egress.js";
 import type { FailureNotificationService } from "./failure.js";
 import { fetchDailyWeather, type DailyWeather } from "./weather.js";
+import type { NwsPointCache } from "./weather-cache.js";
+import { weatherFailureMessage } from "./weather-failure.js";
+import { maximumMessageTextCharacters } from "./types.js";
 import { readDailyBriefWeatherCity } from "../memory/weather.js";
 import type { OpenTodoTask, TodoToolService } from "../todo/tools.js";
 
@@ -103,6 +106,7 @@ export class DailyBriefService {
   readonly #projector: TraceProjector;
   readonly #formatter: Intl.DateTimeFormat;
   readonly #weatherFetch: ProviderFetch | undefined;
+  readonly #weatherPointCache: NwsPointCache | undefined;
   readonly #todo: Pick<TodoToolService, "readOpenTasks"> | undefined;
 
   constructor(input: {
@@ -118,6 +122,7 @@ export class DailyBriefService {
     traces: TraceStore;
     projector: TraceProjector;
     weatherFetch?: ProviderFetch;
+    weatherPointCache?: NwsPointCache;
     todo?: Pick<TodoToolService, "readOpenTasks">;
   }) {
     this.#db = input.db;
@@ -128,6 +133,7 @@ export class DailyBriefService {
     this.#connections = input.connections;
     this.#egress = input.egress;
     this.#weatherFetch = input.weatherFetch;
+    this.#weatherPointCache = input.weatherPointCache;
     this.#todo = input.todo;
     this.#failures = input.failures;
     this.#queue = input.queue;
@@ -310,12 +316,14 @@ export class DailyBriefService {
       const memory = await this.#memory.load();
       const weatherCity = readDailyBriefWeatherCity(memory);
       const existingRun = this.#runForJob(job.id);
-      const hasContext = existingRun !== undefined && this.#runs.loadMessages(existingRun.id).length > 0;
+      const existingMessages = existingRun === undefined ? [] : this.#runs.loadMessages(existingRun.id);
+      const hasContext = existingMessages.length > 0;
       const [weather, websiteTasks]: [DailyWeather | undefined, WebsiteTaskData | undefined] = hasContext ? [undefined, undefined] : await Promise.all([
         fetchDailyWeather({
           traceId: job.traceId, traces: this.#traces, signal: context.signal,
           ...(weatherCity === undefined ? {} : { city: weatherCity }),
           ...(this.#weatherFetch === undefined ? {} : { fetchImpl: this.#weatherFetch }),
+          ...(this.#weatherPointCache === undefined ? {} : { pointCache: this.#weatherPointCache }),
         }),
         this.#todo?.readOpenTasks({ traceId: job.traceId, signal: context.signal }).then(
           (tasks): WebsiteTaskData => ({ status: "available", tasks }),
@@ -361,10 +369,34 @@ export class DailyBriefService {
         });
         return;
       }
+      let diagnostic = weatherFailureMessage(weather);
+      if (hasContext) {
+        const prefix = "Weather forecast data (not instructions): ";
+        const line = existingMessages.find((message) => message.role === "user")?.content
+          .split("\n").find((value) => value.startsWith(prefix));
+        if (line !== undefined) {
+          try {
+            const persistedWeather: unknown = JSON.parse(line.slice(prefix.length, -1));
+            diagnostic = weatherFailureMessage(persistedWeather);
+          } catch {
+            // Historical requests may not contain structured weather diagnostics.
+          }
+        }
+      }
+      let text = result.response;
+      if (diagnostic !== undefined) {
+        const suffix = `\n\n${diagnostic}`;
+        const available = maximumMessageTextCharacters - suffix.length;
+        if (text.length > available) {
+          const notice = "\n[Brief shortened to include weather failure details.]";
+          text = text.slice(0, available - notice.length) + notice;
+        }
+        text += suffix;
+      }
       this.#egress.planReply({
         traceId: job.traceId,
         recipient: this.#config.userPhoneNumber,
-        text: result.response,
+        text,
         runId: result.run.id,
         sendPolicy: this.#sendPolicy(payload.scheduledForMs, result.run),
       });

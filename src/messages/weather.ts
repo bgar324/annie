@@ -1,8 +1,11 @@
 import { z } from "zod";
+import { setTimeout as delay } from "node:timers/promises";
 import { parseToolArguments, type RegisteredTool } from "../agent/tools.js";
 import type { TraceId } from "../core/ids.js";
 import { createTracedProviderFetch, type ProviderFetch } from "../providers/fetch.js";
 import type { TraceStore } from "../tracing/store.js";
+import { nwsForecastUrlSchema, type NwsPointCache } from "./weather-cache.js";
+import type { WeatherFailureDetail, WeatherFailureDiagnostics } from "./weather-failure.js";
 
 const citySchema = z.string().max(120).trim().min(1);
 const weatherArgumentsSchema = z.object({ city: citySchema.optional() }).strict();
@@ -51,7 +54,7 @@ const forecastSchema = z.object({
 });
 
 const nwsPointSchema = z.object({ properties: z.object({
-  forecast: z.string().regex(/^https:\/\/api\.weather\.gov\/gridpoints\/[A-Z]{3}\/\d+,\d+\/forecast$/u),
+  forecast: nwsForecastUrlSchema,
 }) });
 const nwsForecastSchema = z.object({ properties: z.object({
   periods: z.array(z.object({
@@ -66,9 +69,16 @@ const nwsForecastSchema = z.object({ properties: z.object({
 
 export type DailyWeather = { location: string } & (
   | { timeZone: string; days: Array<{ date: string; highF: number | null; lowF: number | null; condition: string }> }
-  | { error: "weather_unavailable" | "location_not_found" }
+  | { error: "weather_unavailable"; diagnostics: WeatherFailureDiagnostics }
+  | { error: "location_not_found" }
   | { error: "location_ambiguous"; candidates: string[] }
 );
+
+class WeatherReadError extends Error {
+  constructor(readonly failure: WeatherFailureDetail, readonly retryDelayMs = 250) {
+    super(failure.kind);
+  }
+}
 
 /** Shared forecast reader for scheduled briefs and the inbound weather tool. */
 export async function fetchDailyWeather(input: {
@@ -77,6 +87,7 @@ export async function fetchDailyWeather(input: {
   signal: AbortSignal;
   city?: string;
   fetchImpl?: ProviderFetch;
+  pointCache?: NwsPointCache;
 }): Promise<DailyWeather> {
   input.signal.throwIfAborted();
   const city = input.city === undefined ? undefined : citySchema.parse(input.city);
@@ -86,26 +97,85 @@ export async function fetchDailyWeather(input: {
     "ucla, los angeles", "ucla los angeles",
   ].includes(normalizedCity);
   let location = isCampus ? "Westwood, Los Angeles" : city ?? "Westwood, Los Angeles";
-  const signal = AbortSignal.any([input.signal, AbortSignal.timeout(5_000)]);
+  const startedAt = Date.now();
+  const budgetMs = isCampus ? 12_000 : 5_000;
+  const deadlineAt = startedAt + budgetMs;
+  const signal = AbortSignal.any([input.signal, AbortSignal.timeout(budgetMs)]);
+  const provider = isCampus ? "nws" : "open_meteo";
+  let stage: WeatherFailureDetail["stage"] = isCampus ? "points" : "geocoding";
+  let httpStatus: number | null = null;
+  let requests = 0;
+  const failures: WeatherFailureDetail[] = [];
   const fetchWeather = createTracedProviderFetch({
-    traceId: input.traceId, traces: input.traces, component: "daily_weather", timeoutMs: 5_000,
+    traceId: input.traceId, traces: input.traces, component: "daily_weather", timeoutMs: budgetMs,
     ...(input.fetchImpl === undefined ? {} : { fetchImpl: input.fetchImpl }),
   });
-  const get = async (url: URL) => {
-    signal.throwIfAborted();
-    const response = await fetchWeather(url, {
-      signal, redirect: "error",
-      headers: { "User-Agent": "Annie (https://github.com/bgar324/annie)", Accept: "application/json" },
-    });
-    if (!response.ok) throw new Error(`Weather HTTP ${response.status}`);
-    const body: unknown = await response.json();
-    signal.throwIfAborted();
-    return body;
+  const get = async (url: URL, requestStage: WeatherFailureDetail["stage"]) => {
+    stage = requestStage;
+    const maximumAttempts = isCampus ? 2 : 1;
+    for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+      input.signal.throwIfAborted();
+      httpStatus = null;
+      const attemptSignal = AbortSignal.any([signal, AbortSignal.timeout(isCampus ? 4_000 : budgetMs)]);
+      try {
+        attemptSignal.throwIfAborted();
+        requests += 1;
+        const response = await fetchWeather(url, {
+          signal: attemptSignal, redirect: "error",
+          headers: { "User-Agent": "Annie (https://github.com/bgar324/annie)", Accept: "application/json" },
+        });
+        httpStatus = response.status;
+        if (!response.ok) {
+          const retryAfter = response.headers.get("retry-after");
+          const seconds = retryAfter === null ? NaN : Number(retryAfter);
+          const retryDelayMs = retryAfter === null ? 250 : Math.max(250,
+            Number.isFinite(seconds) ? seconds * 1_000 : Date.parse(retryAfter) - Date.now());
+          throw new WeatherReadError({ provider, stage, kind: "http", httpStatus, issues: [] },
+            Number.isFinite(retryDelayMs) ? retryDelayMs : 250);
+        }
+        const body: unknown = await response.json();
+        attemptSignal.throwIfAborted();
+        return body;
+      } catch (error) {
+        input.signal.throwIfAborted();
+        const failure = error instanceof WeatherReadError ? error : new WeatherReadError({
+          provider, stage, httpStatus, issues: [],
+          kind: attemptSignal.aborted ? "timeout" : error instanceof SyntaxError ? "invalid_response" : "network",
+        });
+        failures.push(failure.failure);
+        const status = failure.failure.httpStatus;
+        const retryable = failure.failure.kind === "network" || failure.failure.kind === "timeout"
+          || failure.failure.kind === "http" && status !== null && (status === 408 || status === 429 || status >= 500);
+        if (!retryable || attempt === maximumAttempts || signal.aborted
+          || deadlineAt - Date.now() <= failure.retryDelayMs) throw failure;
+        await delay(failure.retryDelayMs, undefined, { signal });
+      }
+    }
+    throw new Error("Weather request attempts exhausted");
   };
   try {
-    if (isCampus || city === undefined) {
-      const point = nwsPointSchema.parse(await get(new URL("https://api.weather.gov/points/34.0689,-118.4452")));
-      const forecast = nwsForecastSchema.parse(await get(new URL(`${point.properties.forecast}?units=us`)));
+    if (isCampus) {
+      let forecastUrl = input.pointCache?.read(Date.now());
+      const cachedMapping = forecastUrl !== undefined;
+      const resolvePoint = async () => {
+        const point = nwsPointSchema.parse(await get(new URL("https://api.weather.gov/points/34.0689,-118.4452"), "points"));
+        input.signal.throwIfAborted();
+        input.pointCache?.write(point.properties.forecast, Date.now());
+        return point.properties.forecast;
+      };
+      forecastUrl ??= await resolvePoint();
+      let forecastBody: unknown;
+      try {
+        forecastBody = await get(new URL(`${forecastUrl}?units=us`), "forecast");
+      } catch (error) {
+        // A grid can move before the periodic refresh. Re-resolve once, never use stale forecast data.
+        if (!cachedMapping || !(error instanceof WeatherReadError)
+          || (error.failure.httpStatus !== 404 && error.failure.httpStatus !== 410)) throw error;
+        input.pointCache?.clear();
+        forecastUrl = await resolvePoint();
+        forecastBody = await get(new URL(`${forecastUrl}?units=us`), "forecast");
+      }
+      const forecast = nwsForecastSchema.parse(forecastBody);
       const timeZone = "America/Los_Angeles";
       const localDate = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" });
       const days = new Map<string, Extract<DailyWeather, { days: unknown }>["days"][number]>();
@@ -124,8 +194,8 @@ export async function fetchDailyWeather(input: {
       return { location, timeZone, days: [...days.values()] };
     }
     const searchUrl = new URL("https://geocoding-api.open-meteo.com/v1/search");
-    searchUrl.search = new URLSearchParams({ name: city, count: "10", language: "en", format: "json" }).toString();
-    const { results } = geocodingSchema.parse(await get(searchUrl));
+    searchUrl.search = new URLSearchParams({ name: city ?? "", count: "10", language: "en", format: "json" }).toString();
+    const { results } = geocodingSchema.parse(await get(searchUrl, "geocoding"));
     if (results.length === 0) return { location, error: "location_not_found" };
     // Send qualifiers unchanged to the provider. Prefer the requested city over prefix matches.
     const exact = results.filter((result) => {
@@ -150,7 +220,7 @@ export async function fetchDailyWeather(input: {
       temperature_unit: "fahrenheit", forecast_days: "7",
       daily: "weather_code,temperature_2m_max,temperature_2m_min",
     }).toString();
-    const forecast = forecastSchema.parse(await get(forecastUrl));
+    const forecast = forecastSchema.parse(await get(forecastUrl, "forecast"));
     const { daily } = forecast;
     if ([daily.temperature_2m_max, daily.temperature_2m_min, daily.weather_code]
       .some((values) => values.length !== daily.time.length)) {
@@ -171,14 +241,22 @@ export async function fetchDailyWeather(input: {
     return { location, timeZone: forecast.timezone, days };
   } catch (error) {
     input.signal.throwIfAborted();
-    input.traces.append({ traceId: input.traceId, component: "daily_weather", event: "forecast", outcome: "unavailable", data: { error: error instanceof Error ? error.name : "UnknownError" } });
-    return { location, error: "weather_unavailable" };
+    if (!(error instanceof WeatherReadError)) failures.push({
+      provider, stage, httpStatus, kind: signal.aborted ? "timeout" : "invalid_response",
+      issues: error instanceof z.ZodError ? error.issues.slice(0, 3).map((issue) => ({
+        path: issue.path.join(".").slice(0, 96), code: issue.code,
+      })) : [],
+    });
+    const diagnostics = { elapsedMs: Date.now() - startedAt, requests, failures };
+    input.traces.append({ traceId: input.traceId, component: "daily_weather", event: "forecast", outcome: "unavailable", data: diagnostics });
+    return { location, error: "weather_unavailable", diagnostics };
   }
 }
 
 export function weatherTool(input: {
   traces: TraceStore;
   fetchImpl?: ProviderFetch;
+  pointCache?: NwsPointCache;
 }): RegisteredTool {
   return {
     definition: {
@@ -201,9 +279,10 @@ export function weatherTool(input: {
       return fetchDailyWeather({
         traceId: context.traceId,
         traces: input.traces,
-        signal: context.signal ?? AbortSignal.timeout(5_000),
+        signal: context.signal ?? AbortSignal.timeout(12_000),
         ...(city === undefined ? {} : { city }),
         ...(input.fetchImpl === undefined ? {} : { fetchImpl: input.fetchImpl }),
+        ...(input.pointCache === undefined ? {} : { pointCache: input.pointCache }),
       });
     },
   };

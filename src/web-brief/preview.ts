@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { DailyWeather } from "../messages/weather.js";
+import { weatherFailureDiagnosticsSchema } from "../messages/weather-failure.js";
 import { digest } from "./store.js";
 
 const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).refine((value) => {
@@ -39,7 +39,10 @@ export const previewWeatherSchema = z.union([
   z.object({ location: z.string().max(512), timeZone: z.string().max(128), days: z.array(z.object({
     date, highF: z.number().finite().nullable(), lowF: z.number().finite().nullable(), condition: z.string().max(2_048),
   }).strict()).max(16) }).strict(),
-  z.object({ location: z.string().max(512), error: z.enum(["weather_unavailable", "location_not_found"]) }).strict(),
+  z.object({
+    location: z.string().max(512), error: z.enum(["weather_unavailable", "location_not_found"]),
+    diagnostics: weatherFailureDiagnosticsSchema.optional(),
+  }).strict(),
   z.object({ location: z.string().max(512), error: z.literal("location_ambiguous"), candidates: z.array(z.string().max(512)).max(32) }).strict(),
 ]);
 export interface PreviewArtifact {
@@ -47,7 +50,7 @@ export interface PreviewArtifact {
   date: string;
   generatedAt: string;
   timeZone: "America/Los_Angeles";
-  weather: DailyWeather;
+  weather: z.infer<typeof previewWeatherSchema>;
   calendar: { id: string; title: string; start: string | null; end: string | null; allDay: boolean; location: string | null }[];
   todos: (Omit<z.infer<typeof previewDraftSchema>["todos"][number], "references"> & {
     id: string; links: { url: string; label: string }[];
