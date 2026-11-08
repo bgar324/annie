@@ -1402,7 +1402,7 @@ describe("production runtime", () => {
         { id: "stale_page", title: "Finish CS161 and winter courses" },
       ]);
       const requests: Request[] = [];
-      const openTask = { title: "Read course announcement", notes: "", dueDate: null, priority: "medium" };
+      const openTask = { title: "Read course announcement", notes: "", dueDate: null };
       const item = await newRuntime(model, new FakeGateway(), {
         dailyBriefEnabled: true,
         notionClients,

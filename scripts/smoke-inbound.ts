@@ -339,7 +339,7 @@ async function runCase(smokeCase: SmokeCase, iteration: number): Promise<CaseRes
             : {
                 status: "available",
                 tasks: todo.tasks.filter((task) => task.completedAt === null)
-                  .map(({ title, notes, dueDate, priority }) => ({ title, notes, dueDate, priority })),
+                  .map(({ title, notes, dueDate }) => ({ title, notes, dueDate })),
               };
           assert.deepEqual(JSON.parse(data.slice(prefix.length)), expected,
             "Only normalized open tasks, never completed records, reach the daily request");

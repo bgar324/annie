@@ -119,7 +119,6 @@ interface SyntheticTodo {
   title: string;
   notes: string;
   dueDate: string | null;
-  priority: "low" | "medium" | "high";
   completedAt: string | null;
   position: number;
   revision: number;
@@ -145,21 +144,21 @@ export function syntheticTodo(token: string, options: TodoOptions = {}): TodoWor
   const tasks: SyntheticTodo[] = (options.noOpenTasks === true ? [] : options.openTitles ?? ["Buy tea"]).map(
     (title, index) => ({
       id: `09ce4aaa-5e5b-4569-a9e0-${String(index + 1).padStart(12, "0")}`, title, notes: "",
-      dueDate: isoDate(0), priority: "medium", completedAt: null, position: index,
+      dueDate: isoDate(0), completedAt: null, position: index,
       revision: 1, createdAt: now, updatedAt: now,
     }),
   );
   if (options.completedTitle !== undefined) {
     tasks.push({
       id: "f1b72da1-169b-4557-b23a-fdab8b3b9bfb", title: options.completedTitle, notes: "",
-      dueDate: isoDate(-1), priority: "medium", completedAt: new Date(Date.now() - day).toISOString(), position: 1,
+      dueDate: isoDate(-1), completedAt: new Date(Date.now() - day).toISOString(), position: 1,
       revision: 2, createdAt: now, updatedAt: now,
     });
   }
   const calls: string[] = [];
   const create = z.object({
     title: z.string().min(1), notes: z.string().optional(),
-    dueDate: z.iso.date().nullable().optional(), priority: z.enum(["low", "medium", "high"]).optional(),
+    dueDate: z.iso.date().nullable().optional(),
   }).strict();
   return {
     tasks, calls,
@@ -198,7 +197,7 @@ export function syntheticTodo(token: string, options: TodoOptions = {}): TodoWor
       const args = create.parse(await request.json());
       const task: SyntheticTodo = {
         id: "cfc85dde-ae18-44e3-8e8d-6c3703890b64", title: args.title, notes: args.notes ?? "",
-        dueDate: args.dueDate ?? null, priority: args.priority ?? "medium", completedAt: null,
+        dueDate: args.dueDate ?? null, completedAt: null,
         position: tasks.length, revision: 1, createdAt: now, updatedAt: now,
       };
       tasks.push(task);

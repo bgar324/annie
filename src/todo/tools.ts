@@ -10,12 +10,10 @@ import type { TodoConfig } from "./config.js";
 
 const dateSchema = z.iso.date();
 const revisionSchema = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
-const prioritySchema = z.enum(["low", "medium", "high"]);
 const fields = {
   title: z.string().trim().min(1).max(300),
   notes: z.string().max(5_000),
   dueDate: dateSchema.nullable(),
-  priority: prioritySchema,
 };
 const target = { id: z.uuid(), expectedRevision: revisionSchema };
 const listSchema = z.object({
@@ -23,12 +21,12 @@ const listSchema = z.object({
   status: z.enum(["open", "completed", "all"]).optional(),
 }).strict();
 const createSchema = z.object({
-  title: fields.title, notes: fields.notes.optional(), dueDate: fields.dueDate.optional(), priority: fields.priority.optional(),
+  title: fields.title, notes: fields.notes.optional(), dueDate: fields.dueDate.optional(),
 }).strict();
 const updateSchema = z.object({
   ...target, title: fields.title.optional(), notes: fields.notes.optional(),
-  dueDate: fields.dueDate.optional(), priority: fields.priority.optional(),
-}).strict().refine((value) => [value.title, value.notes, value.dueDate, value.priority].some((field) => field !== undefined), {
+  dueDate: fields.dueDate.optional(),
+}).strict().refine((value) => [value.title, value.notes, value.dueDate].some((field) => field !== undefined), {
   message: "Supply at least one field to update",
 });
 const completeSchema = z.object({ ...target, completed: z.boolean() }).strict();
@@ -50,7 +48,7 @@ const manySchema = z.object({ todos: z.array(todoSchema).max(5_000) });
 const deletedSchema = z.object({ deleted: z.literal(true) });
 const maximumResponseBytes = 1_048_576;
 
-export type OpenTodoTask = Pick<z.infer<typeof todoSchema>, "title" | "notes" | "dueDate" | "priority">;
+export type OpenTodoTask = Pick<z.infer<typeof todoSchema>, "title" | "notes" | "dueDate">;
 
 export const todoToolNames = [
   "todo.list", "todo.create", "todo.update", "todo.complete", "todo.delete", "todo.reorder",
@@ -85,7 +83,7 @@ export class TodoToolService {
         if (args.status !== undefined) query.set("status", args.status);
         return this.#read({ method: "GET", path: `/api/todos?${query}` }, manySchema, context);
       }),
-      this.#tool("todo.create", "Create one task in the user's simple-to-do website only when requested. title required; optional notes, priority low/medium/high, dueDate YYYY-MM-DD or null for unscheduled. No automatic retries after a write failure.", createSchema, "write", (args, context) =>
+      this.#tool("todo.create", "Create one task in the user's simple-to-do website only when requested. title required; optional notes, dueDate YYYY-MM-DD or null for unscheduled. No automatic retries after a write failure.", createSchema, "write", (args, context) =>
         this.#write({ method: "POST", path: "/api/todos", body: args }, oneSchema, context)),
       this.#tool("todo.update", "Edit only user-requested fields of one simple-to-do task. Use id and expectedRevision from todo.list; ask which task if ambiguous. dueDate:null unschedules. A conflict requires a fresh read and user clarification, not an automatic retry.", updateSchema, "write", ({ id, ...body }, context) =>
         this.#write({ method: "PATCH", path: `/api/todos/${id}`, body }, oneSchema, context)),
@@ -102,7 +100,7 @@ export class TodoToolService {
     const result = await this.#read({ method: "GET", path: "/api/todos?status=open" }, manySchema, input);
     return result.todos
       .filter((task) => task.completedAt === null)
-      .map(({ title, notes, dueDate, priority }) => ({ title, notes, dueDate, priority }));
+      .map(({ title, notes, dueDate }) => ({ title, notes, dueDate }));
   }
 
   #tool<T extends z.ZodType>(

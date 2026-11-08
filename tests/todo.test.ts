@@ -14,7 +14,7 @@ import { createTestDatabase, type TestDatabase } from "./helpers.js";
 const token = "synthetic-todo-token-never-for-model";
 const todo = {
   id: "df87b1e1-6540-4f37-adfe-606213cc278a", title: "Buy tea", notes: "Loose leaf",
-  dueDate: "2026-10-29", priority: "medium", completedAt: null, position: 0, revision: 1,
+  dueDate: "2026-10-29", completedAt: null, position: 0, revision: 1,
   createdAt: "2026-10-29T12:00:00.000Z", updatedAt: "2026-10-29T12:00:00.000Z",
 };
 const databases: TestDatabase[] = [];
@@ -100,6 +100,17 @@ describe("simple-to-do tool boundary", () => {
     expect(item.states()).toEqual([]);
   });
 
+  it.each([undefined, "high"])("accepts task responses and strips legacy priority %s", async (priority) => {
+    const responseTodo = priority === undefined ? todo : { ...todo, priority };
+    const item = harness(async () => Response.json({ todos: [responseTodo], todo: responseTodo }));
+    expect(await item.call("todo.list", {})).toEqual({ todos: [todo] });
+    expect(await item.call("todo.create", { title: todo.title }))
+      .toEqual({ ok: true, result: { todo } });
+    expect(await item.call("todo.update", { id: todo.id, expectedRevision: 1, notes: "New notes" }))
+      .toEqual({ ok: true, result: { todo } });
+    expect(item.states()).toEqual(["succeeded", "succeeded"]);
+  });
+
   it("records dispatch durably before the provider can accept a mutation", async () => {
     const item = harness(async () => {
       expect(item.states()).toEqual(["attempting"]);
@@ -120,6 +131,8 @@ describe("simple-to-do tool boundary", () => {
     { name: "todo.update", args: { id: todo.id, expectedRevision: 1 } },
     { name: "todo.create", args: { title: " " } },
     { name: "todo.create", args: { title: "Tea", dueDate: "2026-02-30" } },
+    { name: "todo.create", args: { title: "Tea", priority: "high" } },
+    { name: "todo.update", args: { id: todo.id, expectedRevision: 1, title: "Tea", priority: "high" } },
     { name: "todo.reorder", args: { dueDate: null, items: [{ id: todo.id, revision: 1 }] } },
     { name: "todo.reorder", args: { dueDate: null, items: [{ id: todo.id, revision: 1 }, { id: todo.id, revision: 1 }], confirmed: true } },
   ])("rejects unsafe $name arguments before intent or request", async ({ name, args }) => {
