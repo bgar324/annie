@@ -614,6 +614,37 @@ export const cases: readonly SmokeCase[] = [
     },
   },
   {
+    name: "gmail_pdf_reimbursement", category: "google_read",
+    texts: ["How does the reimbursement process work for my onsite?"],
+    google: { mailboxScenario: "pdf_reimbursement" },
+    expect(o) {
+      noProviderWrite(o); answeredInText(o);
+      assert(o.tools.some((tool) => tool.tool_name === "gmail.search" && tool.status === "succeeded"),
+        "Find the onsite reimbursement email before selecting its PDF");
+      assert(o.google.calls.includes("gmail.thread:t_costar_onsite"),
+        "Read the source thread, not just its search metadata");
+      assert(o.google.calls.includes("gmail.attachment:m_costar_onsite:a_travel_policy"),
+        "Fetch actual PDF bytes through the Gmail attachment API");
+      const extracted = o.runtime.database.db.prepare<[], { text: string }>(`
+        SELECT json_extract(result_json, '$.attachment.text') AS text
+        FROM tool_executions
+        WHERE tool_name = 'gmail.read_thread' AND status = 'succeeded'
+          AND json_extract(arguments_json, '$.attachment.messageId') = 'm_costar_onsite'
+          AND json_extract(arguments_json, '$.attachment.filename') = 'Travel and Expense Policy.pdf'
+          AND json_extract(result_json, '$.attachment.status') = 'read'
+      `).get();
+      assert(extracted !== undefined, "The model must opt into the exact message and filename through gmail.read_thread");
+      assert.match(extracted.text, /candidate-expenses\.example\.test/u,
+        "The production PDF parser must return the portal that appears only in the PDF");
+      assert.match(extracted.text, /within 14 days of your onsite/iu);
+      assert.match(lastReply(o), /candidate-expenses\.example\.test/iu, "Answer with the PDF's exact submission portal");
+      assert.match(lastReply(o), /itemi[sz]ed\s+receipts/iu, "Explain what to submit");
+      assert.match(lastReply(o),
+        /\b(?:within\s+(?:14|fourteen)\s+(?:calendar\s+)?days(?:\s+of)?|(?:14|fourteen)\s+(?:calendar\s+)?days\s+(?:after|following|from))\s+(?:(?:your|the)\s+)?(?:onsite|on-site|interview)/iu,
+        "Answer with the PDF's exact deadline, measured from the onsite");
+    },
+  },
+  {
     name: "calendar_today", category: "google_read",
     texts: ["what's on my calendar today?"],
     expect(o) {

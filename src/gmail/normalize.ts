@@ -147,6 +147,41 @@ export function normalizeGmailMetadata(data: unknown): NormalizedGmailMessage {
   };
 }
 
+export function findGmailAttachment(
+  data: unknown,
+  selector: { threadId: string; messageId: string; filename: string },
+): GmailPart | null {
+  const thread = threadSchema.parse(data);
+  if (thread.id !== selector.threadId) {
+    return null;
+  }
+  const messages = (thread.messages ?? []).filter((message) => message.id === selector.messageId);
+  if (messages.length !== 1) {
+    return null;
+  }
+  const payload = messages[0]?.payload;
+  const stack = payload === undefined ? [] : [{ part: payload, depth: 0 }];
+  const matches: GmailPart[] = [];
+  let visited = 0;
+  while (stack.length > 0) {
+    const next = stack.pop();
+    if (next === undefined) {
+      break;
+    }
+    visited += 1;
+    if (visited > 100 || next.depth > 8 || (next.part.parts?.length ?? 0) > 100) {
+      return null;
+    }
+    if (next.part.filename === selector.filename) {
+      matches.push(next.part);
+    }
+    for (const child of next.part.parts ?? []) {
+      stack.push({ part: child, depth: next.depth + 1 });
+    }
+  }
+  return matches.length === 1 ? matches[0] ?? null : null;
+}
+
 export function normalizeGmailThread(
   data: unknown,
   bounds: GmailThreadBounds = fullGmailThreadBounds,

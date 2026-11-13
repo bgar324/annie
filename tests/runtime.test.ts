@@ -133,6 +133,9 @@ class FakeGmailClients implements GmailClientProvider {
       getThread: async () => {
         throw new Error("Daily brief should not read an absent Gmail thread");
       },
+      getAttachment: async () => {
+        throw new Error("Daily brief should not read an absent Gmail attachment");
+      },
     };
   }
 }

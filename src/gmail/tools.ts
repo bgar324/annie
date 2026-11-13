@@ -7,8 +7,10 @@ import type { ConnectionCapability, ConnectionRecord } from "../connections/type
 import { ModelSafeError } from "../core/errors.js";
 import type { ToolExecutionId, TraceId } from "../core/ids.js";
 import type { TraceStore } from "../tracing/store.js";
-import type { GmailClientProvider, GmailProviderResponse } from "./client.js";
+import type { GmailApi, GmailClientProvider, GmailProviderResponse } from "./client.js";
 import {
+  findGmailAttachment,
+  fullGmailThreadBounds,
   hydratedGmailThreadBounds,
   normalizeGmailMetadata,
   normalizeGmailThread,
@@ -16,6 +18,8 @@ import {
   type NormalizedGmailMessage,
   type NormalizedGmailThread,
 } from "./normalize.js";
+import { extractPdfText } from "./pdf.js";
+import { PDF_MAX_BYTES } from "./pdf-protocol.js";
 
 const accountSchema = z.string().trim().min(1).max(160).optional();
 const searchArgumentsSchema = z
@@ -30,6 +34,10 @@ const readThreadArgumentsSchema = z
   .object({
     threadId: z.string().min(1).max(256),
     account: accountSchema,
+    attachment: z.object({
+      messageId: z.string().min(1).max(512),
+      filename: z.string().min(1).max(256),
+    }).strict().optional(),
   })
   .strict();
 const maximumSearchResultBytes = 120 * 1_024;
@@ -107,12 +115,21 @@ export class GmailToolService {
       {
         definition: {
           name: "gmail.read_thread",
-          description: "Read a bounded, normalized Gmail thread from the source account returned by gmail.search.",
+          description: "Read a bounded Gmail thread from the source account. To read a PDF listed in that thread or search hydration, set attachment to its exact message id and filename. Returns extracted text, truncation, or an explicit limitation; no OCR for scanned pages.",
           parameters: {
             type: "object",
             properties: {
               threadId: { type: "string", minLength: 1, maxLength: 256 },
               account: { type: "string", minLength: 1, maxLength: 160 },
+              attachment: {
+                type: "object",
+                properties: {
+                  messageId: { type: "string", minLength: 1, maxLength: 512 },
+                  filename: { type: "string", minLength: 1, maxLength: 256 },
+                },
+                required: ["messageId", "filename"],
+                additionalProperties: false,
+              },
             },
             required: ["threadId"],
             additionalProperties: false,
@@ -268,12 +285,97 @@ export class GmailToolService {
         ...(context.signal === undefined ? {} : { signal: context.signal }),
       }),
     );
-    const thread = normalizeGmailThread(response.data);
+    // Reserve room for 32 KiB of PDF text, including worst-case JSON escaping, under
+    // the agent's 128 KiB per-result cap. Ordinary thread reads retain their full bounds.
+    const thread = normalizeGmailThread(response.data, input.attachment === undefined
+      ? fullGmailThreadBounds
+      : { ...fullGmailThreadBounds, maximumThreadBytes: 48 * 1_024, maximumBodyBytes: 32 * 1_024 });
     this.#markHealthy(connection, context.traceId);
     return {
       account: { label: connection.safeLabel },
       thread,
+      ...(input.attachment === undefined ? {} : {
+        attachment: await this.#readPdfAttachment(
+          response.data, { threadId: input.threadId, ...input.attachment }, api, connection, context,
+        ),
+      }),
     };
+  }
+
+  async #readPdfAttachment(
+    threadData: unknown,
+    selector: { threadId: string; messageId: string; filename: string },
+    api: GmailApi,
+    connection: ConnectionRecord,
+    context: ToolExecutionContext,
+  ) {
+    const identity = { messageId: selector.messageId, filename: selector.filename };
+    const part = findGmailAttachment(threadData, selector);
+    if (part === null) {
+      return {
+        ...identity, status: "unavailable", reason: "attachment_not_found",
+        message: "No unique attachment with that exact filename exists in the selected message and thread.",
+      };
+    }
+    const mimeType = (part.mimeType ?? "").toLowerCase();
+    if (mimeType !== "application/pdf" &&
+        !(mimeType === "application/octet-stream" && /\.pdf$/iu.test(selector.filename))) {
+      return {
+        ...identity, status: "unavailable", reason: "unsupported_type",
+        message: "Only PDF attachments can be read.",
+      };
+    }
+    if ((part.body?.size ?? 0) > PDF_MAX_BYTES) {
+      return {
+        ...identity, status: "unavailable", reason: "too_large",
+        message: "PDF attachments must be no larger than 5 MiB.",
+      };
+    }
+    let body: unknown = part.body;
+    const attachmentId = part.body?.attachmentId;
+    if (part.body?.data === undefined && attachmentId !== undefined) {
+      const response = await this.#readRequest("messages.attachments.get", connection, context, () =>
+        api.getAttachment({
+          messageId: selector.messageId,
+          attachmentId,
+          ...(context.signal === undefined ? {} : { signal: context.signal }),
+        }),
+      );
+      body = response.data;
+    }
+    const parsed = z.object({
+      size: z.number().int().nonnegative().optional(),
+      data: z.string(),
+    }).safeParse(body);
+    if (!parsed.success || !/^[A-Za-z0-9_-]*={0,2}$/u.test(parsed.data.data)) {
+      return {
+        ...identity, status: "unavailable", reason: "invalid_data",
+        message: "Gmail returned invalid attachment data; its contents were not read.",
+      };
+    }
+    if ((parsed.data.size ?? 0) > PDF_MAX_BYTES ||
+        parsed.data.data.length > Math.ceil(PDF_MAX_BYTES / 3) * 4) {
+      return {
+        ...identity, status: "unavailable", reason: "too_large",
+        message: "PDF attachments must be no larger than 5 MiB.",
+      };
+    }
+    const bytes = Buffer.from(parsed.data.data, "base64url");
+    if (bytes.length > PDF_MAX_BYTES) {
+      return {
+        ...identity, status: "unavailable", reason: "too_large",
+        message: "PDF attachments must be no larger than 5 MiB.",
+      };
+    }
+    if ((parsed.data.size !== undefined && parsed.data.size !== bytes.length) ||
+        (part.body?.size !== undefined && part.body.size !== bytes.length)) {
+      return {
+        ...identity, status: "unavailable", reason: "invalid_data",
+        message: "The attachment size did not match Gmail's metadata; its contents were not read.",
+      };
+    }
+    context.signal?.throwIfAborted();
+    return { ...identity, mimeType: "application/pdf", ...await extractPdfText(bytes, context.signal) };
   }
 
   async #hydrateThreads(

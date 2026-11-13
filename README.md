@@ -9,6 +9,7 @@ This is deliberately not a general-purpose bot framework. It is built around one
 ## What Annie can do
 
 - Read Gmail, calendars, Drive, contacts, and tasks from connected Google accounts.
+- Read text from selected Gmail PDF attachments, without downloading unrelated attachments.
 - Search and fetch content from connected Notion workspaces.
 - Create one Notion page or narrowly update a Notion page when the current request authorizes the write.
 - Connect multiple Google accounts and a Notion workspace through signed OAuth links.
@@ -19,6 +20,8 @@ This is deliberately not a general-purpose bot framework. It is built around one
 - Optionally list and edit the same tasks as a separate simple-to-do website through six narrow inbound tools.
 
 Gmail and Google Workspace are read-only. The optional simple-to-do adapter can delete an identified task only with explicit user authorization. Annie cannot archive, move, or invoke arbitrary provider methods.
+
+PDF reading supports Gmail attachments up to 5 MiB and 40 pages, with up to 32 KiB of extracted text. Annie reports truncation and pages without extractable text. Scanned pages need OCR, which is not supported; encrypted PDFs and parser-recovered corrupt content are reported as unreadable. This does not add PDF support to Drive or incoming iMessage attachments.
 
 ## Safety model
 

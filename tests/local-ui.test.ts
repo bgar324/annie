@@ -233,7 +233,8 @@ describe("loopback local UI", () => {
       .prepare<[], { outcome: string; redacted_json: string }>(`
         SELECT outcome, redacted_json FROM trace_event_spool
         WHERE component = 'memory' AND event = 'manual_edit'
-        ORDER BY occurred_at_ms, sequence
+        -- Sequence is per trace; rowid preserves insertion order across the two edits.
+        ORDER BY rowid
       `)
       .all();
     expect(events.map((event) => event.outcome)).toEqual([

@@ -8,6 +8,7 @@ import type { GoogleWorkspaceApi, GoogleWorkspaceClientProvider } from "../../sr
 import type { NotionClientProvider } from "../../src/notion/client.js";
 import type { AssistantRuntime } from "../../src/runtime.js";
 import type { ProviderFetch } from "../../src/providers/fetch.js";
+import { createPdf } from "../../tests/fixtures/pdf.js";
 
 export const line = "+15550000001";
 export const user = "+15550000002";
@@ -212,7 +213,7 @@ export function syntheticTodo(token: string, options: TodoOptions = {}): TodoWor
 export interface GoogleOptions {
   gmailFails?: boolean;
   inboxSize?: number;
-  mailboxScenario?: "brief_late_actions" | "brief_byte_budget";
+  mailboxScenario?: "brief_late_actions" | "brief_byte_budget" | "pdf_reimbursement";
 }
 
 export interface GoogleWorld {
@@ -230,6 +231,7 @@ interface Mail {
   ageMs: number;
   unread: boolean;
   folder?: "SPAM" | "TRASH";
+  attachment?: { id: string; filename: string; bytes: Uint8Array };
 }
 
 const base64url = (text: string): string => Buffer.from(text, "utf8").toString("base64url");
@@ -318,6 +320,24 @@ function budgetMailbox(nowMs: number): Mail[] {
   }];
 }
 
+function reimbursementMailbox(): Mail[] {
+  return [{
+    id: "m_costar_onsite", threadId: "t_costar_onsite",
+    from: "CoStar Recruiting <recruiting@costar.example.test>",
+    subject: "CoStar onsite interview travel reimbursement policy",
+    body: "For your CoStar onsite interview travel reimbursement process, please read the attached Travel and Expense Policy.pdf.",
+    ageMs: 2 * 3_600_000, unread: false,
+    attachment: {
+      id: "a_travel_policy", filename: "Travel and Expense Policy.pdf",
+      bytes: createPdf([[
+        "Travel and Expense Policy",
+        "Submit itemized receipts to candidate-expenses.example.test",
+        "within 14 days of your onsite.",
+      ]]),
+    },
+  }];
+}
+
 function gmailMessage(mail: Mail, format: "metadata" | "full", nowMs: number): Record<string, unknown> {
   const sentAt = new Date(nowMs - mail.ageMs);
   return {
@@ -325,13 +345,21 @@ function gmailMessage(mail: Mail, format: "metadata" | "full", nowMs: number): R
     internalDate: String(sentAt.getTime()),
     labelIds: [mail.folder ?? "INBOX", ...(mail.unread ? ["UNREAD"] : [])],
     payload: {
-      mimeType: "text/plain",
+      mimeType: mail.attachment === undefined ? "text/plain" : "multipart/mixed",
       headers: [
         { name: "From", value: mail.from }, { name: "To", value: "ben@example.test" },
         { name: "Subject", value: mail.subject }, { name: "Date", value: sentAt.toUTCString() },
         { name: "Message-ID", value: `<${mail.id}@example.test>` },
       ],
-      ...(format === "full" ? { body: { size: mail.body.length, data: base64url(mail.body) } } : {}),
+      ...(format === "full" ? mail.attachment === undefined
+        ? { body: { size: mail.body.length, data: base64url(mail.body) } }
+        : { parts: [
+          { mimeType: "text/plain", body: { size: mail.body.length, data: base64url(mail.body) } },
+          {
+            mimeType: "application/pdf", filename: mail.attachment.filename,
+            body: { size: mail.attachment.bytes.byteLength, attachmentId: mail.attachment.id },
+          },
+        ] } : {}),
     },
   };
 }
@@ -364,7 +392,9 @@ export function syntheticGoogle(options: GoogleOptions = {}): GoogleWorld {
   const nowMs = Date.now();
   const mails = options.mailboxScenario === "brief_late_actions"
     ? briefMailbox(nowMs)
-    : options.mailboxScenario === "brief_byte_budget" ? budgetMailbox(nowMs) : mailbox(options.inboxSize ?? 4);
+    : options.mailboxScenario === "brief_byte_budget" ? budgetMailbox(nowMs)
+    : options.mailboxScenario === "pdf_reimbursement" ? reimbursementMailbox()
+    : mailbox(options.inboxSize ?? 4);
   const date = (offset: number): string => new Date(nowMs + offset * day).toISOString().slice(0, 10);
   const at = (hoursFromNow: number): string => new Date(nowMs + hoursFromNow * 3_600_000).toISOString();
   const todayAt = (hour: number): string => `${date(0)}T${String(hour).padStart(2, "0")}:00:00.000Z`;
@@ -419,6 +449,17 @@ export function syntheticGoogle(options: GoogleOptions = {}): GoogleWorld {
       const thread = mails.filter((mail) => mail.threadId === input.threadId);
       assert(thread.length > 0, "Model read an unknown synthetic thread");
       return { data: { id: input.threadId, messages: thread.map((mail) => gmailMessage(mail, "full", nowMs)) }, headers: {} };
+    },
+    async getAttachment(input) {
+      calls.push(`gmail.attachment:${input.messageId}:${input.attachmentId}`);
+      input.signal?.throwIfAborted();
+      const attachment = mails.find((mail) => mail.id === input.messageId)?.attachment;
+      assert(attachment !== undefined && attachment.id === input.attachmentId,
+        "Unexpected synthetic Gmail attachment request");
+      return {
+        data: { size: attachment.bytes.byteLength, data: Buffer.from(attachment.bytes).toString("base64url") },
+        headers: {},
+      };
     },
   };
   const workspace: GoogleWorkspaceApi = {

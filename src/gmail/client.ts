@@ -22,6 +22,11 @@ export interface GmailApi {
     signal?: AbortSignal;
   }): Promise<GmailProviderResponse>;
   getThread(input: { threadId: string; signal?: AbortSignal }): Promise<GmailProviderResponse>;
+  getAttachment(input: {
+    messageId: string;
+    attachmentId: string;
+    signal?: AbortSignal;
+  }): Promise<GmailProviderResponse>;
 }
 
 export interface GmailClientProvider {
@@ -115,6 +120,14 @@ export class GoogleGmailClientProvider implements GmailClientProvider {
             ["format", "full"],
             ["fields", "id,historyId,messages(id,threadId,labelIds,snippet,internalDate,payload)"],
           ],
+          maximumFullResponseBytes,
+          input.signal,
+        );
+      },
+      async getAttachment(input) {
+        return request(
+          `messages/${encodeURIComponent(input.messageId)}/attachments/${encodeURIComponent(input.attachmentId)}`,
+          [["fields", "size,data"]],
           maximumFullResponseBytes,
           input.signal,
         );

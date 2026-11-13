@@ -24,6 +24,7 @@ import { CredentialVault } from "../src/security/vault.js";
 import { createTraceRedactor } from "../src/tracing/redaction.js";
 import { TraceStore } from "../src/tracing/store.js";
 import { createTestDatabase, type TestDatabase } from "./helpers.js";
+import { createPdf } from "./fixtures/pdf.js";
 
 const databases: TestDatabase[] = [];
 afterEach(() => {
@@ -698,6 +699,172 @@ describe("Gmail read tools", () => {
     });
   });
 
+  it("reads a source-bound PDF through Gmail HTTP and records the attempt before download", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(harness, "sub_pdf", "Travel", "travel@example.test");
+    const bytes = createPdf([["Submit itemized receipts within 14 days."]]);
+    const attachmentId = "private-provider-attachment-".repeat(30);
+    const context = toolContext(harness, "gmail.read_thread");
+    const refresh = {
+      async credentials() {
+        return { accessToken: "synthetic-access-token" };
+      },
+    } as unknown as RefreshCoordinator;
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = new URL(String(input));
+      expect(init?.method).toBe("GET");
+      expect(url.origin).toBe("https://gmail.googleapis.com");
+      if (url.pathname === "/gmail/v1/users/me/threads/thread_pdf") {
+        return Response.json({
+          id: "thread_pdf",
+          messages: [{
+            id: "message_pdf",
+            payload: { parts: [{
+              filename: "policy.pdf", mimeType: "application/pdf",
+              body: { attachmentId, size: bytes.byteLength },
+            }] },
+          }],
+        });
+      }
+      expect(url.pathname).toBe(`/gmail/v1/users/me/messages/message_pdf/attachments/${attachmentId}`);
+      const events = harness.traces.list(context.traceId);
+      expect(events.some((event) => event.component === "gmail" &&
+        event.event === "request_attempted" && event.outcome === "messages.attachments.get")).toBe(true);
+      return Response.json({ size: bytes.byteLength, data: Buffer.from(bytes).toString("base64url") });
+    };
+    const service = gmailService(harness, new GoogleGmailClientProvider(harness.config, refresh, fetchImpl));
+    const read = service.tools().find((tool) => tool.definition.name === "gmail.read_thread");
+    const result = await read!.execute({
+      account: "Travel", threadId: "thread_pdf",
+      attachment: { messageId: "message_pdf", filename: "policy.pdf" },
+    }, context);
+    expect(result).toMatchObject({
+      account: { label: "Travel" },
+      attachment: {
+        messageId: "message_pdf", filename: "policy.pdf", mimeType: "application/pdf",
+        status: "read", text: expect.stringContaining("Submit itemized receipts within 14 days."),
+        pages: 1, pagesRead: 1, truncated: false,
+      },
+    });
+    expect(harness.runs.getToolRequired(context.toolExecutionId).connectionId).toBe(connection.id);
+    expect(JSON.stringify(result)).not.toContain("synthetic-access-token");
+  });
+
+  it("reads inline PDF bytes without requesting a separate download", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(harness, "sub_inline", "Inline", "inline@example.test");
+    const bytes = createPdf([["Inline reimbursement instructions."]]);
+    const service = gmailService(harness, fixedClient(connection.id, stubGmailApi({
+      async getThread() {
+        return response({
+          id: "thread_inline", messages: [{
+            id: "message_inline", payload: {
+              filename: "inline.pdf", mimeType: "application/pdf",
+              body: { size: bytes.byteLength, data: Buffer.from(bytes).toString("base64url") },
+            },
+          }],
+        });
+      },
+    })));
+    await expect(service.readThread({
+      threadId: "thread_inline", attachment: { messageId: "message_inline", filename: "inline.pdf" },
+    }, toolContext(harness, "gmail.read_thread"))).resolves.toMatchObject({
+      attachment: { status: "read", text: expect.stringContaining("Inline reimbursement instructions.") },
+    });
+  });
+
+  it("keeps PDF text visible within the model result cap even for a large source thread", async () => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(harness, "sub_large_pdf", "PDF", "pdf@example.test");
+    const pdfText = '"'.repeat(32_768);
+    const bytes = createPdf([[pdfText]]);
+    const messages = Array.from({ length: 50 }, (_, index) => ({
+      id: `message_${index}`,
+      payload: {
+        parts: [{
+          mimeType: "text/plain",
+          body: { data: Buffer.from("large source thread ".repeat(2_000)).toString("base64url") },
+        }, {
+          mimeType: "application/pdf", filename: "policy.pdf",
+          body: { size: bytes.byteLength, attachmentId: "attachment" },
+        }],
+      },
+    }));
+    const service = gmailService(harness, fixedClient(connection.id, stubGmailApi({
+      async getThread() {
+        return response({ id: "thread_pdf", messages });
+      },
+      async getAttachment() {
+        return response({ size: bytes.byteLength, data: Buffer.from(bytes).toString("base64url") });
+      },
+    })));
+    const result = await service.readThread({
+      threadId: "thread_pdf", attachment: { messageId: "message_0", filename: "policy.pdf" },
+    }, toolContext(harness, "gmail.read_thread"));
+    expect(result).toMatchObject({ attachment: { status: "read", text: pdfText } });
+    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(131_072);
+  });
+
+  it.each([
+    ["wrong_message", "attachment_not_found"],
+    ["wrong_thread", "attachment_not_found"],
+    ["duplicate_filename", "attachment_not_found"],
+    ["unsupported", "unsupported_type"],
+    ["oversized", "too_large"],
+  ])("does not download an unverified PDF target: %s", async (scenario, reason) => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(harness, `sub_${scenario}`, "PDF", "pdf@example.test");
+    const part = {
+      filename: "policy.pdf",
+      mimeType: scenario === "unsupported" ? "image/png" : "application/pdf",
+      body: { size: scenario === "oversized" ? 5 * 1_024 * 1_024 + 1 : 100, attachmentId: "attachment" },
+    };
+    const service = gmailService(harness, fixedClient(connection.id, stubGmailApi({
+      async getThread() {
+        return response({
+          id: scenario === "wrong_thread" ? "other_thread" : "thread_pdf",
+          messages: [{
+            id: scenario === "wrong_message" ? "other_message" : "message_pdf",
+            payload: { parts: scenario === "duplicate_filename" ? [part, part] : [part] },
+          }],
+        });
+      },
+    })));
+    await expect(service.readThread({
+      threadId: "thread_pdf", attachment: { messageId: "message_pdf", filename: "policy.pdf" },
+    }, toolContext(harness, "gmail.read_thread"))).resolves.toMatchObject({
+      attachment: { status: "unavailable", reason },
+    });
+  });
+
+  it.each([
+    { data: "not base64!", size: 8 },
+    { data: Buffer.from("%PDF-truncated").toString("base64url"), size: 999 },
+  ])("rejects corrupt attachment bytes before PDF parsing", async (body) => {
+    const harness = gmailHarness();
+    const connection = addGoogleConnection(harness, "sub_corrupt", "PDF", "pdf@example.test");
+    const service = gmailService(harness, fixedClient(connection.id, stubGmailApi({
+      async getThread() {
+        return response({
+          id: "thread_pdf", messages: [{
+            id: "message_pdf", payload: {
+              filename: "policy.pdf", mimeType: "application/pdf",
+              body: { attachmentId: "attachment", size: body.size },
+            },
+          }],
+        });
+      },
+      async getAttachment() {
+        return response(body);
+      },
+    })));
+    await expect(service.readThread({
+      threadId: "thread_pdf", attachment: { messageId: "message_pdf", filename: "policy.pdf" },
+    }, toolContext(harness, "gmail.read_thread"))).resolves.toMatchObject({
+      attachment: { status: "unavailable", reason: "invalid_data" },
+    });
+  });
+
   it("bounds provider-controlled metadata and the aggregate normalized thread", () => {
     const metadata = normalizeGmailMetadata({
       id: "m".repeat(2_000),
@@ -1030,6 +1197,9 @@ function stubGmailApi(overrides: Partial<GmailApi>): GmailApi {
     },
     async getThread() {
       throw new Error("Unexpected threads.get");
+    },
+    async getAttachment() {
+      throw new Error("Unexpected attachments.get");
     },
     ...overrides,
   };
